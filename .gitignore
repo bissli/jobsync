@@ -1,0 +1,8 @@
+build/
+dist/
+__pycache__/
+*.spec
+.python-version
+activate.ps1
+test*.db
+config-pg.yml

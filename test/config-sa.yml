@@ -1,0 +1,23 @@
+database:
+  type: sqlalchemy
+  name: test_f
+  host:
+  username:
+  password:
+  timezone: US/Eastern
+
+tables:
+  agent:
+    name: sync_agent
+    agent: agent
+    created: created_on
+  claim:
+    name: sync_claim
+    agent: agent
+    claim: claim
+  audit:
+    name: sync_audit
+    created: created_on
+    agent: agent
+    claim: claim
+    date: date
