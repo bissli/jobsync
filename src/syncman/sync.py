@@ -2,49 +2,45 @@ import copy
 import datetime
 import logging
 import time
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 
+import pytz
 import sqlalchemy as sa
 from dateutil import relativedelta
 
-from . import db
+from . import model
 
-logging.basicConfig()
-logging.getLogger('sqlalchemy.engine').setLevel(logging.WARNING)
-logging.getLogger('syncman').setLevel(logging.WARNING)
-logger = logging.getLogger('syncman')
+logger = logging.getLogger(__name__)
 
 
 class SyncTaskManager:
-    """Task manager with claim synchronization
+    """Task manager with sync synchronization
     NOT local thread safe
-    We only publish completed claims. Let the client dictate how to split tasks.
+    We only publish completed syncs. Let the client dictate how to split tasks.
     """
 
     def __init__(
         self,
         name,
-        config='config.yml',
-        synchronize_agents=True,
-        agent_heartbeat_window=20,
+        synchronize_nodes=True,
+        node_heartbeat_window=20,
         pre_wait=60,
         post_wait=5,
+        db_appname='syncman_',
+        db_connection='sqlite:///syncman.db',
+        db_timezone='US/Eastern',
     ):
-        self.name = name
-        self._agent_hearbeat_window = int(abs(agent_heartbeat_window)) or 20
+        self._name = name
+        self._node_hearbeat_window = int(abs(node_heartbeat_window)) or 20
         self._pre_wait = int(abs(pre_wait)) or 60
         self._post_wait = int(abs(post_wait)) or 5
-        self._synchronize_agents = synchronize_agents
-        self._local_claims = set()
-        self._publishing_agents = []
-        _ = db.create(config)
-        self.tz = _['timezone']
-        self.engine = _['engine']
-        self.agent, self.Agent = _['agent']
-        self.claim, self.Claim = _['claim']
-        self.audit, self.Audit = _['audit']
-        _ = datetime.datetime.now().astimezone(self.tz)
-        self._today = datetime.date(_.year, _.month, _.day)
+        self._synchronize_nodes = synchronize_nodes
+        self._items = set()
+        self._nodes = []
+        self._tz = pytz.timezone(db_timezone)
+        self._thedate = datetime.date(self.now.year, self.now.month, self.now.day)
+        _ = model.create(db_connection, db_appname)
+        self.engine, self.Node, self.Sync, self.Audit = _.values()
 
     #
     # public methods
@@ -52,114 +48,115 @@ class SyncTaskManager:
 
     @contextmanager
     def register_task(self, wait=120):
-        self.__get_participating_agents()
-        yield  # during this time `add_claim` will be called to add claims
-        self.__publish_completed_claims()
+        self.__get_participating_nodes()
+        yield  # during this time `add_sync` will be called to add syncs
+        self.__publish_completed_syncs()
         for i in range(int(wait / 2)):
-            if len(self._publishing_agents) <= 1:
+            if not self._synchronize_nodes:
                 break
-            if len(self._publishing_agents) == self.__count_agents_with_status_published():
+            if len(self._nodes) == self.__count_nodes_with_published_status():
                 time.sleep(wait / 5)  # extra buffer
-                break  # done
-            logger.debug(f'Waiting for all agents to flush ({i+1}:{int(wait/2)})')
+                break
+            logger.debug(f'Waiting for all nodes to flush ({i+1}:{int(wait/2)})')
             time.sleep(wait / 60)
         time.sleep(self._post_wait)
-        self.__clear_published_claims()
-        self._local_claims.clear()
+        self.__clear_sync_and_audit()
+        self._items.clear()
 
-    def add_claim(self, claim_id):
-        self._local_claims.add(claim_id)
+    def add_sync(self, item):
+        self._items.add(item)
 
-    def remove_claim(self, claim_id):
-        self._local_claims.remove(claim_id)
+    def remove_sync(self, sync_id):
+        self._items.remove(sync_id)
 
     @property
-    def agents(self):
-        return copy.copy(self._publishing_agents)
+    def nodes(self):
+        return copy.copy(self._nodes)
 
     #
     # private methods
     #
 
+    @property
+    def now(self):
+        return datetime.datetime.now().astimezone(self._tz)
+
     def __enter__(self):
-        if self._synchronize_agents:
-            self.__publish_status(ready=True)
+        if self._synchronize_nodes:
+            self.__publish_running_status()
         else:
-            logger.warning('Skipping agent notification on enter.')
+            logger.warning('Skipping node notification on enter.')
         return self
 
     def __exit__(self, exc_ty, exc_val, tb):
         if exc_ty:
             logger.exception(exc_val)
-        if self._synchronize_agents:
-            self.__publish_status(ready=False)
+        if self._synchronize_nodes:
+            self.__publish_stopped_status()
         else:
-            logger.warning('Skipping agent notification on exit.')
+            logger.warning('Skipping node notification on exit.')
 
-    def __publish_status(self, ready=True):
-        if ready:
-            stmt = sa.insert(self.Agent)
-            now = datetime.datetime.now().astimezone(self.tz)
-            param = {self.agent.agent: self.name, self.agent.created: now}
-            with self.engine.begin() as conn:
-                conn.execute(stmt, param)
-            logger.info(f'Sleeping {self._pre_wait} seconds...')
-            time.sleep(self._pre_wait)
-        else:
-            with suppress(Exception):
-                stmt = sa.delete(self.Claim)
-                param = {self.claim.agent: self.name}
-                with self.engine.begin() as conn:
-                    conn.execute(stmt, param)
-                logger.debug(f'Cleared {self.name} from {self.agent.name}')
+    def __publish_running_status(self):
+        stmt = sa.insert(self.Node)
+        with self.engine.begin() as conn:
+            conn.execute(stmt, {'name': self._name, 'created': self.now})
+        logger.info(f'Sleeping {self._pre_wait} seconds...')
+        time.sleep(self._pre_wait)
 
-    def __clear_published_claims(self):
+    def __publish_stopped_status(self):
+        stmt = sa.delete(self.Sync)
+        with self.engine.begin() as conn:
+            conn.execute(stmt, {'node': self._name})
+        logger.debug(f'Cleared {self._name} from {self.Sync.name}')
+
+    def __clear_sync_and_audit(self):
         stmt = sa.insert(self.Audit).from_select(
-            [self.audit.date, self.audit.agent, self.audit.claim],
+            [self.Audit.c.date, self.Audit.c.node, self.Audit.c.item, self.Audit.c.created],
             sa.select(
-                sa.text(f':current_date as "{self.audit.date}"'),
-                self.Claim.c[self.claim.agent].label(self.audit.agent),
-                self.Claim.c[self.claim.claim].label(self.audit.claim),
-            ).where(self.Claim.c[self.claim.agent] == sa.bindparam(self.claim.agent)),
+                sa.text(f'{str(sa.bindparam("thedate"))} as "date"'),
+                self.Sync.c.node,
+                self.Sync.c.item,
+                sa.text(f'{str(sa.bindparam("created"))} as "created"'),
+            ).where(self.Sync.c.node == sa.bindparam('node')),
         )
         with self.engine.begin() as conn:
-            param = {self.claim.agent: self.name, 'current_date': self._today}
+            param = {'node': self._name, 'thedate': self._thedate, 'created': self.now}
             conn.execute(stmt, param)
-            stmt = sa.delete(self.Claim).where(self.Claim.c[self.claim.agent] == sa.bindparam(self.claim.agent))
+            stmt = sa.delete(self.Sync).where(self.Sync.c.node == sa.bindparam('node'))
             i = conn.execute(stmt, param).rowcount
-        logger.debug(f'Wrote {i} seen instruments to {self.audit.name}')
+        logger.debug(f'Wrote {i} seen instruments to {self.Audit.name}')
 
-    def __publish_completed_claims(self):
+    def __publish_completed_syncs(self):
         """We explicitly do this only after completing task in order to avoid needless database round-trips.
         Obviously a real-time sync would be ideal, but this is impractical over a network connection.
         """
-        if not self._local_claims:
+        if not self._items:
             return
-        rows = [{self.claim.agent: self.name, self.claim.claim: i} for i in self._local_claims]
-        stmt = sa.insert(self.Claim)
+        rows = [{'node': self._name, 'item': i} for i in self._items]
+        stmt = sa.insert(self.Sync)
         with self.engine.begin() as conn:
             i = conn.execute(stmt, rows).rowcount
-        logger.debug(f'Wrote {i} saved instruments to {self.claim.name}')
+        logger.debug(f'Wrote {i} saved instruments to {self.Sync.name}')
 
-    def __count_agents_with_status_published(self):
-        stmt = sa.select(sa.distinct(self.Claim.c[self.claim.agent]))
+    def __count_nodes_with_published_status(self):
+        if not self._synchronize_nodes:
+            return 1
+        stmt = sa.select(sa.func.count(sa.distinct(self.Sync.c.node)))
         with self.engine.begin() as conn:
-            res = conn.execute(stmt).fetchall()
-        return len(res[0]) if res else 0
+            i = conn.execute(stmt).scalar()
+        logger.debug(f'Found {i} nodes with published status')
+        return i
 
-    def __get_participating_agents(self):
-        if not self._synchronize_agents:
-            self._publishing_agents = [self.name]
+    def __get_participating_nodes(self):
+        if not self._synchronize_nodes:
+            self._nodes = [self._name]
         else:
             stmt = (
-                sa.select(sa.distinct(self.Agent.c[self.agent.agent].label('agent')))
-                .where(self.Agent.c[self.agent.created] > sa.bindparam(self.agent.created))
-                .order_by('agent')
+                sa.select(sa.distinct(self.Node.c.name))
+                .where(self.Node.c.created > sa.bindparam('created_on'))
+                .order_by(self.Node.c.name)
             )
             with self.engine.begin() as conn:
-                now_minus_window = datetime.datetime.now().astimezone(self.tz) - relativedelta.relativedelta(
-                    minutes=self._agent_hearbeat_window
-                )
-                param = {self.agent.created: now_minus_window}
-                res = conn.execute(stmt, param).fetchall()
-            self._publishing_agents = res[0] if res else []
+                now_minus_window = self.now - relativedelta.relativedelta(minutes=self._node_hearbeat_window)
+                res = conn.execute(stmt, {'created_on': now_minus_window}).fetchall()
+            self._nodes = res[0] if res else []
