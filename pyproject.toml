@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "syncman"
-version = "0.0.1"
+version = "1.0.0"
 description = "Simple Sync Manager"
 authors = ["bissli <bissli@xyz.com>"]
 
