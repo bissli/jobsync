@@ -1,88 +1,171 @@
-import asyncio
-import glob
 import logging
+import multiprocessing
 import os
+import time
 
 import pytest
-import sqlalchemy as sa
-from asserts import assert_equal
-from syncman.model import create
+from asserts import assert_almost_equal, assert_equal
+from conftest import conn
+from syncman import config, db, schema
 from syncman.sync import SyncTaskManager
 
-logging.basicConfig()
-logging.getLogger('sqlalchemy.engine').setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
 current_path = os.path.dirname(os.path.realpath(__file__))
 
-
-@pytest.fixture
-def cleanup():
-    yield
-    [os.remove(x) for x in glob.glob(os.path.join(current_path, '*.db'))]
+Inst = f'{config.sql.appname}inst'
 
 
-async def action(db_connection, name, pre_wait, pool):
+def test_tables_count():
+    """Create basic tables"""
+    with conn('sqlite') as cn:
+        tables = db.select(cn, "SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+        assert_equal(len(tables), 4)
+
+
+def test_insert_instruments():
+    """Create instruments"""
+    # sqlite
+    with conn('sqlite') as cn:
+        for i in range(200):
+            db.execute(cn, f'insert into {Inst} (item, done) values (?, ?)', i, False)
+        df = db.select_scalar(cn, f'select count(1) as count from {Inst}')
+        assert_equal(int(df['count'].iloc[0]), 200)
+
+
+@pytest.mark.parametrize('profile, nodes, items, ph', [('sqlite', 3, 30, '?'), ('postgres', 3, 30, '%s')])
+def test_multiprocess(psql_docker, profile, nodes, items, ph):
+
+    with conn(profile) as cn:
+        for i in range(1, items + 1):
+            db.execute(cn, f'insert into {Inst} (item, done) values ({ph}, {ph})', i, False)
+
+        def worker(num):
+            cn_loc = db.connect(profile)
+            delay = NonBlockingDelay()
+            while 1:
+                df = db.select(cn_loc, f'select item, done from {Inst} where done is false')
+                if df.empty:
+                    break
+                df = df.sample(n=1)
+                item = int(df.item.iloc[0])
+                sql = f'insert into {schema.Sync} (node, item) values ({ph}, {ph}) on conflict do nothing'
+                i = db.execute(cn_loc, sql, num, item)
+                if not i:
+                    continue
+                sql = f'update {Inst} set done=true where item = {ph}'
+                db.execute(cn_loc, sql, item)
+                delay.delay(0.1)
+                while not delay.timeout():
+                    continue
+
+        threads = []
+        for i in range(1, nodes + 1):
+            threads.append(multiprocessing.Process(target=worker, args=(i,)))
+        for task in threads:
+            task.start()
+        for task in threads:
+            task.join()
+
+        df = db.select(cn, f'select * from {schema.Sync}')
+        df = df.groupby('node').count().reset_index()
+
+        expect, delta = int(items / nodes), int((items / nodes) * 0.1)
+        assert_almost_equal(int(df[df['node'] == '1'].iloc[0]['item']), expect, delta=delta)
+        assert_almost_equal(int(df[df['node'] == '2'].iloc[0]['item']), expect, delta=delta)
+        assert_almost_equal(int(df[df['node'] == '3'].iloc[0]['item']), expect, delta=delta)
+
+
+def action(name, items):
     with SyncTaskManager(
         name=name,
-        pre_wait=pre_wait,
-        db_appname='syncman_',
-        db_connection=db_connection,
-    ) as manager, manager.register_task(wait=pre_wait):
+        wait_on_enter=5,
+        sync_nodes=True,
+        cn=db.connect('postgres'),
+        ) as manager:
         while 1:
-            try:
-                manager.add_sync(pool.pop())
-                await asyncio.sleep(2)
-            except:
-                break
+            with manager.synchronize(wait=6):
+                assert_equal(manager.nodecount, 3)
+                df = db.select(manager.cn, f'select item from {Inst} where done is false')
+                if df.empty:
+                    break
+                x = list(df.sample(n=min(5, len(df.index)))['item'])
+                logger.info(f'Node {manager.name} found {len(df.index)} items, working {len(x)}')
+                manager.add_sync(x)
+                db.execute(manager.cn, f"update {Inst} set done=true where item in ({','.join(['%s'] * len(x))})", *x)
+                delay(0.1)
 
 
-async def run(db_connection, pool, loop):
-    t1 = loop.create_task(action(db_connection, 'host1', 5, pool))
-    t2 = loop.create_task(action(db_connection, 'host2', 5, pool))
-    t3 = loop.create_task(action(db_connection, 'host3', 5, pool))
-    await asyncio.wait([t1, t2, t3])
+def delay(seconds):
+    delay = NonBlockingDelay()
+    delay.delay(seconds)
+    while not delay.timeout():
+        continue
 
 
-def validate(db_connection):
-    _ = create(db_connection=db_connection, db_appname='syncman_')
-    engine, Node, Sync, Audit = _.values()
-    with engine.connect() as conn:
-        # names
-        host1 = conn.execute(sa.select(sa.func.count(Node.c.name)).where(Node.c.name == 'host1')).scalar()
-        host2 = conn.execute(sa.select(sa.func.count(Node.c.name)).where(Node.c.name == 'host2')).scalar()
-        host3 = conn.execute(sa.select(sa.func.count(Node.c.name)).where(Node.c.name == 'host3')).scalar()
+def run(items):
+    tasks = [
+        multiprocessing.Process(target=action, args=('host1', items)),
+        multiprocessing.Process(target=action, args=('host2', items)),
+        multiprocessing.Process(target=action, args=('host3', items)),
+        ]
+    for task in tasks:
+        task.start()
+    for task in tasks:
+        task.join()
+
+
+def test_run_and_sync(psql_docker):
+    with conn('postgres') as cn:
+        items = 91
+        for i in range(items):
+            db.execute(cn, f'insert into {Inst} (item, done) values (%s, %s)', i, False)
+        run(items)
+        # nodes
+        host1 = db.select_scalar(cn, f'select count(name) from {schema.Node} where name = %s', 'host1')
+        host2 = db.select_scalar(cn, f'select count(name) from {schema.Node} where name = %s', 'host2')
+        host3 = db.select_scalar(cn, f'select count(name) from {schema.Node} where name = %s', 'host3')
         print('Each node should have one entry')
         assert_equal(host1, 1)
         assert_equal(host1, host2)
         assert_equal(host2, host3)
         # sync items
-        host1 = conn.execute(sa.select(sa.func.count(Sync.c.node)).where(Sync.c.node == 'host1')).scalar()
-        host2 = conn.execute(sa.select(sa.func.count(Sync.c.node)).where(Sync.c.node == 'host2')).scalar()
-        host3 = conn.execute(sa.select(sa.func.count(Sync.c.node)).where(Sync.c.node == 'host3')).scalar()
+        host1 = db.select_scalar(cn, f'select count(node) from {schema.Sync} where node = %s', 'host1')
+        host2 = db.select_scalar(cn, f'select count(node) from {schema.Sync} where node = %s', 'host2')
+        host3 = db.select_scalar(cn, f'select count(node) from {schema.Sync} where node = %s', 'host3')
         print('No items should remain after run')
         assert_equal(host1, 0)
         assert_equal(host1, host2)
         assert_equal(host2, host3)
         # audit
-        host1 = conn.execute(sa.select(sa.func.count(Audit.c.node)).where(Audit.c.node == 'host1')).scalar()
-        host2 = conn.execute(sa.select(sa.func.count(Audit.c.node)).where(Audit.c.node == 'host2')).scalar()
-        host3 = conn.execute(sa.select(sa.func.count(Audit.c.node)).where(Audit.c.node == 'host3')).scalar()
-        print('Each node should process 5 tasks')
-        assert_equal(host1, 5)
-        assert_equal(host1, host2)
-        assert_equal(host2, host3)
+        host1 = db.select_scalar(cn, f'select count(node) from {schema.Audit} where node = %s', 'host1')
+        host2 = db.select_scalar(cn, f'select count(node) from {schema.Audit} where node = %s', 'host2')
+        host3 = db.select_scalar(cn, f'select count(node) from {schema.Audit} where node = %s', 'host3')
+        print(f'Each node should process roughly the same number of tasks: {host1}, {host2}, {host3}')
+        expect, delta = int(items / 3), int((items / 3) * 0.15)
+        assert_almost_equal(host1, expect, delta=delta)
+        assert_almost_equal(host2, expect, delta=delta)
+        assert_almost_equal(host3, expect, delta=delta)
 
 
-def execute(db_connection):
-    pool = set(range(0, 15))
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(run(db_connection, pool, loop))
-    validate(db_connection)
+class NonBlockingDelay:
+    """Non blocking delay class"""
 
+    def __init__(self):
+        self._timestamp = 0
+        self._delay = 0
 
-def test_run_and_sync(cleanup):
-    execute(db_connection='sqlite:///syncman.db')
+    def _seconds(self):
+        return int(time.time())
+
+    def timeout(self):
+        """Check if time is up"""
+        return (self._seconds() - self._timestamp) > self._delay
+
+    def delay(self, delay):
+        """Non blocking delay in seconds"""
+        self._timestamp = self._seconds()
+        self._delay = delay
 
 
 if __name__ == '__main__':
