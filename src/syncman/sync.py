@@ -1,11 +1,12 @@
 import datetime
 import logging
-import time
 from contextlib import contextmanager
 
+import more_itertools
 import pytz
 from dateutil import relativedelta
 from syncman import db
+from syncman.delay import delay
 from syncman.schema import Audit, Node, Sync
 
 logger = logging.getLogger(__name__)
@@ -127,10 +128,11 @@ where
         """
         if not self._items:
             return
-        with db.transaction(self.cn) as tx:
-            for i in self._items:
-                tx.execute(f'insert into {Sync} (node, item) values (%s, %s) on conflict do nothing', self.name, i)
-        logger.debug(f'Wrote {i} saved instruments to {Sync}')
+        args = ','.join(['(%s, %s)'] * len(self._items))
+        vals = list(more_itertools.flatten([(self.name, i) for i in self._items]))
+        sql = f'insert into {Sync} (node, item) values {args} on conflict do nothing'
+        i = db.execute(self.cn, sql, *vals)
+        logger.debug(f'Wrote {i} instruments to {Sync}')
 
     def __count_synchronized_nodes(self):
         if not self._sync_nodes:
@@ -144,30 +146,3 @@ where
         i = db.select_scalar(self.cn, f'select count(distinct(name)) from {Node} where created > %s', now_minus_window)
         logger.debug(f'Found {i} participating nodes')
         return i
-
-
-def delay(seconds):
-    delay = NonBlockingDelay()
-    delay.delay(seconds)
-    while not delay.timeout():
-        continue
-
-
-class NonBlockingDelay:
-    """Non blocking delay class"""
-
-    def __init__(self):
-        self._timestamp = 0
-        self._delay = 0
-
-    def _seconds(self):
-        return int(time.time())
-
-    def timeout(self):
-        """Check if time is up"""
-        return (self._seconds() - self._timestamp) > self._delay
-
-    def delay(self, delay):
-        """Non blocking delay in seconds"""
-        self._timestamp = self._seconds()
-        self._delay = delay
