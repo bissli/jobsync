@@ -5,12 +5,39 @@ from contextlib import contextmanager
 
 import docker
 import pytest
-from syncman import config, db, schema
+import sqlalchemy as sa
+from sqlalchemy.engine import URL
+from sqlalchemy.orm import Session, declarative_base
+from syncman import config, schema
 
 logging.basicConfig()
 logger = logging.getLogger(__name__)
 
 current_path = os.path.dirname(os.path.realpath(__file__))
+
+Test = declarative_base()
+
+
+class Inst(Test):
+    __tablename__ = f'{config.sql.appname}inst'
+
+    Item = sa.Column('item', sa.INTEGER, primary_key=True)
+    Done = sa.Column('done', sa.BOOLEAN, default=False, nullable=False)
+
+    def __repr__(self):
+        return "<Inst(Id='%s', Done='%s')>" % (self.Id, self.Done)
+
+
+pg_url = URL.create(
+    'postgresql+psycopg',
+    username=config.sql.user,
+    password=config.sql.passwd,
+    host=config.sql.host,
+    port=config.sql.port,
+    database=config.sql.database,
+    )
+
+sql_url = 'sqlite:///database.db'
 
 
 @pytest.fixture(scope='session')
@@ -36,27 +63,15 @@ def psql_docker():
     container.stop()
 
 
-Inst = f'{config.sql.appname}inst'
+def create_tables(session):
+    engine = session.bind
+    Test.metadata.drop_all(engine)
+    Test.metadata.create_all(engine)
 
 
-def drop_tables(cn):
-    for table in [schema.Node, schema.Sync, schema.Audit, Inst]:
-        db.execute(cn, f'drop table if exists {table}')
-
-
-def create_tables(cn):
-    sql = f"""
-create table if not exists {Inst} (
-    item integer not null,
-    done boolean default False not null,
-    primary key (item, done)
-)
-    """
-    db.execute(cn, sql)
-
-
-def terminate_postgres_connections():
-    sql = """
+def terminate_postgres_connections(url):
+    sql = sa.text(
+        """
 select
     pg_terminate_backend(pg_stat_activity.pid)
 from
@@ -65,18 +80,39 @@ where
     pg_stat_activity.datname = current_database()
     and pid <> pg_backend_pid()
     """
-    db.execute(db.connect('postgres'), sql)
+        )
+    engine = sa.create_engine(url)
+    with Session(bind=engine) as cn:
+        cn.execute(sql)
 
 
 @contextmanager
-def conn(profile):
-    if profile == 'postgres':
-        terminate_postgres_connections()
-    cn = db.connect(profile)
-    schema.create_tables(cn)
-    create_tables(cn)
-    try:
-        yield cn
-    finally:
-        drop_tables(cn)
-        cn.close()
+def non_build_session(url):
+    engine = sa.create_engine(url, execution_options={'isolation_level': 'AUTOCOMMIT'})
+    with Session(bind=engine, autoflush=True, expire_on_commit=False) as session:
+        try:
+            yield session
+        except:
+            raise
+        finally:
+            session.close()
+
+
+@contextmanager
+def db_session(url):
+    """Creates a context with an open SQLAlchemy session."""
+    if 'postgres' in url:
+        terminate_postgres_connections(url)
+    engine = sa.create_engine(url, execution_options={'isolation_level': 'AUTOCOMMIT'})
+    with Session(bind=engine, autoflush=True, expire_on_commit=False) as session:
+        schema.create_tables(session, drop=True)
+        create_tables(session)
+        try:
+            yield session
+            #  session.commit()
+            #  session.flush()
+        except:
+            #  session.rollback()
+            raise
+        finally:
+            session.close()

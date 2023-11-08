@@ -39,8 +39,14 @@ class Audit(Base):
         return "<Audit(Node='%s', Created='%s', Item='%s')>" % (self.Node, self.Created, self.Item)
 
 
-def create_tables(cn, drop=False):
-    engine = cn.bind
-    if drop:
-        Base.metadata.drop_all(engine)
-    Base.metadata.create_all(engine, checkfirst=True)
+Test = declarative_base()
+
+
+class Inst(Test):
+    __tablename__ = f'{config.sql.appname}inst'
+
+    Id = sa.Column('id', sa.INTEGER, primary_key=True)
+    Done = sa.Column('done', sa.BOOLEAN, default=False, nullable=False)
+
+    def __repr__(self):
+        return "<Inst(Id='%s', Done='%s')>" % (self.Id, self.Done)

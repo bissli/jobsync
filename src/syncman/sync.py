@@ -4,8 +4,8 @@ import time
 from contextlib import contextmanager
 
 import pytz
+import sqlalchemy as sa
 from dateutil import relativedelta
-from syncman import db
 from syncman.schema import Audit, Node, Sync
 
 logger = logging.getLogger(__name__)
@@ -24,7 +24,7 @@ class SyncTaskManager:
     def __init__(
         self,
         name,
-        cn,
+        db_session,
         sync_nodes=True,
         node_heartbeat_window=20,
         wait_on_enter=60,
@@ -40,7 +40,7 @@ class SyncTaskManager:
         self._nodecount = 1
         self._tz = pytz.timezone(db_timezone)
         self._thedate = datetime.date(now(self._tz).year, now(self._tz).month, now(self._tz).day)
-        self.cn = cn
+        self.session = db_session
 
     #
     # public methods
@@ -93,33 +93,30 @@ class SyncTaskManager:
             self.__publish_stopped()
 
     def __publish_running(self):
-        db.execute(self.cn, f'insert into {Node} (name, created) values (%s, %s)', self.name, now(self._tz))
-        logger.debug(f'{self.name} published ready status')
-        logger.info(f'Sleeping {self._wait_on_enter} seconds...')
+        with self.session() as conn:
+            conn.execute(sa.insert(Node), {'name': self._name, 'created': self.now})
+        logger.info(f'Sleeping {self._pre_wait} seconds...')
         delay(self._wait_on_enter)
 
     def __publish_stopped(self):
-        db.execute(self.cn, f'delete from {Sync} where node = %s', self.name)
-        logger.debug(f'Cleared {self.name} from {Sync}')
+        with self.session() as conn:
+            conn.execute(sa.delete(self.Sync), {'node': self._name})
+        logger.debug(f'Cleared {self._name} from {Sync.__tablename__}')
 
     def __flush_audit(self):
-        sql = f"""
-insert into {Audit} (
-    date,
-    node,
-    item,
-    created
-)
-select %s as "date", node, item, %s as "created"
-from
-    {Sync}
-where
-    node = %s
-"""
-        with db.transaction(self.cn) as tx:
-            tx.execute(sql, self._thedate, now(self._tz), self.name)
-            i = tx.execute(f'delete from {Sync} where node = %s', self.name)
-            logger.debug(f'Wrote {i} seen instruments to {Audit}')
+        stmt = sa.insert(Audit).from_select(['date', 'node', 'item', 'created'],
+            sa.select(
+            sa.text(f'{str(sa.bindparam("thedate"))} as "date"'),
+            'node',
+            'item',
+            sa.text(f'{str(sa.bindparam("created"))} as "created"'))\
+                .where('node' == sa.bindparam('node')))
+        with self.session() as conn:
+            param = {'node': self._name, 'thedate': self._thedate, 'created': now(self._tz)}
+            conn.execute(stmt, param)
+            stmt = sa.delete(Sync).where('node' == sa.bindparam('node'))
+            i = conn.execute(stmt, param).rowcount
+        logger.debug(f'Wrote {i} seen instruments to {Audit.__tablename__}')
 
     def __publish_completed_items(self):
         """We explicitly do this only after completing task in order to avoid needless database round-trips.
@@ -127,21 +124,25 @@ where
         """
         if not self._items:
             return
-        with db.transaction(self.cn) as tx:
-            for i in self._items:
-                tx.execute(f'insert into {Sync} (node, item) values (%s, %s) on conflict do nothing', self.name, i)
-        logger.debug(f'Wrote {i} saved instruments to {Sync}')
+        rows = [{'node': self._name, 'item': i} for i in self._items]
+        with self.session() as conn:
+            i = conn.execute(sa.insert(self.Sync), rows).on_conflict_do_nothing().rowcount
+        logger.debug(f'Wrote {i} saved instruments to {Sync.__tablename__}')
 
     def __count_synchronized_nodes(self):
         if not self._sync_nodes:
             return 1
-        i = db.select_scalar(self.cn, f'select count(distinct(node)) as count from {Sync}')
+        with self.session() as conn:
+            i = conn.execute(sa.select(sa.func.count(sa.distinct('node')))).scalar()
         logger.debug(f'Found {i} nodes with published status')
         return i
 
     def __count_participating_nodes(self):
-        now_minus_window = now(self._tz) - relativedelta.relativedelta(minutes=self._node_hearbeat_window)
-        i = db.select_scalar(self.cn, f'select count(distinct(name)) from {Node} where created > %s', now_minus_window)
+        now_minus_window = self.now - relativedelta.relativedelta(minutes=self._node_hearbeat_window)
+        stmt =  sa.select(sa.func.count(sa.distinct('name')))\
+            .where('created' > sa.bindparam('created_on'))
+        with self.session() as conn:
+            i = conn.execute(stmt, {'created_on': now_minus_window}).scalar()
         logger.debug(f'Found {i} participating nodes')
         return i
 

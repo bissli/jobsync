@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+
+echo
+echo ==============
+echo "${1}_node"
+echo ==============
+echo
+sqlite-utils "${1}.db" "select * from ${1}_node" --table
+
+echo
+echo ==============
+echo "${1}_sync"
+echo ==============
+echo
+sqlite-utils "${1}.db" "select * from ${1}_sync" --table
+
+echo
+echo ==============
+echo "${1}_audit"
+echo ==============
+echo
+sqlite-utils "${1}.db" "select * from ${1}_audit" --table
