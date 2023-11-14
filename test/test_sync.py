@@ -41,7 +41,7 @@ def _simulation(profile, threshold):
                 sync.publish_checkpoint()
                 delay(0.3)
                 for _ in range(10):
-                    if sync.all_nodes_published_checkponts():
+                    if sync.all_nodes_published_checkpoints():
                         break
                     delay(3)
 
@@ -87,9 +87,11 @@ def _simulation(profile, threshold):
         assert_almost_equal(host3, expect, delta=delta)
 
 
-def test_simulate_postgres(psql_docker):
-    print('Running simulation with Postgres')
-    _simulation('postgres', 0.25)
+class TestSimulatePostgres:
+    @pytest.mark.parametrize('params', [['syncman', 'postgres', 'postgres', 5432]])
+    def test_simulate_postgres(self, psql_docker):
+        print('Running simulation with Postgres')
+        _simulation('postgres', 0.3)
 
 
 def test_simulate_sqlite():

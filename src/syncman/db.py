@@ -92,7 +92,7 @@ def connect(profile='postgres', **kw):
     cleanup = kw.get('cleanup', True)
     if profile == 'postgres':
         _con = psycopg.connect(
-            dbname=config.sql.database,
+            dbname=config.sql.dbname,
             host=config.sql.host,
             user=config.sql.user,
             port=config.sql.port,

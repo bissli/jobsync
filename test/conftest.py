@@ -4,7 +4,9 @@ import time
 from contextlib import contextmanager
 
 import docker
+import psycopg
 import pytest
+import wrapt
 from syncman import config, db, schema
 
 logger = logging.getLogger(__name__)
@@ -12,21 +14,21 @@ logger = logging.getLogger(__name__)
 current_path = os.path.dirname(os.path.realpath(__file__))
 
 
-@pytest.fixture(scope='session')
-def psql_docker():
+@pytest.fixture
+def psql_docker(params):
     client = docker.from_env()
     container = client.containers.run(
         image='postgres:12',
         auto_remove=True,
         environment={
-            'POSTGRES_PASSWORD': config.sql.passwd,
-            'POSTGRES_USER': config.sql.user,
-            'POSTGRES_DB': config.sql.database,
+            'POSTGRES_DB': params[0],
+            'POSTGRES_USER': params[1],
+            'POSTGRES_PASSWORD': params[2],
             'TZ': 'US/Eastern',
             'PGTZ': 'US/Eastern',
         },
         name='test_postgres',
-        ports={'5432/tcp': ('127.0.0.1', config.sql.port)},
+        ports={'5432/tcp': ('127.0.0.1', params[3])},
         detach=True,
         remove=True,
     )
@@ -65,6 +67,16 @@ where
     and pid <> pg_backend_pid()
     """
     db.execute(db.connect('postgres'), sql)
+
+
+@wrapt.patch_function_wrapper(psycopg, 'connect')
+def patch_connect(wrapped, instance, args, kwargs):
+    kwargs['dbname'] = 'syncman'
+    kwargs['host'] = 'localhost'
+    kwargs['user'] = 'postgres'
+    kwargs['port'] = 5432
+    kwargs['password'] = 'postgres'
+    return wrapped(*args, **kwargs)
 
 
 @contextmanager
