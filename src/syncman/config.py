@@ -70,10 +70,10 @@ pathlib.Path(tmpdir.dir).mkdir(parents=True, exist_ok=True)
 
 sql = Setting()
 sql.type = 'psycopg2+psycopg'
-sql.appname = os.getenv('SYNC_DB_APPNAME', 'syncman_')
-sql.timezone = 'US/Eastern'
-sql.host = 'localhost'
-sql.database = 'syncman'
-sql.user = 'postgres'
-sql.passwd = 'postgres'
-sql.port = 65432
+sql.appname = os.getenv('SYNC_DB_APPNAME', 'sync_')
+sql.timezone = os.getenv('SYNC_DB_TIMEZONE', 'US/Eastern')
+sql.host = os.getenv('SYNC_DB_HOST', 'localhost')
+sql.database = os.getenv('SYNC_DB_DBNAME', 'syncman')
+sql.user = os.getenv('SYNC_PD_USERNAME', 'postgres')
+sql.passwd = os.getenv('SYNC_PD_PASSWORD', 'postgres')
+sql.port = os.getenv('SYNC_DB_PORT', 5432)

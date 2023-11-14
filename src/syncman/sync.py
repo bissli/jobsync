@@ -1,13 +1,14 @@
+"""See test caes for implemenation example
+"""
+import contextlib
 import datetime
 import logging
-from contextlib import contextmanager
 
-import more_itertools
 import pytz
-from dateutil import relativedelta
-from syncman import db
+from more_itertools import flatten
+from syncman import config, db
 from syncman.delay import delay
-from syncman.schema import Audit, Node, Sync
+from syncman.schema import Audit, Check, Node, create_tables
 
 logger = logging.getLogger(__name__)
 
@@ -16,133 +17,101 @@ def now(tz):
     return datetime.datetime.now().astimezone(tz)
 
 
-class SyncTaskManager:
+def today(tz):
+    return datetime.date(now(tz).year, now(tz).month, now(tz).day)
+
+
+class UniqueDict(dict):
+    def __setitem__(self, k, v):
+        if k in self.keys():
+            raise KeyError('Key {k} is already present')
+        return super().__setitem__(k, v)
+
+
+class SyncManager:
     """Task manager with sync synchronization
     NOT local thread safe
     We only publish completed syncs. Let the client dictate how to split tasks.
     """
-
-    def __init__(
-        self,
-        name,
-        cn,
-        sync_nodes=True,
-        node_heartbeat_window=20,
-        wait_on_enter=60,
-        wait_on_exit=5,
-        db_timezone='US/Eastern',
-        ):
+    def __init__(self, name, cn, wait_on_enter=60, wait_on_exit=5, run_without_sync=False, create_tables=True):
         self.name = name
-        self._node_hearbeat_window = int(abs(node_heartbeat_window)) or 20
         self._wait_on_enter = int(abs(wait_on_enter)) or 60
         self._wait_on_exit = int(abs(wait_on_exit)) or 5
-        self._sync_nodes = sync_nodes
-        self._items = set()
-        self._nodecount = 1
-        self._tz = pytz.timezone(db_timezone)
-        self._thedate = datetime.date(now(self._tz).year, now(self._tz).month, now(self._tz).day)
+        self._run_without_sync = run_without_sync
+        self._create_tables = create_tables
+        self._tasks = UniqueDict()
+        self._node_count = 1
+        self._tz = pytz.timezone(config.sql.timezone)
         self.cn = cn
 
-    #
-    # public methods
-    #
-
-    @contextmanager
-    def synchronize(self, wait=120):
-        yield  # during this time `add_sync` will be called to add syncs
-        self.__publish_completed_items()
-        for i in range(int(wait / 2)):
-            if not self._sync_nodes:
-                break
-            if self._nodecount == self.__count_synchronized_nodes():
-                delay(wait / 5)  # extra buffer
-                break
-            logger.debug(f'Waiting for all nodes to flush ({i+1}:{int(wait/2)})')
-            delay(wait / 60)
-        delay(self._wait_on_exit)
-        self.__flush_audit()
-        self._items.clear()
-
-    def add_sync(self, item):
-        if isinstance(item, (tuple, list)):
-            self._items.update(item)
-        else:
-            self._items.add(item)
-
-    def remove_sync(self, item):
-        self._items.remove(item)
-
-    @property
-    def nodecount(self):
-        return self._nodecount
-
-    #
-    # private methods
-    #
-
     def __enter__(self):
-        if self._sync_nodes:
-            self.__publish_running()
-            self._nodecount = self.__count_participating_nodes()
+        if self._create_tables:
+            with contextlib.suppress(Exception):
+                create_tables(self.cn)
+        if not self._run_without_sync:
+            self.publish_online()
+            logger.info(f'Sleeping {self._wait_on_enter} seconds...')
+            delay(self._wait_on_enter)
+            self._node_count = self.count_online()
         return self
 
     def __exit__(self, exc_ty, exc_val, tb):
-        print(f'Exiting {self.name}')
+        logger.info(f'Exiting {self.name} context')
         if exc_ty:
             logger.exception(exc_val)
-        if self._sync_nodes:
-            self.__publish_stopped()
+        self.__cleanup__()
 
-    def __publish_running(self):
+    def publish_online(self):
+        """Notify other nodes that current node is online"""
         db.execute(self.cn, f'insert into {Node} (name, created) values (%s, %s)', self.name, now(self._tz))
         logger.debug(f'{self.name} published ready status')
-        logger.info(f'Sleeping {self._wait_on_enter} seconds...')
-        delay(self._wait_on_enter)
 
-    def __publish_stopped(self):
-        db.execute(self.cn, f'delete from {Sync} where node = %s', self.name)
-        logger.debug(f'Cleared {self.name} from {Sync}')
-
-    def __flush_audit(self):
-        sql = f"""
-insert into {Audit} (
-    date,
-    node,
-    item,
-    created
-)
-select %s as "date", node, item, %s as "created"
-from
-    {Sync}
-where
-    node = %s
-"""
-        with db.transaction(self.cn) as tx:
-            tx.execute(sql, self._thedate, now(self._tz), self.name)
-            i = tx.execute(f'delete from {Sync} where node = %s', self.name)
-            logger.debug(f'Wrote {i} seen instruments to {Audit}')
-
-    def __publish_completed_items(self):
-        """We explicitly do this only after completing task in order to avoid needless database round-trips.
-        Obviously a real-time sync would be ideal, but this is impractical over a network connection.
-        """
-        if not self._items:
-            return
-        args = ','.join(['(%s, %s)'] * len(self._items))
-        vals = list(more_itertools.flatten([(self.name, i) for i in self._items]))
-        sql = f'insert into {Sync} (node, item) values {args} on conflict do nothing'
-        i = db.execute(self.cn, sql, *vals)
-        logger.debug(f'Wrote {i} instruments to {Sync}')
-
-    def __count_synchronized_nodes(self):
-        if not self._sync_nodes:
-            return 1
-        i = db.select_scalar(self.cn, f'select count(distinct(node)) as count from {Sync}')
-        logger.debug(f'Found {i} nodes with published status')
-        return i
-
-    def __count_participating_nodes(self):
-        now_minus_window = now(self._tz) - relativedelta.relativedelta(minutes=self._node_hearbeat_window)
-        i = db.select_scalar(self.cn, f'select count(distinct(name)) from {Node} where created > %s', now_minus_window)
+    def count_online(self, use_cached=False):
+        """Query database for currently online nodes"""
+        i = db.select_scalar(self.cn, f'select count(distinct(name)) from {Node}')
         logger.debug(f'Found {i} participating nodes')
         return i
+
+    def publish_checkpoint(self):
+        db.execute(self.cn, f'insert into {Check} (node, created) values (%s, %s)', self.name, now(self._tz))
+
+    def count_checkpoints(self):
+        return db.select(self.cn, f'select node, count(1) as count from {Check} group by node')
+
+    def all_nodes_published_checkponts(self):
+        """We want both all nodes to have published and the checkpoint count to be identical."""
+        if self._run_without_sync:
+            return True
+        df = self.count_checkpoints()
+        return len(df['node']) % self._node_count == 0 and len(set(df['count'])) == 1
+
+    def add_local_task(self, item):
+        with contextlib.suppress(KeyError):
+            self._tasks[item] = now(self._tz)
+
+    def remove_local_task(self, item):
+        with contextlib.suppress(KeyError):
+            del self._tasks[item]
+
+    def write_audit(self):
+        """The application can chose to flush to audit the tasks early, but generally it's fine to wait
+        and flush on context manager exit (to avoid database trips).
+        """
+        if not self._tasks:
+            logger.info('No remaining tasks to flush')
+            return
+        thedate = today(self._tz)
+        args = ','.join(['(%s, %s, %s, %s)'] * len(self._tasks))
+        vals = list(flatten([(thedate, self.name, task, created) for task, created in self._tasks.items()]))
+        sql = f'insert into {Audit} (date, node, item, created) values {args}'
+        i = db.execute(self.cn, sql, *vals)
+        logger.debug(f'Flushed {i} tasks to {Audit}')
+        self._tasks.clear()
+
+    def __cleanup__(self):
+        if not self._run_without_sync:
+            db.execute(self.cn, f'delete from {Check} where node = %s', self.name)
+            logger.debug(f'Cleaned {self.name} from {Check}')
+            db.execute(self.cn, f'delete from {Node} where name = %s', self.name)
+            logger.debug(f'Cleared {self.name} from {Node}')
+        self.write_audit()  # always log, even when not syncing

@@ -2,6 +2,7 @@ import atexit
 import logging
 import time
 
+from pandas import DataFrame
 from syncman import config
 
 logger = logging.getLogger(__name__)
@@ -21,9 +22,9 @@ class ConnectionWrapper:
     """Wraps a connection object so we can keep track of the
     calls and execution time of any cursors used by this connection.
     """
-
-    def __init__(self, connection, cleanup=True):
+    def __init__(self, connection, profile, cleanup=True):
         self.connection = connection
+        self.profile = profile
         self.calls = 0
         self.time = 0
         if cleanup:
@@ -52,7 +53,6 @@ class CursorWrapper:
     """Wraps a cursor object so we can keep track of the
     execute calls and time used by this cursor.
     """
-
     def __init__(self, cursor, connwrapper):
         self.cursor = cursor
         self.connwrapper = connwrapper
@@ -75,9 +75,9 @@ class CursorWrapper:
 
 def dumpsql(function):
     """This is a decorator for db module functions, for logging data flowing down to driver"""
-
     def wrapper(cn, sql, *args, **kwargs):
         try:
+            sql = sql.replace('%s', '?') if cn.profile == 'sqlite' else sql
             return function(cn, sql, *args, **kwargs)
         except Exception as exc:
             logger.error('Error with query:\nSQL: {}\nARGS: {}\nKWARGS:{}'.format(sql, args, kwargs))
@@ -89,6 +89,7 @@ def dumpsql(function):
 
 def connect(profile='postgres', **kw):
     timeout = kw.get('timeout') or 150
+    cleanup = kw.get('cleanup', True)
     if profile == 'postgres':
         _con = psycopg.connect(
             dbname=config.sql.database,
@@ -96,11 +97,11 @@ def connect(profile='postgres', **kw):
             user=config.sql.user,
             port=config.sql.port,
             password=config.sql.passwd,
-            )
+        )
     if profile == 'sqlite':
         _con = sqlite3.connect('database.db')
 
-    return ConnectionWrapper(_con)
+    return ConnectionWrapper(_con, profile=profile, cleanup=cleanup)
 
 
 def _dict_cur(cn):
@@ -120,8 +121,6 @@ def select(cn, sql, *args, **kwargs):
 
 def create_dataframe(cursor, **kwargs):
     """Create a dataframe from the raw rows, column names and column types"""
-    from pandas import DataFrame
-
     cols_typs = kwargs.pop('cols_typs', None)
 
     if type(cursor.connection) == psycopg.Connection:
@@ -157,7 +156,6 @@ class transaction:
         tx.execute('delete from ...', args)
         tx.execute('update from ...', args)
     """
-
     def __init__(self, cn):
         self.cn = cn
 
@@ -187,45 +185,19 @@ class transaction:
     def select_scalar(self, cn, sql, *args):
         row = select_row(cn, sql, *args)
         if len(row) != 1:
-            logger.error('fExpected one col, got {len(row)}')
+            logger.error(f'Expected one col, got {len(row)}')
             return 1
         return row[list(row.keys())[0]]
 
 
 def select_row(cn, sql, *args):
+    """When we query a single select parameter, return just that dataframe column"""
     df = select(cn, sql, *args)
-    assert len(df.index) == 1, 'Expected one row, got %d' % len(df.index)
-    return df.iloc[0]
+    assert len(df.index) == 1, 'Expected one col, got %d' % len(df.index)
+    return df[df.columns[0]]
 
 
 def select_scalar(cn, sql, *args):
     df = select(cn, sql, *args)
     assert len(df.index) == 1, 'Expected one row, got %d' % len(df.index)
     return df[df.columns[0]].iloc[0]
-
-
-def select_scalar_or_none(cn, sql, *args):
-    row = select_row_or_none(cn, sql, *args)
-    if row:
-        return row[list(row.keys())[0]]
-    return None
-
-
-class SQLiteAutoClose:
-    """A context manager that automatically closes the cursor and the database.
-    Return a cursor object upon entering.
-    """
-
-    def __init__(self, database):
-        self.conn = sqlite3.connect(database)
-
-    def __enter__(self):
-        self.conn = self.conn.__enter__()
-        self.cur = self.conn.cursor()
-        return self.cur
-
-    def __exit__(self, *exc_info):
-        result = self.conn.__exit__(*exc_info)
-        self.cur.close()
-        self.conn.close()
-        return result

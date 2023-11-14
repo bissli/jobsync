@@ -7,7 +7,6 @@ import docker
 import pytest
 from syncman import config, db, schema
 
-logging.basicConfig()
 logger = logging.getLogger(__name__)
 
 current_path = os.path.dirname(os.path.realpath(__file__))
@@ -20,17 +19,17 @@ def psql_docker():
         image='postgres:12',
         auto_remove=True,
         environment={
-        'POSTGRES_PASSWORD': config.sql.passwd,
-        'POSTGRES_USER': config.sql.user,
-        'POSTGRES_DB': config.sql.database,
-        'TZ': 'US/Eastern',
-        'PGTZ': 'US/Eastern',
-            },
+            'POSTGRES_PASSWORD': config.sql.passwd,
+            'POSTGRES_USER': config.sql.user,
+            'POSTGRES_DB': config.sql.database,
+            'TZ': 'US/Eastern',
+            'PGTZ': 'US/Eastern',
+        },
         name='test_postgres',
         ports={'5432/tcp': ('127.0.0.1', config.sql.port)},
         detach=True,
         remove=True,
-        )
+    )
     time.sleep(5)
     yield
     container.stop()
@@ -40,11 +39,11 @@ Inst = f'{config.sql.appname}inst'
 
 
 def drop_tables(cn):
-    for table in [schema.Node, schema.Sync, schema.Audit, Inst]:
+    for table in [schema.Node, schema.Check, schema.Audit, Inst]:
         db.execute(cn, f'drop table if exists {table}')
 
 
-def create_tables(cn):
+def create_inst_table(cn):
     sql = f"""
 create table if not exists {Inst} (
     item integer not null,
@@ -74,7 +73,7 @@ def conn(profile):
         terminate_postgres_connections()
     cn = db.connect(profile)
     schema.create_tables(cn)
-    create_tables(cn)
+    create_inst_table(cn)
     try:
         yield cn
     finally:
