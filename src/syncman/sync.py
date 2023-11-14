@@ -66,6 +66,9 @@ class SyncManager:
         db.execute(self.cn, f'insert into {Node} (name, created) values (%s, %s)', self.name, now(self._tz))
         logger.debug(f'{self.name} published ready status')
 
+    def get_online(self, use_cached=False):
+        return db.select_column(self.cn, f'select distinct(name) from {Node}')
+
     def count_online(self, use_cached=False):
         """Query database for currently online nodes"""
         i = db.select_scalar(self.cn, f'select count(distinct(name)) from {Node}')

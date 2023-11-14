@@ -22,9 +22,9 @@ def _simulation(profile, threshold):
     def action(name, items):
         total = 0
         with SyncManager(name=name, wait_on_enter=5, cn=db.connect(profile), create_tables=False) as sync:
+            # we want all nodes to be online
+            assert_equal(len(sync.get_online()), 3)
             while 1:
-                # we want all nodes to be online
-                assert_equal(sync.count_online(use_cached=True), 3)
                 # gather and process tasks
                 df = db.select(sync.cn, f'select item from {Inst} where done is false')
                 if df.empty:

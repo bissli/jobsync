@@ -183,17 +183,14 @@ class transaction:
         return create_dataframe(cursor, **kwargs)
 
     def select_scalar(self, cn, sql, *args):
-        row = select_row(cn, sql, *args)
-        if len(row) != 1:
-            logger.error(f'Expected one col, got {len(row)}')
-            return 1
-        return row[list(row.keys())[0]]
+        col = select_column(cn, sql, *args)
+        return col[list(col.keys())[0]]
 
 
-def select_row(cn, sql, *args):
+def select_column(cn, sql, *args):
     """When we query a single select parameter, return just that dataframe column"""
     df = select(cn, sql, *args)
-    assert len(df.index) == 1, 'Expected one col, got %d' % len(df.index)
+    assert len(df.columns) == 1, 'Expected one col, got %d' % len(df.columns)
     return df[df.columns[0]]
 
 
