@@ -3,11 +3,12 @@ import os
 import time
 from contextlib import contextmanager
 
+import dataset
 import docker
-import psycopg
+import psycopg2
 import pytest
 import wrapt
-from syncman import config, db, schema
+from syncman import config, schema
 
 logger = logging.getLogger(__name__)
 
@@ -40,23 +41,18 @@ def psql_docker(params):
 Inst = f'{config.sql.appname}inst'
 
 
-def drop_tables(cn):
+def drop_tables(db):
     for table in [schema.Node, schema.Check, schema.Audit, Inst]:
-        db.execute(cn, f'drop table if exists {table}')
+        db[table].drop()
 
 
-def create_inst_table(cn):
-    sql = f"""
-create table if not exists {Inst} (
-    item integer not null,
-    done boolean default False not null,
-    primary key (item, done)
-)
-    """
-    db.execute(cn, sql)
+def create_inst_table(db):
+    t = db[Inst]
+    t.create_column('item', db.types.integer, nullable=False)
+    t.create_column('done', db.types.boolean, nullable=False)
 
 
-def terminate_postgres_connections():
+def terminate_postgres_connections(db_url):
     sql = """
 select
     pg_terminate_backend(pg_stat_activity.pid)
@@ -66,12 +62,13 @@ where
     pg_stat_activity.datname = current_database()
     and pid <> pg_backend_pid()
     """
-    db.execute(db.connect('postgres'), sql)
+    db = dataset.connect(db_url)
+    db.query(sql)
 
 
-@wrapt.patch_function_wrapper(psycopg, 'connect')
+@wrapt.patch_function_wrapper(psycopg2, 'connect')
 def patch_connect(wrapped, instance, args, kwargs):
-    kwargs['dbname'] = 'syncman'
+    kwargs['database'] = 'syncman'
     kwargs['host'] = 'localhost'
     kwargs['user'] = 'postgres'
     kwargs['port'] = 5432
@@ -80,14 +77,14 @@ def patch_connect(wrapped, instance, args, kwargs):
 
 
 @contextmanager
-def conn(profile):
-    if profile == 'postgres':
-        terminate_postgres_connections()
-    cn = db.connect(profile)
-    schema.create_tables(cn)
-    create_inst_table(cn)
+def conn(db_url):
+    if 'postgres' in db_url:
+        terminate_postgres_connections(db_url)
+    db = dataset.connect(db_url)
+    schema.create_tables(db)
+    create_inst_table(db)
     try:
-        yield cn
+        yield db
     finally:
-        drop_tables(cn)
-        cn.close()
+        drop_tables(db)
+        db.close()

@@ -1,6 +1,6 @@
 import logging
 
-from syncman import config, db
+from syncman import config
 
 logger = logging.getLogger(__name__)
 
@@ -9,29 +9,18 @@ Check = f'{config.sql.appname}checkpoint'
 Audit = f'{config.sql.appname}audit'
 
 
-def create_tables(cn):
+def create_tables(db):
     logger.debug('Creating primary sync tables')
-    sqls = [
-        f"""
-create table if not exists {Node} (
-    name varchar(255),
-    created timestamp without time zone,
-    primary key(name, created)
-)
-    """, f"""
-create table if not exists {Check} (
-    node varchar(255) not null,
-    created timestamp without time zone,
-    primary key (node, created)
-)
-    """, f"""
-create table if not exists {Audit} (
-    created timestamp without time zone not null,
-    node varchar(255) not null,
-    item varchar(255) not null,
-    date date not null
-)
-    """
-    ]
-    for sql in sqls:
-        db.execute(cn, sql)
+    t = db[Node]
+    t.create_column('name', db.types.string, nullable=False)
+    t.create_column('created', db.types.datetime, nullable=False)
+    t.create_index(['name', 'created'], unique=True)
+    t = db[Check]
+    t.create_column('node', db.types.string, nullable=False)
+    t.create_column('created', db.types.datetime, nullable=False)
+    t.create_index(['node', 'created'], unique=False)
+    t = db[Audit]
+    t.create_column('created', db.types.datetime, nullable=False)
+    t.create_column('node', db.types.string, nullable=False)
+    t.create_column('item', db.types.string, nullable=False)
+    t.create_column('date', db.types.date, nullable=False)

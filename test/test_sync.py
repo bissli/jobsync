@@ -4,39 +4,38 @@ import random
 from pathlib import Path
 
 import pytest
-import syncman
 from asserts import assert_almost_equal, assert_equal
 from conftest import conn
-from syncman import db
+from syncman import config, schema
 from syncman.delay import delay
 from syncman.sync import SyncManager
 
 logger = logging.getLogger(__name__)
 
-Inst = f'{syncman.config.sql.appname}inst'
+Inst = f'{config.sql.appname}inst'
 
 
-def _simulation(profile, threshold):
+def _simulation(db_url, threshold):
     """Full simulation
     """
     def action(name, items):
         total = 0
-        with SyncManager(name=name, wait_on_enter=5, cn=db.connect(profile), create_tables=False) as sync:
+        with SyncManager(name=name, wait_on_enter=5, db_url=db_url, create_tables=False) as sync:
             # we want all nodes to be online
             assert_equal(len(sync.get_online()), 3)
             while 1:
                 # gather and process tasks
-                df = db.select(sync.cn, f'select item from {Inst} where done is false')
-                if df.empty:
+                inst = list(sync.db[Inst].find(done=False))  # iterdict
+                if not inst:
                     break
-                x_ref = list(df['item'])
+                x_ref = [x['item'] for x in inst]
                 random.shuffle(x_ref)
                 x = x_ref[:5]
                 total += len(x)
-                logger.info(f'Node {sync.name} found {len(df.index)} items, working {len(x)}')
+                logger.info(f'Node {sync.name} found {len(inst)} items, working {len(x)}')
                 [sync.add_local_task(i) for i in x]
                 # write that task if completed
-                db.execute(sync.cn, f"update {Inst} set done=true where item in ({','.join(['%s'] * len(x))})", *x)
+                sync.db[Inst].update({'done': True, 'item': x}, ['item'])
                 # check-in and wait until other nodes are finished
                 sync.publish_checkpoint()
                 delay(0.3)
@@ -54,32 +53,31 @@ def _simulation(profile, threshold):
         for task in tasks:
             task.join()
 
-    with conn(profile) as cn:
+    with conn(db_url) as db:
         items = 91
         nodes = 3
-        for i in range(items):
-            db.execute(cn, f'insert into {Inst} (item, done) values (%s, %s)', i, False)
+        db[Inst].insert_many([{'item': i, 'done': False} for i in range(items)])
         run(items)
         # nodes
-        host1 = db.select_scalar(cn, f'select count(name) from {syncman.schema.Node} where name = %s', 'host1')
-        host2 = db.select_scalar(cn, f'select count(name) from {syncman.schema.Node} where name = %s', 'host2')
-        host3 = db.select_scalar(cn, f'select count(name) from {syncman.schema.Node} where name = %s', 'host3')
+        host1 = db[schema.Node].count(name='host1')
+        host2 = db[schema.Node].count(name='host2')
+        host3 = db[schema.Node].count(name='host3')
         print('No nodes should remain online (cleanup)')
         assert_equal(host1, 0)
         assert_equal(host1, host2)
         assert_equal(host2, host3)
         # checkpoints
-        host1 = db.select_scalar(cn, f'select count(node) from {syncman.schema.Check} where node = %s', 'host1')
-        host2 = db.select_scalar(cn, f'select count(node) from {syncman.schema.Check} where node = %s', 'host2')
-        host3 = db.select_scalar(cn, f'select count(node) from {syncman.schema.Check} where node = %s', 'host3')
+        host1 = db[schema.Check].count(node='host1')
+        host2 = db[schema.Check].count(node='host2')
+        host3 = db[schema.Check].count(node='host3')
         print('No checkpoints should remain after run (cleanup)')
         assert_equal(host1, 0)
         assert_equal(host1, host2)
         assert_equal(host2, host3)
         # audit
-        host1 = db.select_scalar(cn, f'select count(node) from {syncman.schema.Audit} where node = %s', 'host1')
-        host2 = db.select_scalar(cn, f'select count(node) from {syncman.schema.Audit} where node = %s', 'host2')
-        host3 = db.select_scalar(cn, f'select count(node) from {syncman.schema.Audit} where node = %s', 'host3')
+        host1 = db[schema.Audit].count(node='host1')
+        host2 = db[schema.Audit].count(node='host2')
+        host3 = db[schema.Audit].count(node='host3')
         print(f'Each node should process roughly the same number of tasks: {host1}, {host2}, {host3}')
         expect, delta = int(items / nodes), int((items / nodes) * threshold)  # multiprocessing somewhat unpredictable
         assert_almost_equal(host1, expect, delta=delta)
@@ -91,13 +89,17 @@ class TestSimulatePostgres:
     @pytest.mark.parametrize('params', [['syncman', 'postgres', 'postgres', 5432]])
     def test_simulate_postgres(self, psql_docker):
         print('Running simulation with Postgres')
-        _simulation('postgres', 0.3)
+        db_url = f'postgresql+psycopg2://{config.sql.user}:{config.sql.passwd}@{config.sql.host}:{config.sql.port}/{config.sql.dbname}'
+        _simulation(db_url, 0.3)
 
 
 def test_simulate_sqlite():
     print('Running simulation with Sqlite')
-    _simulation('sqlite', 0.4)
-    Path('database.db').unlink(missing_ok=True)
+    db_url = 'sqlite:///database.db'
+    try:
+        _simulation(db_url, 0.4)
+    finally:
+        Path('database.db').unlink(missing_ok=True)
 
 
 if __name__ == '__main__':
