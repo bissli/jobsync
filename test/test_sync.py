@@ -8,7 +8,7 @@ from asserts import assert_almost_equal, assert_equal
 from conftest import conn
 from syncman import config, schema
 from syncman.delay import delay
-from syncman.sync import SyncManager
+from syncman.sync import Job
 
 logger = logging.getLogger(__name__)
 
@@ -18,40 +18,41 @@ Inst = f'{config.sql.appname}inst'
 def _simulation(db_url, threshold):
     """Full simulation
     """
-    def action(name, items):
+    def action(node_name, items):
         total = 0
-        with SyncManager(name=name, wait_on_enter=5, db_url=db_url, create_tables=False) as sync:
+        with Job(node_name, wait_on_enter=5, db_url=db_url, create_tables=False) as job:
             # we want all nodes to be online
-            assert_equal(len(sync.get_online()), 3)
+            assert_equal(len(job.poll_ready()), 3)
             while 1:
                 # gather and process tasks
-                inst = list(sync.db[Inst].find(done=False))  # iterdict
+                inst = list(job.db[Inst].find(done=False))  # iterdict
                 if not inst:
                     break
                 x_ref = [x['item'] for x in inst]
                 random.shuffle(x_ref)
                 x = x_ref[:5]
                 total += len(x)
-                logger.info(f'Node {sync.name} found {len(inst)} items, working {len(x)}')
-                [sync.add_local_task(i) for i in x]
+                logger.info(f'Node {job.node_name} found {len(inst)} items, working {len(x)}')
+                [job.add_step(i) for i in x]
                 # write that task if completed
-                sync.db[Inst].update({'done': True, 'item': x}, ['item'])
+                job.db[Inst].update({'done': True, 'item': x}, ['item'])
                 # check-in and wait until other nodes are finished
-                sync.publish_checkpoint()
+                job.tell_done()
                 delay(0.3)
                 for _ in range(10):
-                    if sync.all_nodes_published_checkpoints():
+                    if job.all_done():
                         break
                     delay(3)
 
     def run(items):
-        tasks = []
+        steps = []
         for i in range(1, 4):
-            tasks.append(multiprocessing.Process(target=action, args=('host' + str(i), items)))
-        for task in tasks:
-            task.start()
-        for task in tasks:
-            task.join()
+            steps.append(
+                multiprocessing.Process(target=action, args=('host' + str(i), items)))
+        for step in steps:
+            step.start()
+        for step in steps:
+            step.join()
 
     with conn(db_url) as db:
         items = 91

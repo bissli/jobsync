@@ -3,7 +3,6 @@ import time
 
 class NonBlockingDelay:
     """Non blocking delay class"""
-
     def __init__(self):
         self._timestamp = 0
         self._delay = 0
