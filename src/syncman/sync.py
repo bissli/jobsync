@@ -26,11 +26,11 @@ def today(tz):
 class SyncManager:
     """Task manager with sync synchronization
     """
-    def __init__(self, name, db_url, wait_on_enter=60, wait_on_exit=5, run_without_sync=False, create_tables=True):
+    def __init__(self, name, db_url, wait_on_enter=60, wait_on_exit=5, skip_sync=False, create_tables=True):
         self.name = name
         self._wait_on_enter = int(abs(wait_on_enter)) or 60
         self._wait_on_exit = int(abs(wait_on_exit)) or 5
-        self._run_without_sync = run_without_sync
+        self._skip_sync = skip_sync
         self._create_tables = create_tables
         self._tasks = []
         self._node_count = 1
@@ -42,7 +42,7 @@ class SyncManager:
             with contextlib.suppress(Exception):
                 create_tables(self.db)
         self.__cleanup__()
-        if not self._run_without_sync:
+        if not self._skip_sync:
             self.publish_online()
             logger.info(f'Sleeping {self._wait_on_enter} seconds...')
             delay(self._wait_on_enter)
@@ -63,25 +63,25 @@ class SyncManager:
         logger.debug(f'{self.name} published ready status')
 
     def get_online(self, use_cached=False) -> List:
-        if self._run_without_sync:
+        if self._skip_sync:
             return [self.name]
         return list(self.db[Node].distinct('name'))
 
     def count_online(self, use_cached=False) -> int:
         """Query database for currently online nodes"""
-        if self._run_without_sync:
+        if self._skip_sync:
             return 1
         i = len(list(self.db[Node].distinct('name')))
         logger.debug(f'Found {i} participating nodes')
         return i
 
     def publish_checkpoint(self):
-        if self._run_without_sync:
+        if self._skip_sync:
             return
         self.db[Check].insert({'node': self.name, 'created': now(self._tz)})
 
     def count_checkpoints(self):
-        if self._run_without_sync:
+        if self._skip_sync:
             return pd.DataFrame(data={'node': [self.name], 'count': [1]})
         return list(self.db.query(f'select node, count(1) as count from {Check} group by node'))
 
@@ -117,7 +117,7 @@ class SyncManager:
         logger.debug(f'Cleaned {self.name} from {Check}')
 
     def __cleanup__(self):
-        if not self._run_without_sync:
+        if not self._skip_sync:
             self._clean_node()
             self._clean_check()
         self.write_audit()  # always log, even when not syncing
