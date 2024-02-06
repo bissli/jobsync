@@ -8,9 +8,9 @@ from typing import List
 import dataset
 import pandas as pd
 import pytz
-from syncman import config
-from syncman.delay import delay
-from syncman.schema import Audit, Check, Node, create_tables
+from jobsync import config
+from jobsync.delay import delay
+from jobsync.schema import Audit, Check, Node, create_tables
 
 logger = logging.getLogger(__name__)
 

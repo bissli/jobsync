@@ -8,7 +8,7 @@ import docker
 import psycopg2
 import pytest
 import wrapt
-from syncman import config, schema
+from jobsync import config, schema
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +67,7 @@ where
 
 @wrapt.patch_function_wrapper(psycopg2, 'connect')
 def patch_connect(wrapped, instance, args, kwargs):
-    kwargs['database'] = 'syncman'
+    kwargs['database'] = 'jobsync'
     kwargs['host'] = 'localhost'
     kwargs['user'] = 'postgres'
     kwargs['port'] = 5432

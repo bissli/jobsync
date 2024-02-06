@@ -1,6 +1,6 @@
 import logging
 
-from syncman import config
+from jobsync import config
 
 logger = logging.getLogger(__name__)
 

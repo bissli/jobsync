@@ -6,9 +6,9 @@ from pathlib import Path
 import pytest
 from asserts import assert_almost_equal, assert_equal
 from conftest import conn
-from syncman import config, schema
-from syncman.delay import delay
-from syncman.sync import Job
+from jobsync import config, schema
+from jobsync.delay import delay
+from jobsync.sync import Job
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +87,7 @@ def _simulation(db_url, threshold):
 
 
 class TestSimulatePostgres:
-    @pytest.mark.parametrize('params', [['syncman', 'postgres', 'postgres', 5432]])
+    @pytest.mark.parametrize('params', [['jobsync', 'postgres', 'postgres', 5432]])
     def test_simulate_postgres(self, psql_docker):
         print('Running simulation with Postgres')
         db_url = f'postgresql+psycopg2://{config.sql.user}:{config.sql.passwd}@{config.sql.host}:{config.sql.port}/{config.sql.dbname}'

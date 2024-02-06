@@ -1,5 +1,5 @@
 [tool.poetry]
-name = "syncman"
+name = "jobsync"
 version = "1.1.0"
 description = "Simple Sync Manager"
 authors = ["bissli <bissli@xyz.com>"]
@@ -7,11 +7,12 @@ authors = ["bissli <bissli@xyz.com>"]
 [tool.poetry.dependencies]
 python = "~3.11"
 more-itertools = "^10.1.0"
-pandas = "^2.1.2"
+pandas = "*"
 python-dateutil = "^2.8.2"
 pytz = "^2023.3.post1"
 dataset = "^1.6.2"
 psycopg2-binary = "^2.9.9"
+libb = {git = "https://github.com/bissli/libb"}
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.2"
