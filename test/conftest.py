@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 current_path = os.path.dirname(os.path.realpath(__file__))
 
 
-@pytest.fixture
+@pytest.fixture()
 def psql_docker(params):
     client = docker.from_env()
     container = client.containers.run(
@@ -26,7 +26,7 @@ def psql_docker(params):
             'POSTGRES_USER': params[1],
             'POSTGRES_PASSWORD': params[2],
             'TZ': 'US/Eastern',
-            'PGTZ': 'US/Eastern',},
+            'PGTZ': 'US/Eastern'},
         name='test_postgres',
         ports={'5432/tcp': ('127.0.0.1', params[3])},
         detach=True,
@@ -37,7 +37,7 @@ def psql_docker(params):
     container.stop()
 
 
-Inst = f'{config.sql.appname}inst'
+Inst = f'{config.sync.sql.appname}inst'
 
 
 def drop_tables(db):

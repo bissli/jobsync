@@ -1,53 +1,61 @@
 """See test cases for implemenation example
 """
 import contextlib
-import datetime
 import logging
-from typing import List
+from functools import total_ordering
+from typing import Dict, List
 
 import dataset
-import pandas as pd
-import pytz
-from jobsync import config
-from jobsync.delay import delay
 from jobsync.schema import Audit, Check, Node, create_tables
+from libb import attrdict, delay, now, today
 
 logger = logging.getLogger(__name__)
 
 
-def now(tz):
-    return datetime.datetime.now().astimezone(tz)
+@total_ordering
+class BaseStep:
 
+    def __init__(self, id, name=None):
+        self.id = id
+        self.name = name
 
-def today(tz):
-    return datetime.date(now(tz).year, now(tz).month, now(tz).day)
+    def __repr__(self):
+        return f'id:{self.id},name:{self.name}'
+
+    def __eq__(self, other):
+        return self.id == other.id
+
+    def __lt__(self, other):
+        return self.id < other.id
+
+    def __gt__(self, other):
+        return not self.__lt__(other)
 
 
 class Job:
-    """Job sync manager
-    """
+    """Job sync manager"""
+
     def __init__(self, node_name, db_url, wait_on_enter=60, wait_on_exit=5,
-                 skip_sync=False, create_tables=True):
+                 skip_sync=False, db_init=False):
         self.node_name = node_name
         self._wait_on_enter = int(abs(wait_on_enter)) or 60
         self._wait_on_exit = int(abs(wait_on_exit)) or 5
         self._skip_sync = skip_sync
-        self._create_tables = create_tables
         self._steps = []
         self._node_count = 1
-        self._tz = pytz.timezone(config.sql.timezone)
-        self.db = dataset.connect(db_url)  # should be in SQLAlchemy format
-
-    def __enter__(self):
-        if self._create_tables:
+        # should be in SQLAlchemy format
+        self.db = dataset.connect(db_url)
+        if db_init:
             with contextlib.suppress(Exception):
                 create_tables(self.db)
+
+    def __enter__(self):
         self.__cleanup__()
         if not self._skip_sync:
-            self.tell_ready()
+            self.set_idle()
             logger.info(f'Sleeping {self._wait_on_enter} seconds...')
             delay(self._wait_on_enter)
-            self._node_count = len(self.poll_ready())
+            self._node_count = len(self.get_idle())
         return self
 
     def __exit__(self, exc_ty, exc_val, tb):
@@ -58,51 +66,59 @@ class Job:
         with contextlib.suppress(Exception):
             self.db.close()
 
-    def tell_ready(self):
-        """Notify other nodes that current node is ready"""
-        self.db[Node].insert({'name': self.node_name, 'created': now(self._tz)})
+    def get_idle(self) -> List[Dict]:
+        if self._skip_sync:
+            return [attrdict(node=self.node_name)]
+        return [attrdict(node=row['name']) for row in self.db[Node].distinct('name')]
+
+    def get_done(self) -> List[Dict]:
+        """Return mapping of nodes to current completed checkpoints
+        """
+        if self._skip_sync:
+            return [attrdict(node=self.node_name, count=1)]
+        sql = f'select node, count(1) as count from {Check} group by node'
+        return [attrdict(node=row['node'], count=row['count']) for row in self.db.query(sql)]
+
+    def set_idle(self):
+        """Notify other nodes that current node is ready
+        """
+        self.db[Node].insert({'name': self.node_name, 'created': now()})
         logger.debug(f'{self.node_name} told ready status')
 
-    def poll_ready(self, use_cached=False) -> List:
-        if self._skip_sync:
-            return [self.node_name]
-        return list(self.db[Node].distinct('name'))
-
-    def tell_done(self):
+    def set_done(self):
         if self._skip_sync:
             return
-        self.db[Check].insert({'node': self.node_name, 'created': now(self._tz)})
+        self.db[Check].insert({'node': self.node_name, 'created': now()})
 
-    def poll_done(self):
-        if self._skip_sync:
-            return pd.DataFrame(data={'node': [self.node_name], 'count': [1]})
-        return list(
-            self.db.query(f'select node, count(1) as count from {Check} group by node'))
+    def others_done(self) -> bool:
+        """We want both all nodes to have completed and the checkpoint count
+        to be identical.
+        Return if the
+        """
+        data = self.get_done()
+        len_node = len([x['node'] for x in data])
+        len_count = len({x['count'] for x in data})
+        return len_count == 1 and len_node % self._node_count == 0
 
-    def all_done(self):
-        """We want both all nodes to have completed and the checkpoint count to be identical."""
-        data = self.poll_done()
-        return len([x['node'] for x in data]) % self._node_count == 0 \
-            and len({x['count'] for x in data}) == 1
+    def add_step(self, step: BaseStep):
+        self._steps.append((step, now()))
 
-    def add_step(self, step):
-        self._steps.append((step, now(self._tz)))
-
-    def remove_step(self, step):
+    def remove_step(self, step: BaseStep):
         self._steps = [(_step, _) for _step, _ in self._steps if _step != step]
 
     def write_audit(self):
-        """The application can chose to flush to audit the steps early, but generally it's fine to wait
-        and flush on context manager exit (to avoid database trips).
+        """The application can chose to flush to audit the steps early, but
+        generally it's fine to wait and flush on context manager exit
+        (to avoid database trips).
         """
         if not self._steps:
             return
-        thedate = today(self._tz)
+        thedate = today()
         i = self.db[Audit].insert_many([{
             'date': thedate,
             'node': self.node_name,
-            'item': step,
-            'created': created,} for step, created in self._steps])
+            'item': step.id,
+            'created': created} for step, created in self._steps])
         logger.debug(f'Flushed {i} step to {Audit}')
         self._steps.clear()
 
@@ -115,7 +131,9 @@ class Job:
         logger.debug(f'Cleaned {self.node_name} from {Check}')
 
     def __cleanup__(self):
+        """Always log, even when not syncing
+        """
         if not self._skip_sync:
             self._clean_node()
             self._clean_check()
-        self.write_audit()  # always log, even when not syncing
+        self.write_audit()

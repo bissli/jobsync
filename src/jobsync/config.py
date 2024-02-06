@@ -1,79 +1,22 @@
 import os
-import pathlib
-import tempfile
+
+from libb import Setting
 
 HERE = os.path.abspath(os.path.dirname(__file__))
 
+Setting.unlock()
 
-class Setting(dict):
-    """Dict where d['foo'] can also be accessed as d.foo
-    but also automatically creates new sub-attributes of
-    type Setting. This behavior can be locked to turn off
-    later. Used in config.py.
-    WARNING: not copy safe
+sync = Setting()
+sync.sql.appname = os.getenv('SYNC_SQL_APPNAME', 'sync_')
+sync.sql.profile = os.getenv('SYNC_SQL_PROFILE', 'postgres')
+sync.sql.timezone = os.getenv('SYNC_SQL_TIMEZONE', 'US/Eastern')
+sync.sql.host = os.getenv('SYNC_SQL_HOST', 'localhost')
+sync.sql.dbname = os.getenv('SYNC_SQL_DATABASE', 'jobsync')
+sync.sql.user = os.getenv('SYNC_SQL_USERNAME', 'postgres')
+sync.sql.passwd = os.getenv('SYNC_SQL_PASSWORD', 'postgres')
+sync.sql.port = os.getenv('SYNC_SQL_PORT', 5432)
 
-    >>> cfg = Setting()
-    >>> cfg.unlock() # locked after config.py load
+Setting.lock()
 
-    >>> cfg.foo.bar = 1
-    >>> hasattr(cfg.foo, 'bar')
-    True
-    >>> cfg.foo.bar
-    1
-    >>> cfg.lock()
-    >>> cfg.foo.bar = 2
-    Traceback (most recent call last):
-     ...
-    ValueError: This Setting object is locked from editing
-    >>> cfg.foo.baz = 3
-    Traceback (most recent call last):
-     ...
-    ValueError: This Setting object is locked from editing
-    >>> cfg.unlock()
-    >>> cfg.foo.baz = 3
-    >>> cfg.foo.baz
-    3
-    """
-
-    _locked = False
-
-    def __init__(self, *args, **kwargs):
-        dict.__init__(self, *args, **kwargs)
-
-    def __getattr__(self, name):
-        """Create sub-setting fields on the fly"""
-        if name not in self:
-            if self._locked:
-                raise ValueError('This Setting object is locked from editing')
-            self[name] = Setting()
-        return self[name]
-
-    def __setattr__(self, name, val):
-        if self._locked:
-            raise ValueError('This Setting object is locked from editing')
-        elif name not in self:
-            self[name] = Setting()
-        self[name] = val
-
-    @staticmethod
-    def lock():
-        Setting._locked = True
-
-    @staticmethod
-    def unlock():
-        Setting._locked = False
-
-
-tmpdir = Setting()
-tmpdir.dir = tempfile.gettempdir()
-pathlib.Path(tmpdir.dir).mkdir(parents=True, exist_ok=True)
-
-sql = Setting()
-sql.appname = os.getenv('SYNC_DB_APPNAME', 'sync_')
-sql.profile = os.getenv('SYNC_DB_PROFILE', 'postgres')
-sql.timezone = os.getenv('SYNC_DB_TIMEZONE', 'US/Eastern')
-sql.host = os.getenv('SYNC_DB_HOST', 'localhost')
-sql.dbname = os.getenv('SYNC_DB_DATABASE', 'jobsync')
-sql.user = os.getenv('SYNC_DB_USERNAME', 'postgres')
-sql.passwd = os.getenv('SYNC_DB_PASSWORD', 'postgres')
-sql.port = os.getenv('SYNC_DB_PORT', 5432)
+if __name__ == '__main__':
+    __import__('doctest').testmod()

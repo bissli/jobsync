@@ -4,9 +4,9 @@ from jobsync import config
 
 logger = logging.getLogger(__name__)
 
-Node = f'{config.sql.appname}node'
-Check = f'{config.sql.appname}checkpoint'
-Audit = f'{config.sql.appname}audit'
+Node = f'{config.sync.sql.appname}node'
+Check = f'{config.sync.sql.appname}checkpoint'
+Audit = f'{config.sync.sql.appname}audit'
 
 
 def create_tables(db):
