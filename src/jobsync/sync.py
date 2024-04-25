@@ -3,11 +3,12 @@
 import contextlib
 import logging
 from functools import total_ordering
-from typing import Dict, List
 
 import dataset
 from jobsync.schema import Audit, Check, Node, create_tables
-from libb import attrdict, delay, now, today
+
+from date import now, today
+from libb import attrdict, delay
 
 logger = logging.getLogger(__name__)
 
@@ -66,12 +67,12 @@ class Job:
         with contextlib.suppress(Exception):
             self.db.close()
 
-    def get_idle(self) -> List[Dict]:
+    def get_idle(self) -> list[dict]:
         if self._skip_sync:
             return [attrdict(node=self.node_name)]
         return [attrdict(node=row['name']) for row in self.db[Node].distinct('name')]
 
-    def get_done(self) -> List[Dict]:
+    def get_done(self) -> list[dict]:
         """Return mapping of nodes to current completed checkpoints
         """
         if self._skip_sync:
