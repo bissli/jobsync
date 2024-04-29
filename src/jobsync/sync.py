@@ -4,9 +4,9 @@ import contextlib
 import logging
 from functools import total_ordering
 
-import dataset
-from jobsync.schema import Audit, Check, Node, create_tables
+from jobsync.schema import Audit, Check, Node
 
+import db
 from date import now, today
 from libb import attrdict, delay
 
@@ -36,19 +36,22 @@ class BaseStep:
 class Job:
     """Job sync manager"""
 
-    def __init__(self, node_name, db_url, wait_on_enter=60, wait_on_exit=5,
-                 skip_sync=False, db_init=False):
+    def __init__(
+        self,
+        node_name,
+        site,
+        config,
+        wait_on_enter=60,
+        wait_on_exit=5,
+        skip_sync=False,
+    ):
         self.node_name = node_name
         self._wait_on_enter = int(abs(wait_on_enter)) or 60
         self._wait_on_exit = int(abs(wait_on_exit)) or 5
         self._skip_sync = skip_sync
         self._steps = []
         self._node_count = 1
-        # should be in SQLAlchemy format
-        self.db = dataset.connect(db_url)
-        if db_init:
-            with contextlib.suppress(Exception):
-                create_tables(self.db)
+        self.cn = db.connect(site, config)
 
     def __enter__(self):
         self.__cleanup__()
@@ -65,12 +68,14 @@ class Job:
             logger.exception(exc_val)
         self.__cleanup__()
         with contextlib.suppress(Exception):
-            self.db.close()
+            self.cn.close()
 
     def get_idle(self) -> list[dict]:
         if self._skip_sync:
             return [attrdict(node=self.node_name)]
-        return [attrdict(node=row['name']) for row in self.db[Node].distinct('name')]
+        sql = f'select distinct(name) from {Node}'
+        return [attrdict(node=row['name']) for row in
+                db.select(self.cn, sql).to_dict('records')]
 
     def get_done(self) -> list[dict]:
         """Return mapping of nodes to current completed checkpoints
@@ -78,18 +83,21 @@ class Job:
         if self._skip_sync:
             return [attrdict(node=self.node_name, count=1)]
         sql = f'select node, count(1) as count from {Check} group by node'
-        return [attrdict(node=row['node'], count=row['count']) for row in self.db.query(sql)]
+        return [attrdict(node=row['node'], count=row['count']) for row in
+                db.select(self.cn, sql).to_dict('records')]
 
     def set_idle(self):
         """Notify other nodes that current node is ready
         """
-        self.db[Node].insert({'name': self.node_name, 'created': now()})
+        sql = f'insert into {Node} (name, created) values (%s, %s)'
+        db.execute(self.cn, sql, self.node_name, now())
         logger.debug(f'{self.node_name} told ready status')
 
     def set_done(self):
         if self._skip_sync:
             return
-        self.db[Check].insert({'node': self.node_name, 'created': now()})
+        sql = f'insert into {Check} (node, created) values (%s, %s)'
+        db.execute(self.cn, sql, self.node_name, now())
 
     def others_done(self) -> bool:
         """We want both all nodes to have completed and the checkpoint count
@@ -115,20 +123,21 @@ class Job:
         if not self._steps:
             return
         thedate = today()
-        i = self.db[Audit].insert_many([{
-            'date': thedate,
-            'node': self.node_name,
-            'item': step.id,
-            'created': created} for step, created in self._steps])
+        rows = [{'date': thedate, 'node': self.node_name, 'item': step.id,
+                 'created': created}
+                for step,created in self._steps]
+        i = db.insert_rows(self.cn, Audit, rows)
         logger.debug(f'Flushed {i} step to {Audit}')
         self._steps.clear()
 
     def _clean_node(self):
-        self.db[Node].delete(name=self.node_name)
+        sql = f'delete from {Node} where name = %s'
+        db.execute(self.cn, sql, self.node_name)
         logger.debug(f'Cleared {self.node_name} from {Node}')
 
     def _clean_check(self):
-        self.db[Check].delete(node=self.node_name)
+        sql = f'delete from {Check} where node = %s'
+        db.execute(self.cn, sql, self.node_name)
         logger.debug(f'Cleaned {self.node_name} from {Check}')
 
     def __cleanup__(self):

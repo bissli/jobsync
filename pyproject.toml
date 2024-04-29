@@ -8,11 +8,10 @@ authors = ["bissli <bissli@xyz.com>"]
 python = "~3.11"
 
 more-itertools = "*"
-dataset = "^1.6.2"
-psycopg2-binary = "*"
 
 libb-util = { git = "https://github.com/bissli/libb-util" }
 libb-date = { git = "https://github.com/bissli/libb-date" }
+libb-db = { git = "https://github.com/bissli/libb-db" }
 
 # == test
 asserts = { version = "*", optional = true }
