@@ -15,7 +15,7 @@ Inst = f'{config.sync.sql.appname}inst'
 def init_database(cn, is_test=False):
     """Init datbase and return engine
     """
-    logger.debug('Checking for primary sync tables')
+    logger.debug(f'Initializing tables {Node},{Check},{Audit}')
 
     db.execute(cn, f"""
 CREATE TABLE IF NOT EXISTS {Node} (
@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS {Audit} (
 
     if not is_test:
         return
+
+    logger.debug(f'Initializing table {Inst}')
 
     db.execute(cn, f"""
 CREATE TABLE IF NOT EXISTS {Inst} (
