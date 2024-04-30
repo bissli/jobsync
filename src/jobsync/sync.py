@@ -107,7 +107,6 @@ class Job:
     def others_done(self) -> bool:
         """We want both all nodes to have completed and the checkpoint count
         to be identical.
-        Return if the
         """
         data = self.get_done()
         len_node = len([x['node'] for x in data])
@@ -123,14 +122,17 @@ class Job:
     def write_audit(self):
         """The application can chose to flush to audit the tasks early, but
         generally it's fine to wait and flush on context manager exit
-        (to avoid database trips).
+        (to avoid database round trips).
         """
         if not self._tasks:
             return
         thedate = today()
-        rows = [{'date': thedate, 'node': self.node_name, 'item': task.id,
-                 'created_on': created}
-                for task, created in self._tasks]
+        rows = [{
+            'date': thedate,
+            'node': self.node_name,
+            'item': task.id,
+            'created_on': created
+            } for task, created in self._tasks]
         i = db.insert_rows(self.cn, Audit, rows)
         logger.debug(f'Flushed {i} task to {Audit}')
         self._tasks.clear()
