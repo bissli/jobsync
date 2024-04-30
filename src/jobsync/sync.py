@@ -12,9 +12,11 @@ from libb import attrdict, delay
 
 logger = logging.getLogger(__name__)
 
+__all__ = ['Job', 'Step']
+
 
 @total_ordering
-class BaseStep:
+class Step:
 
     def __init__(self, id, name=None):
         self.id = id
@@ -92,14 +94,14 @@ class Job:
     def set_idle(self):
         """Notify other nodes that current node is ready
         """
-        sql = f'insert into {Node} (name, created) values (%s, %s)'
+        sql = f'insert into {Node} (name, created_on) values (%s, %s)'
         db.execute(self.cn, sql, self.node_name, now())
         logger.debug(f'{self.node_name} told ready status')
 
     def set_done(self):
         if self._skip_sync:
             return
-        sql = f'insert into {Check} (node, created) values (%s, %s)'
+        sql = f'insert into {Check} (node, created_on) values (%s, %s)'
         db.execute(self.cn, sql, self.node_name, now())
 
     def others_done(self) -> bool:
@@ -112,10 +114,10 @@ class Job:
         len_count = len({x['count'] for x in data})
         return len_count == 1 and len_node % self._node_count == 0
 
-    def add_step(self, step: BaseStep):
+    def add_step(self, step: Step):
         self._steps.append((step, now()))
 
-    def remove_step(self, step: BaseStep):
+    def remove_step(self, step: Step):
         self._steps = [(_step, _) for _step, _ in self._steps if _step != step]
 
     def write_audit(self):
@@ -127,8 +129,8 @@ class Job:
             return
         thedate = today()
         rows = [{'date': thedate, 'node': self.node_name, 'item': step.id,
-                 'created': created}
-                for step,created in self._steps]
+                 'created_on': created}
+                for step, created in self._steps]
         i = db.insert_rows(self.cn, Audit, rows)
         logger.debug(f'Flushed {i} step to {Audit}')
         self._steps.clear()

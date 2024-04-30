@@ -20,22 +20,22 @@ def init_database(cn, is_test=False):
     db.execute(cn, f"""
 CREATE TABLE IF NOT EXISTS {Node} (
     name varchar not null,
-    created timestamp without time zone not null,
-    primary key (name, created)
+    created_on timestamp without time zone not null,
+    primary key (name, created_on)
 );
     """)
 
     db.execute(cn, f"""
 CREATE TABLE IF NOT EXISTS {Check} (
     node varchar not null,
-    created timestamp without time zone not null,
-    primary key (node, created)
+    created_on timestamp without time zone not null,
+    primary key (node, created_on)
 );
     """)
 
     db.execute(cn, f"""
 CREATE TABLE IF NOT EXISTS {Audit} (
-    created timestamp without time zone not null,
+    created_on timestamp without time zone not null,
     node varchar not null,
     item varchar not null,
     date date not null

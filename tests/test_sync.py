@@ -6,8 +6,7 @@ import config
 import pytest
 from asserts import assert_almost_equal, assert_equal
 from jobsync import schema
-from jobsync.schema import Inst
-from jobsync.sync import BaseStep, Job
+from jobsync.sync import Job, Step
 
 import db
 from libb import delay
@@ -23,7 +22,7 @@ def trigger(node_name, items, site, skip_sync=False, assert_node_count=3):
         assert_equal(len(self.get_idle()), assert_node_count)
         while True:
             # gather and process tasks
-            inst = db.select(self.cn, f'select item, done from {Inst} where done is False').to_dict('records')
+            inst = db.select(self.cn, f'select item, done from {schema.Inst} where done is False').to_dict('records')
             if not inst:
                 break
             x_ref = [x['item'] for x in inst]
@@ -31,10 +30,10 @@ def trigger(node_name, items, site, skip_sync=False, assert_node_count=3):
             x = x_ref[:5]
             total += len(x)
             logger.info(f'Node {self.node_name} found {len(inst)} items, working {len(x)}')
-            [self.add_step(BaseStep(i)) for i in x]
+            [self.add_step(Step(i)) for i in x]
             # write that task if completed
             for item in x:
-                db.update(self.cn, f'update {Inst} set done=True where item = %s', item)
+                db.update(self.cn, f'update {schema.Inst} set done=True where item = %s', item)
             # check-in and wait until other nodes are finished
             self.set_done()
             delay(0.3)
@@ -48,7 +47,7 @@ def run_only_one_node(site, skip_sync):
     cn = db.connect(site, config)
     items = 30
     nodes = 1
-    db.insert_rows(cn, Inst, [{'item': i, 'done': False} for i in range(items)])
+    db.insert_rows(cn, schema.Inst, [{'item': i, 'done': False} for i in range(items)])
     trigger('host1', items, site, skip_sync=skip_sync, assert_node_count=1)
     # nodes
     host1 = db.select_scalar_or_none(cn, f'select count(1) from {schema.Node} where name=%s', 'host1')
@@ -69,7 +68,7 @@ def run_more_than_one_node(site, threshold):
     cn = db.connect(site, config)
     items = 91
     nodes = 3
-    db.insert_rows(cn, Inst, [{'item': i, 'done': False} for i in range(items)])
+    db.insert_rows(cn, schema.Inst, [{'item': i, 'done': False} for i in range(items)])
     # simulate
     steps = []
     for i in range(1, 4):
