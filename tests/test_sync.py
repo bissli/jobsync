@@ -6,7 +6,7 @@ import config
 import pytest
 from asserts import assert_almost_equal, assert_equal
 from jobsync import schema
-from jobsync.sync import Job, Step
+from jobsync.sync import Job, Task
 
 import db
 from libb import delay
@@ -30,7 +30,7 @@ def trigger(node_name, items, site, skip_sync=False, assert_node_count=3):
             x = x_ref[:5]
             total += len(x)
             logger.info(f'Node {self.node_name} found {len(inst)} items, working {len(x)}')
-            [self.add_step(Step(i)) for i in x]
+            [self.add_task(Task(i)) for i in x]
             # write that task if completed
             for item in x:
                 db.update(self.cn, f'update {schema.Inst} set done=True where item = %s', item)
@@ -70,15 +70,15 @@ def run_more_than_one_node(site, threshold):
     nodes = 3
     db.insert_rows(cn, schema.Inst, [{'item': i, 'done': False} for i in range(items)])
     # simulate
-    steps = []
+    tasks = []
     for i in range(1, 4):
-        steps.append(
+        tasks.append(
             multiprocessing.Process(target=trigger, args=(f'host{i}', items, site)))
-    for step in steps:
-        step.start()
-    for step in steps:
-        step.join()
-    assert step.exitcode != 1, 'Multiprocessing terminated irregularly'
+    for task in tasks:
+        task.start()
+    for task in tasks:
+        task.join()
+    assert task.exitcode != 1, 'Multiprocessing terminated irregularly'
     # result
     # nodes
     host1 = db.select_scalar_or_none(cn, f'select count(1) from {schema.Node} where name=%s', 'host1')

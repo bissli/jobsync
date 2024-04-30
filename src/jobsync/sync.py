@@ -12,11 +12,11 @@ from libb import attrdict, delay
 
 logger = logging.getLogger(__name__)
 
-__all__ = ['Job', 'Step']
+__all__ = ['Job', 'Task']
 
 
 @total_ordering
-class Step:
+class Task:
 
     def __init__(self, id, name=None):
         self.id = id
@@ -52,7 +52,7 @@ class Job:
         self._wait_on_enter = int(abs(wait_on_enter)) or 60
         self._wait_on_exit = int(abs(wait_on_exit)) or 5
         self._skip_sync = skip_sync
-        self._steps = []
+        self._tasks = []
         self._node_count = 1
         self.cn = db.connect(site, config)
         if not skip_db_init:
@@ -114,26 +114,26 @@ class Job:
         len_count = len({x['count'] for x in data})
         return len_count == 1 and len_node % self._node_count == 0
 
-    def add_step(self, step: Step):
-        self._steps.append((step, now()))
+    def add_task(self, task: Task):
+        self._tasks.append((task, now()))
 
-    def remove_step(self, step: Step):
-        self._steps = [(_step, _) for _step, _ in self._steps if _step != step]
+    def remove_task(self, task: Task):
+        self._tasks = [(_task, _) for _task, _ in self._tasks if _task != task]
 
     def write_audit(self):
-        """The application can chose to flush to audit the steps early, but
+        """The application can chose to flush to audit the tasks early, but
         generally it's fine to wait and flush on context manager exit
         (to avoid database trips).
         """
-        if not self._steps:
+        if not self._tasks:
             return
         thedate = today()
-        rows = [{'date': thedate, 'node': self.node_name, 'item': step.id,
+        rows = [{'date': thedate, 'node': self.node_name, 'item': task.id,
                  'created_on': created}
-                for step, created in self._steps]
+                for task, created in self._tasks]
         i = db.insert_rows(self.cn, Audit, rows)
-        logger.debug(f'Flushed {i} step to {Audit}')
-        self._steps.clear()
+        logger.debug(f'Flushed {i} task to {Audit}')
+        self._tasks.clear()
 
     def _clean_node(self):
         sql = f'delete from {Node} where name = %s'
