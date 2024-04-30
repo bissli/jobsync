@@ -62,13 +62,13 @@ class Job:
         self.__cleanup__()
         if not self._skip_sync:
             self.set_idle()
-            logger.info(f'Sleeping {self._wait_on_enter} seconds...')
+            logger.debug(f'Sleeping {self._wait_on_enter} seconds...')
             delay(self._wait_on_enter)
             self._node_count = len(self.get_idle())
         return self
 
     def __exit__(self, exc_ty, exc_val, tb):
-        logger.info(f'Exiting {self.node_name} context')
+        logger.debug(f'Exiting {self.node_name} context')
         if exc_ty:
             logger.exception(exc_val)
         self.__cleanup__()
