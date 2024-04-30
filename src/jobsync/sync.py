@@ -4,7 +4,7 @@ import contextlib
 import logging
 from functools import total_ordering
 
-from jobsync.schema import Audit, Check, Node
+from jobsync.schema import Audit, Check, Node, init_database
 
 import db
 from date import now, today
@@ -44,6 +44,7 @@ class Job:
         wait_on_enter=60,
         wait_on_exit=5,
         skip_sync=False,
+        skip_db_init=False,
     ):
         self.node_name = node_name
         self._wait_on_enter = int(abs(wait_on_enter)) or 60
@@ -52,6 +53,8 @@ class Job:
         self._steps = []
         self._node_count = 1
         self.cn = db.connect(site, config)
+        if not skip_db_init:
+            init_database(self.cn)
 
     def __enter__(self):
         self.__cleanup__()

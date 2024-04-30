@@ -58,7 +58,7 @@ where
 def postgres():
     cn = db.connect('postgres', config)
     terminate_postgres_connections(cn)
-    schema.init_database(cn)
+    schema.init_database(cn, is_test=True)
     try:
         yield cn
     finally:
@@ -70,7 +70,7 @@ def postgres():
 @pytest.fixture()
 def sqlite():
     cn = db.connect('sqlite', config)
-    schema.init_database(cn)
+    schema.init_database(cn, is_test=True)
     try:
         yield cn
     finally:

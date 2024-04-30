@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 def trigger(node_name, items, site, skip_sync=False, assert_node_count=3):
     total = 0
-    kw = {'wait_on_enter': 5, 'skip_sync': skip_sync}
+    kw = {'wait_on_enter': 5, 'skip_sync': skip_sync, 'skip_db_init': True}
     with Job(node_name, site, config, **kw) as self:
         # we want all nodes to be online
         assert_equal(len(self.get_idle()), assert_node_count)

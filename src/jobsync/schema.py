@@ -12,7 +12,7 @@ Audit = f'{config.sync.sql.appname}audit'
 Inst = f'{config.sync.sql.appname}inst'
 
 
-def init_database(cn):
+def init_database(cn, is_test=False):
     """Init datbase and return engine
     """
     logger.debug('Checking for primary sync tables')
@@ -41,6 +41,9 @@ CREATE TABLE IF NOT EXISTS {Audit} (
     date date not null
 );
     """)
+
+    if not is_test:
+        return
 
     db.execute(cn, f"""
 CREATE TABLE IF NOT EXISTS {Inst} (
