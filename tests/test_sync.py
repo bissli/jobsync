@@ -6,7 +6,7 @@ import config
 import pytest
 from asserts import assert_almost_equal, assert_equal
 from jobsync import schema
-from jobsync.sync import Job, Task
+from jobsync.client import Job, Task
 
 import db
 from libb import delay
