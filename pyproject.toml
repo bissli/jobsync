@@ -9,9 +9,9 @@ python = "~3.11"
 
 more-itertools = "*"
 
-libb-util = { git = "https://github.com/bissli/libb-util" }
-libb-date = { git = "https://github.com/bissli/libb-date" }
-libb-db = { git = "https://github.com/bissli/libb-db" }
+libb-util = { git = "https://github.com/bissli/libb-util", rev = "master" }
+libb-date = { git = "https://github.com/bissli/libb-date", rev = "master" }
+libb-db = { git = "https://github.com/bissli/libb-db", rev = "master" }
 
 # == test
 asserts = { version = "*", optional = true }
@@ -19,7 +19,7 @@ docker = { version = "*", optional = true }
 pytest = { version = "*", optional = true }
 pytest-mock = { version = "*", optional = true }
 pytest-runner = { version = "*", optional = true }
-pdbpp = { git = "https://github.com/pdbpp/pdbpp", optional = true }
+pdbpp = { git = "https://github.com/pdbpp/pdbpp", optional = true, rev = "master" }
 wrapt = { version = "*", optional = true }
 
 [tool.poetry.extras]
