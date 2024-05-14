@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS {Audit} (
 
     db.execute(cn, f"""
 CREATE TABLE IF NOT EXISTS {Inst} (
-    item integer not null,
+    item varchar not null,
     done boolean not null
 );
     """)
