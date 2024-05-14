@@ -2,12 +2,13 @@
 """
 import contextlib
 import logging
+from collections.abc import Hashable
+from copy import deepcopy
 from functools import total_ordering
-
-from jobsync.schema import Audit, Check, Node, init_database
 
 import db
 from date import now, today
+from jobsync.schema import Audit, Check, Node, init_database
 from libb import attrdict, delay
 
 logger = logging.getLogger(__name__)
@@ -18,7 +19,8 @@ __all__ = ['Job', 'Task']
 @total_ordering
 class Task:
 
-    def __init__(self, id, name=None):
+    def __init__(self, id: Hashable, name: str = None):
+        assert isinstance(id, Hashable), f'Id {id} must be hashable'
         self.id = id
         self.name = name
 
@@ -36,7 +38,29 @@ class Task:
 
 
 class Job:
-    """Job sync manager"""
+    """Job sync manager
+
+    General routine:
+
+    with Job(...) as job:
+        # on enter we have written to the `Node` table to
+        # notify other nodes that we are idle. Then we wait
+        # and perform a query of idle nodes.
+        
+        call job.`add_task` and add Task 
+        
+        # run some actions
+
+        call job.`set_done` to indicate job completed.
+
+        # wait some interval 
+
+        call job.`others_done` to check that other nodes have flushed.
+
+        # if others done finished.
+
+        # on exit we flush audit log and cleanup tables
+    """
 
     def __init__(
         self,
@@ -53,21 +77,35 @@ class Job:
         self._wait_on_exit = int(abs(wait_on_exit)) or 5
         self._skip_sync = skip_sync
         self._tasks = []
-        self._node_count = 1
+        self._nodes = [self.node_name]
         self.cn = db.connect(site, config)
         if not skip_db_init:
             init_database(self.cn)
 
     def __enter__(self):
+        """On enter (assuming sync)
+
+        (1) Clear self from audit tables (in case previous run failed).
+        (2) Notify nodes that we are ready to sync.
+        (3) Wait `self._wait_on_enter` seconds.
+        (4) Count number of nodes registered for sync.
+
+        """
         self.__cleanup__()
         if not self._skip_sync:
             self.set_idle()
             logger.debug(f'Sleeping {self._wait_on_enter} seconds...')
             delay(self._wait_on_enter)
-            self._node_count = len(self.get_idle())
+            self._nodes = self.get_idle()
         return self
 
     def __exit__(self, exc_ty, exc_val, tb):
+        """On exit (assuming sync)
+
+        (1) Clear self from audit tables.
+        (2) Close DB connection.
+
+        """
         logger.debug(f'Exiting {self.node_name} context')
         if exc_ty:
             logger.exception(exc_val)
@@ -75,7 +113,18 @@ class Job:
         with contextlib.suppress(Exception):
             self.cn.close()
 
+    @property
+    def nodes(self):
+        """Safely expose internal nodes (for name matching, for example).
+        """
+        return deepcopy(self._nodes)
+
     def get_idle(self) -> list[dict]:
+        """Get idle nodes.
+
+        (1) Get nodes from `Node` table (membership indicates idle node).
+
+        """
         if self._skip_sync:
             return [attrdict(node=self.node_name)]
         sql = f'select distinct(name) from {Node}'
@@ -84,6 +133,9 @@ class Job:
 
     def get_done(self) -> list[dict]:
         """Return mapping of nodes to current completed checkpoints
+
+        (1) Query nodes in `Check` table (membership indicates node done).
+
         """
         if self._skip_sync:
             return [attrdict(node=self.node_name, count=1)]
@@ -93,12 +145,20 @@ class Job:
 
     def set_idle(self):
         """Notify other nodes that current node is ready
+
+        (1) Add node to `Node` table (membership indicates idle node).
+
         """
         sql = f'insert into {Node} (name, created_on) values (%s, %s)'
         db.execute(self.cn, sql, self.node_name, now())
         logger.debug(f'{self.node_name} told ready status')
 
     def set_done(self):
+        """Notify other nodes that current node is done
+
+        (1) Add node to `Check` table (membership indicates node done).
+
+        """
         if self._skip_sync:
             return
         sql = f'insert into {Check} (node, created_on) values (%s, %s)'
@@ -111,7 +171,7 @@ class Job:
         data = self.get_done()
         len_node = len([x['node'] for x in data])
         len_count = len({x['count'] for x in data})
-        return len_count == 1 and len_node % self._node_count == 0
+        return len_count == 1 and len_node % len(self._nodes) == 0
 
     def add_task(self, task: Task):
         self._tasks.append((task, now()))
