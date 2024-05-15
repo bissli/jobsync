@@ -1,8 +1,8 @@
 import logging
 
-from jobsync import config
+import database as db
 
-import db
+from jobsync import config
 
 logger = logging.getLogger(__name__)
 

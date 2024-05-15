@@ -6,7 +6,8 @@ from collections.abc import Hashable
 from copy import deepcopy
 from functools import total_ordering
 
-import db
+import database as db
+
 from date import now, today
 from jobsync.schema import Audit, Check, Node, init_database
 from libb import attrdict, delay
@@ -46,14 +47,14 @@ class Job:
         # on enter we have written to the `Node` table to
         # notify other nodes that we are idle. Then we wait
         # and perform a query of idle nodes.
-        
-        call job.`add_task` and add Task 
-        
+
+        call job.`add_task` and add Task
+
         # run some actions
 
         call job.`set_done` to indicate job completed.
 
-        # wait some interval 
+        # wait some interval
 
         call job.`others_done` to check that other nodes have flushed.
 

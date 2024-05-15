@@ -3,12 +3,12 @@ import multiprocessing
 import random
 
 import config
+import database as db
 import pytest
 from asserts import assert_almost_equal, assert_equal
+
 from jobsync import schema
 from jobsync.client import Job, Task
-
-import db
 from libb import delay
 
 logger = logging.getLogger(__name__)

@@ -3,11 +3,11 @@ import os
 import time
 
 import config
+import database as db
 import docker
 import pytest
-from jobsync import schema
 
-import db
+from jobsync import schema
 
 logger = logging.getLogger(__name__)
 

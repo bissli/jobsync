@@ -9,9 +9,9 @@ python = "~3.11"
 
 more-itertools = "*"
 
+database = { git = "https://github.com/bissli/database", rev = "master" }
 libb-util = { git = "https://github.com/bissli/libb-util", rev = "master" }
 libb-date = { git = "https://github.com/bissli/libb-date", rev = "master" }
-libb-db = { git = "https://github.com/bissli/libb-db", rev = "master" }
 
 # == test
 asserts = { version = "*", optional = true }
