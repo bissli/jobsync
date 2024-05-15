@@ -78,7 +78,7 @@ class Job:
         self._wait_on_exit = int(abs(wait_on_exit)) or 5
         self._skip_sync = skip_sync
         self._tasks = []
-        self._nodes = [self.node_name]
+        self._nodes = [attrdict(node=self.node_name)]
         self.cn = db.connect(site, config)
         if not skip_db_init:
             init_database(self.cn)
@@ -120,7 +120,7 @@ class Job:
         """
         return deepcopy(self._nodes)
 
-    def get_idle(self) -> list[dict]:
+    def get_idle(self) -> list[attrdict]:
         """Get idle nodes.
 
         (1) Get nodes from `Node` table (membership indicates idle node).
@@ -132,7 +132,7 @@ class Job:
         return [attrdict(node=row['name']) for row in
                 db.select(self.cn, sql).to_dict('records')]
 
-    def get_done(self) -> list[dict]:
+    def get_done(self) -> list[attrdict]:
         """Return mapping of nodes to current completed checkpoints
 
         (1) Query nodes in `Check` table (membership indicates node done).
