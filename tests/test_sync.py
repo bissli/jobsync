@@ -114,12 +114,12 @@ def test_simulate_postgres_multiple_nodes(psql_docker, postgres):
 
 def test_simulate_postgres_one_node_no_sync(psql_docker, postgres):
     print('Running simulation with Postgres one node no sync')
-    run_only_one_node('postgres', skip_sync=False)
+    run_only_one_node('postgres', skip_sync=True)
 
 
 def test_simulate_postgres_one_node_sync(psql_docker, postgres):
     print('Running simulation with Postgres one node sync')
-    run_only_one_node('postgres', skip_sync=True)
+    run_only_one_node('postgres', skip_sync=False)
 
 
 def test_simulate_sqlite_multiple_nodes(sqlite):
@@ -129,7 +129,7 @@ def test_simulate_sqlite_multiple_nodes(sqlite):
 
 def test_simulate_sqlite_one_node_no_sync(sqlite):
     print('Running simulation with Sqlite one node no sync')
-    run_only_one_node('sqlite', skip_sync=False)
+    run_only_one_node('sqlite', skip_sync=True)
 
 
 def test_simulate_sqlite_one_node_sync(sqlite):
