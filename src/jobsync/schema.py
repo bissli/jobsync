@@ -10,12 +10,13 @@ Node = f'{config.sync.sql.appname}node'
 Check = f'{config.sync.sql.appname}checkpoint'
 Audit = f'{config.sync.sql.appname}audit'
 Inst = f'{config.sync.sql.appname}inst'
+Claim = f'{config.sync.sql.appname}claim'
 
 
 def init_database(cn, is_test=False):
     """Init datbase and return engine
     """
-    logger.debug(f'Initializing tables {Node},{Check},{Audit}')
+    logger.debug(f'Initializing tables {Node},{Check},{Audit},{Claim}')
 
     db.execute(cn, f"""
 CREATE TABLE IF NOT EXISTS {Node} (
@@ -39,6 +40,17 @@ CREATE TABLE IF NOT EXISTS {Audit} (
     node varchar not null,
     item varchar not null,
     date date not null
+);
+    """)
+
+    logger.debug(f'Initializing table {Claim}')
+
+    db.execute(cn, f"""
+CREATE TABLE IF NOT EXISTS {Claim} (
+    node varchar not null,
+    item varchar not null,
+    created_on timestamp without time zone not null,
+    primary key (node, item)
 );
     """)
 

@@ -9,8 +9,8 @@ from functools import total_ordering
 import database as db
 
 from date import now, today
-from jobsync.schema import Audit, Check, Node, init_database
-from libb import attrdict, delay
+from jobsync.schema import Audit, Check, Claim, Node, init_database
+from libb import attrdict, delay, isiterable
 
 logger = logging.getLogger(__name__)
 
@@ -69,13 +69,13 @@ class Job:
         site,
         config,
         wait_on_enter=60,
-        wait_on_exit=5,
+        wait_on_exit=0,
         skip_sync=False,
         skip_db_init=False,
     ):
         self.node_name = node_name
-        self._wait_on_enter = int(abs(wait_on_enter)) or 60
-        self._wait_on_exit = int(abs(wait_on_exit)) or 5
+        self._wait_on_enter = int(abs(wait_on_enter))
+        self._wait_on_exit = int(abs(wait_on_exit))
         self._skip_sync = skip_sync
         self._tasks = []
         self._nodes = [attrdict(node=self.node_name)]
@@ -92,7 +92,7 @@ class Job:
         (4) Count number of nodes registered for sync.
 
         """
-        self.__cleanup__()
+        self.__cleanup()
         if not self._skip_sync:
             self.set_idle()
             logger.debug(f'Sleeping {self._wait_on_enter} seconds...')
@@ -110,7 +110,10 @@ class Job:
         logger.debug(f'Exiting {self.node_name} context')
         if exc_ty:
             logger.exception(exc_val)
-        self.__cleanup__()
+        if not self._skip_sync and self._wait_on_exit:
+            logger.debug(f'Sleeping {self._wait_on_exit} seconds...')
+            delay(self._wait_on_exit)
+        self.__cleanup()
         with contextlib.suppress(Exception):
             self.cn.close()
 
@@ -165,6 +168,28 @@ class Job:
         sql = f'insert into {Check} (node, created_on) values (%s, %s)'
         db.execute(self.cn, sql, self.node_name, now())
 
+    def set_claim(self, item):
+        """Claim and item or items. Publish to database to
+        inform other nodes.
+        """
+        if isiterable(item):
+            this = [{'node': self.node_name, 'created_on': now(), 'item': i} for i in item]
+            db.insert_rows(self.cn, Claim, *this)
+        else:
+            sql = f'insert into {Claim} (node, item, created_on) values (%s, %s, %s) on conflict do nothing'
+            db.execute(self.cn, sql, self.node_name, str(item), now())
+
+    def release_claim(self, item):
+        """Release claim on item or items. Publish to database
+        to inform other nodes.
+        """
+        if isiterable(item):
+            sql = f'delete from {Claim} where node = %s and item in ({",".join(["%s"]*len(item))})'
+            db.execute(self.cn, sql, self.node_name, *[str(i) for i in item])
+        else:
+            sql = f'delete from {Claim} where node = %s and item = %s'
+            db.execute(self.cn, sql, self.node_name, str(item))
+
     def others_done(self) -> bool:
         """We want both all nodes to have completed and the checkpoint count
         to be identical.
@@ -198,20 +223,26 @@ class Job:
         logger.debug(f'Flushed {i} task to {Audit}')
         self._tasks.clear()
 
-    def _clean_node(self):
+    def __cleanup_node_table(self):
         sql = f'delete from {Node} where name = %s'
         db.execute(self.cn, sql, self.node_name)
         logger.debug(f'Cleared {self.node_name} from {Node}')
 
-    def _clean_check(self):
+    def __cleanup_check_table(self):
         sql = f'delete from {Check} where node = %s'
         db.execute(self.cn, sql, self.node_name)
         logger.debug(f'Cleaned {self.node_name} from {Check}')
 
-    def __cleanup__(self):
+    def __cleanup_claim_table(self):
+        sql = f'delete from {Claim} where node = %s'
+        db.execute(self.cn, sql, self.node_name)
+        logger.debug(f'Cleaned {self.node_name} from {Claim}')
+
+    def __cleanup(self):
         """Always log, even when not syncing
         """
         if not self._skip_sync:
-            self._clean_node()
-            self._clean_check()
+            self.__cleanup_node_table()
+            self.__cleanup_check_table()
+            self.__cleanup_claim_table()
         self.write_audit()

@@ -37,7 +37,7 @@ def psql_docker():
 
 
 def drop_tables(cn):
-    for table in [schema.Node, schema.Check, schema.Audit, schema.Inst]:
+    for table in [schema.Node, schema.Check, schema.Audit, schema.Inst, schema.Claim]:
         db.execute(cn, f'drop table {table}')
 
 
