@@ -17,28 +17,29 @@ logger = logging.getLogger(__name__)
 def trigger(node_name, items, site, skip_sync=False, assert_node_count=3):
     total = 0
     kw = {'wait_on_enter': 5, 'skip_sync': skip_sync, 'skip_db_init': True}
-    with Job(node_name, site, config, **kw) as self:
+    cn = db.connect(site, config)
+    with Job(node_name, site, config, **kw) as job:
         # we want all nodes to be online
-        assert_equal(len(self.get_idle()), assert_node_count)
+        assert_equal(len(job.get_idle()), assert_node_count)
         while True:
             # gather and process tasks
-            inst = db.select(self.cn, f'select item, done from {schema.Inst} where done is False').to_dict('records')
+            inst = db.select(cn, f'select item, done from {schema.Inst} where done is False').to_dict('records')
             if not inst:
                 break
             x_ref = [x['item'] for x in inst]
             random.shuffle(x_ref)
             x = x_ref[:5]
             total += len(x)
-            logger.info(f'Node {self.node_name} found {len(inst)} items, working {len(x)}')
-            [self.add_task(Task(i)) for i in x]
+            logger.info(f'Node {job.node_name} found {len(inst)} items, working {len(x)}')
+            [job.add_task(Task(i)) for i in x]
             # write that task if completed
             for item in x:
-                db.update(self.cn, f'update {schema.Inst} set done=True where item = %s', item)
+                db.update(cn, f'update {schema.Inst} set done=True where item = %s', item)
             # check-in and wait until other nodes are finished
-            self.set_done()
+            job.set_done()
             delay(0.3)
             for _ in range(10):
-                if self.others_done():
+                if job.others_done():
                     break
                 delay(3)
 
