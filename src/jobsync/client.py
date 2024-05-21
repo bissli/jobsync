@@ -134,7 +134,7 @@ class Job:
         """
         if self._skip_sync:
             return [attrdict(node=self.node_name)]
-        sql = f'select distinct(name) from {Node}'
+        sql = f'select name from {Node} group by name order by name'
         return [attrdict(node=row['name']) for row in
                 db.select(self._cn, sql).to_dict('records')]
 
