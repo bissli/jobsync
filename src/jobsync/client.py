@@ -194,13 +194,11 @@ class Job:
             db.execute(self._cn, sql, self.node_name, str(item))
 
     def others_done(self) -> bool:
-        """We want both all nodes to have completed and the checkpoint count
-        to be identical.
+        """Others are done when everyone has flushed. No congruency enforcement.
         """
         data = self.get_done()
-        len_node = len([x['node'] for x in data])
-        len_count = len({x['count'] for x in data})
-        return len_count == 1 and len_node % len(self._nodes) == 0
+        len_node = len([x['node'] for x in data if x['count']])
+        return len_node == len(self._nodes)
 
     def add_task(self, task: Task):
         self._tasks.append((task, now()))
