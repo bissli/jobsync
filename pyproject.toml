@@ -10,8 +10,8 @@ python = "^3.9"
 more-itertools = "*"
 opendate = "*"
 
-database = { git = "https://github.com/bissli/database", rev = "master" }
-libb-util = { git = "https://github.com/bissli/libb-util", rev = "master" }
+database = { git = "https://github.com/bissli/database" }
+libb-util = { git = "https://github.com/bissli/libb-util" }
 
 # == test
 asserts = { version = "*", optional = true }
@@ -19,14 +19,12 @@ docker = { version = "*", optional = true }
 pytest = { version = "*", optional = true }
 pytest-mock = { version = "*", optional = true }
 pytest-runner = { version = "*", optional = true }
-pdbpp = { git = "https://github.com/pdbpp/pdbpp", optional = true, rev = "master" }
 wrapt = { version = "*", optional = true }
 
 [tool.poetry.extras]
 test = [
   "asserts",
   "docker",
-  "pdbpp",
   "pytest",
   "pytest-mock",
   "pytest-runner",
