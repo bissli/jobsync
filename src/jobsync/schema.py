@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS {Audit} (
     item varchar not null,
     date date not null
 );
+CREATE INDEX ON {Audit} (note, item, date);
     """)
 
     logger.debug(f'Initializing table {Claim}')
