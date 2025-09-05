@@ -18,12 +18,13 @@ def trigger(node_name, items, site, skip_sync=False, assert_node_count=3):
     total = 0
     kw = {'wait_on_enter': 5, 'skip_sync': skip_sync, 'skip_db_init': True}
     cn = db.connect(site, config)
+    tables = schema.get_table_names(config)
     with Job(node_name, site, config, **kw) as job:
         # we want all nodes to be online
         assert_equal(len(job.get_idle()), assert_node_count)
         while True:
             # gather and process tasks
-            inst = db.select(cn, f'select item, done from {schema.Inst} where done is False').to_dict('records')
+            inst = db.select(cn, f'select item, done from {tables["Inst"]} where done is False').to_dict('records')
             if not inst:
                 break
             x_ref = [x['item'] for x in inst]
@@ -34,7 +35,7 @@ def trigger(node_name, items, site, skip_sync=False, assert_node_count=3):
             [job.add_task(Task(i)) for i in x]
             # write that task if completed
             for item in x:
-                db.update(cn, f'update {schema.Inst} set done=True where item = %s', item)
+                db.update(cn, f'update {tables["Inst"]} set done=True where item = %s', item)
             # check-in and wait until other nodes are finished
             job.set_done()
             delay(0.3)
@@ -46,20 +47,21 @@ def trigger(node_name, items, site, skip_sync=False, assert_node_count=3):
 
 def run_only_one_node(site, skip_sync):
     cn = db.connect(site, config)
+    tables = schema.get_table_names(config)
     items = 30
     nodes = 1
-    db.insert_rows(cn, schema.Inst, [{'item': i, 'done': False} for i in range(items)])
+    db.insert_rows(cn, tables['Inst'], [{'item': i, 'done': False} for i in range(items)])
     trigger('host1', items, site, skip_sync=skip_sync, assert_node_count=1)
     # nodes
-    host1 = db.select_scalar_or_none(cn, f'select count(1) from {schema.Node} where name=%s', 'host1')
+    host1 = db.select_scalar_or_none(cn, f'select count(1) from {tables["Node"]} where name=%s', 'host1')
     print('No nodes should remain online (cleanup)')
     assert_equal(host1, 0)
     # checkpoints
-    host1 = db.select_scalar_or_none(cn, f'select count(1) from {schema.Check} where node=%s', 'host1')
+    host1 = db.select_scalar_or_none(cn, f'select count(1) from {tables["Check"]} where node=%s', 'host1')
     print('No checkpoints should remain after run (cleanup)')
     assert_equal(host1, 0)
     # audit
-    host1 = db.select_scalar_or_none(cn, f'select count(1) from {schema.Audit} where node=%s', 'host1')
+    host1 = db.select_scalar_or_none(cn, f'select count(1) from {tables["Audit"]} where node=%s', 'host1')
     print(f'Host1 handled all tasks: {host1}')
     expect, delta = int(items / nodes), int(items / nodes)
     assert_almost_equal(host1, expect, delta=delta)
@@ -67,9 +69,10 @@ def run_only_one_node(site, skip_sync):
 
 def run_more_than_one_node(site, threshold):
     cn = db.connect(site, config)
+    tables = schema.get_table_names(config)
     items = 91
     nodes = 3
-    db.insert_rows(cn, schema.Inst, [{'item': i, 'done': False} for i in range(items)])
+    db.insert_rows(cn, tables['Inst'], [{'item': i, 'done': False} for i in range(items)])
     # simulate
     tasks = []
     for i in range(1, 4):
@@ -82,25 +85,25 @@ def run_more_than_one_node(site, threshold):
     assert task.exitcode != 1, 'Multiprocessing terminated irregularly'
     # result
     # nodes
-    host1 = db.select_scalar_or_none(cn, f'select count(1) from {schema.Node} where name=%s', 'host1')
-    host2 = db.select_scalar_or_none(cn, f'select count(1) from {schema.Node} where name=%s', 'host2')
-    host3 = db.select_scalar_or_none(cn, f'select count(1) from {schema.Node} where name=%s', 'host3')
+    host1 = db.select_scalar_or_none(cn, f'select count(1) from {tables["Node"]} where name=%s', 'host1')
+    host2 = db.select_scalar_or_none(cn, f'select count(1) from {tables["Node"]} where name=%s', 'host2')
+    host3 = db.select_scalar_or_none(cn, f'select count(1) from {tables["Node"]} where name=%s', 'host3')
     print('No nodes should remain online (cleanup)')
     assert_equal(host1, 0)
     assert_equal(host1, host2)
     assert_equal(host2, host3)
     # checkpoints
-    host1 = db.select_scalar_or_none(cn, f'select count(1) from {schema.Check} where node=%s', 'host1')
-    host2 = db.select_scalar_or_none(cn, f'select count(1) from {schema.Check} where node=%s', 'host2')
-    host3 = db.select_scalar_or_none(cn, f'select count(1) from {schema.Check} where node=%s', 'host3')
+    host1 = db.select_scalar_or_none(cn, f'select count(1) from {tables["Check"]} where node=%s', 'host1')
+    host2 = db.select_scalar_or_none(cn, f'select count(1) from {tables["Check"]} where node=%s', 'host2')
+    host3 = db.select_scalar_or_none(cn, f'select count(1) from {tables["Check"]} where node=%s', 'host3')
     print('No checkpoints should remain after run (cleanup)')
     assert_equal(host1, 0)
     assert_equal(host1, host2)
     assert_equal(host2, host3)
     # audit
-    host1 = db.select_scalar_or_none(cn, f'select count(1) from {schema.Audit} where node=%s', 'host1')
-    host2 = db.select_scalar_or_none(cn, f'select count(1) from {schema.Audit} where node=%s', 'host2')
-    host3 = db.select_scalar_or_none(cn, f'select count(1) from {schema.Audit} where node=%s', 'host3')
+    host1 = db.select_scalar_or_none(cn, f'select count(1) from {tables["Audit"]} where node=%s', 'host1')
+    host2 = db.select_scalar_or_none(cn, f'select count(1) from {tables["Audit"]} where node=%s', 'host2')
+    host3 = db.select_scalar_or_none(cn, f'select count(1) from {tables["Audit"]} where node=%s', 'host3')
     print(f'Each node should process roughly the same number of tasks: {host1}, {host2}, {host3}')
     expect, delta = int(items / nodes), int((items / nodes) * threshold)  # multiprocessing somewhat unpredictable
     assert_almost_equal(host1, expect, delta=delta)

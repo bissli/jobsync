@@ -5,7 +5,7 @@ description = "Simple Sync Manager"
 authors = ["bissli <bissli@xyz.com>"]
 
 [tool.poetry.dependencies]
-python = "^3.9"
+python = "^3.10"
 
 more-itertools = "*"
 opendate = "*"

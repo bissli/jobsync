@@ -10,7 +10,7 @@ from types import ModuleType
 import database as db
 
 from date import Date, now, today
-from jobsync.schema import Audit, Check, Claim, Node, init_database
+from jobsync.schema import get_table_names, init_database
 from libb import attrdict, delay, isiterable
 
 logger = logging.getLogger(__name__)
@@ -83,8 +83,10 @@ class Job:
         self._nodes = [attrdict(node=self.node_name)]
         self._date = date or today()
         self._cn = db.connect(site, config)
+        self._config = config
+        self._tables = get_table_names(config)
         if not skip_db_init:
-            init_database(self._cn)
+            init_database(self._cn, config)
 
     def __enter__(self):
         """On enter (assuming sync)
@@ -112,7 +114,7 @@ class Job:
         """
         logger.debug(f'Exiting {self.node_name} context')
         if exc_ty:
-            logger.exception(exc_val)
+            logger.error(exc_val)
         if not self._skip_sync and self._wait_on_exit:
             logger.debug(f'Sleeping {self._wait_on_exit} seconds...')
             delay(self._wait_on_exit)
@@ -134,7 +136,7 @@ class Job:
         """
         if self._skip_sync:
             return [attrdict(node=self.node_name)]
-        sql = f'select name from {Node} group by name order by name'
+        sql = f'select name from {self._tables["Node"]} group by name order by name'
         return [attrdict(node=row['name']) for row in
                 db.select(self._cn, sql).to_dict('records')]
 
@@ -146,7 +148,7 @@ class Job:
         """
         if self._skip_sync:
             return [attrdict(node=self.node_name, count=1)]
-        sql = f'select node, count(1) as count from {Check} group by node'
+        sql = f'select node, count(1) as count from {self._tables["Check"]} group by node'
         return [attrdict(node=row['node'], count=row['count']) for row in
                 db.select(self._cn, sql).to_dict('records')]
 
@@ -156,7 +158,7 @@ class Job:
         (1) Add node to `Node` table (membership indicates idle node).
 
         """
-        sql = f'insert into {Node} (name, created_on) values (%s, %s)'
+        sql = f'insert into {self._tables["Node"]} (name, created_on) values (%s, %s)'
         db.execute(self._cn, sql, self.node_name, now())
         logger.debug(f'{self.node_name} told ready status')
 
@@ -168,7 +170,7 @@ class Job:
         """
         if self._skip_sync:
             return
-        sql = f'insert into {Check} (node, created_on) values (%s, %s)'
+        sql = f'insert into {self._tables["Check"]} (node, created_on) values (%s, %s)'
         db.execute(self._cn, sql, self.node_name, now())
 
     def set_claim(self, item):
@@ -177,9 +179,9 @@ class Job:
         """
         if isiterable(item):
             this = [{'node': self.node_name, 'created_on': now(), 'item': i} for i in item]
-            db.insert_rows(self._cn, Claim, *this)
+            db.insert_rows(self._cn, self._tables['Claim'], *this)
         else:
-            sql = f'insert into {Claim} (node, item, created_on) values (%s, %s, %s) on conflict do nothing'
+            sql = f'insert into {self._tables["Claim"]} (node, item, created_on) values (%s, %s, %s) on conflict do nothing'
             db.execute(self._cn, sql, self.node_name, str(item), now())
 
     def release_claim(self, item):
@@ -187,10 +189,10 @@ class Job:
         to inform other nodes.
         """
         if isiterable(item):
-            sql = f'delete from {Claim} where node = %s and item in ({",".join(["%s"]*len(item))})'
+            sql = f'delete from {self._tables["Claim"]} where node = %s and item in ({",".join(["%s"]*len(item))})'
             db.execute(self._cn, sql, self.node_name, *[str(i) for i in item])
         else:
-            sql = f'delete from {Claim} where node = %s and item = %s'
+            sql = f'delete from {self._tables["Claim"]} where node = %s and item = %s'
             db.execute(self._cn, sql, self.node_name, str(item))
 
     def others_done(self) -> bool:
@@ -219,29 +221,29 @@ class Job:
             'item': task.id,
             'created_on': created
             } for task, created in self._tasks]
-        i = db.insert_rows(self._cn, Audit, rows)
-        logger.debug(f'Flushed {i} task to {Audit}')
+        i = db.insert_rows(self._cn, self._tables['Audit'], rows)
+        logger.debug(f'Flushed {i} task to {self._tables["Audit"]}')
         self._tasks.clear()
 
     def get_audit(self) -> list[attrdict]:
-        sql = f'select node, item from {Audit} where date = %s'
+        sql = f'select node, item from {self._tables["Audit"]} where date = %s'
         return [attrdict(node=row['node'], item=row['item']) for row in
                 db.select(self._cn, sql, self._date).to_dict('records')]
 
     def __cleanup_node_table(self):
-        sql = f'delete from {Node} where name = %s'
+        sql = f'delete from {self._tables["Node"]} where name = %s'
         db.execute(self._cn, sql, self.node_name)
-        logger.debug(f'Cleared {self.node_name} from {Node}')
+        logger.debug(f'Cleared {self.node_name} from {self._tables["Node"]}')
 
     def __cleanup_check_table(self):
-        sql = f'delete from {Check} where node = %s'
+        sql = f'delete from {self._tables["Check"]} where node = %s'
         db.execute(self._cn, sql, self.node_name)
-        logger.debug(f'Cleaned {self.node_name} from {Check}')
+        logger.debug(f'Cleaned {self.node_name} from {self._tables["Check"]}')
 
     def __cleanup_claim_table(self):
-        sql = f'delete from {Claim} where node = %s'
+        sql = f'delete from {self._tables["Claim"]} where node = %s'
         db.execute(self._cn, sql, self.node_name)
-        logger.debug(f'Cleaned {self.node_name} from {Claim}')
+        logger.debug(f'Cleaned {self.node_name} from {self._tables["Claim"]}')
 
     def __cleanup(self):
         """Always log, even when not syncing

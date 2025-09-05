@@ -3,7 +3,7 @@ from libb import Setting
 Setting.unlock()
 
 postgres = Setting()
-postgres.drivername = 'postgres'
+postgres.drivername = 'postgresql'
 postgres.database = 'jobsync'
 postgres.hostname = 'localhost'
 postgres.username = 'postgres'

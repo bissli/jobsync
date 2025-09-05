@@ -17,15 +17,21 @@ current_path = os.path.dirname(os.path.realpath(__file__))
 @pytest.fixture(scope='module')
 def psql_docker():
     client = docker.from_env()
+    try:
+        existing = client.containers.get('test_postgres')
+        existing.stop()
+        existing.remove()
+    except docker.errors.NotFound:
+        pass
     container = client.containers.run(
-        image='postgres:12',
+        image='postgres:17',
         auto_remove=True,
         environment={
             'POSTGRES_DB': 'jobsync',
             'POSTGRES_USER': 'postgres',
             'POSTGRES_PASSWORD': 'postgres',
-            'TZ': 'US/Eastern',
-            'PGTZ': 'US/Eastern'},
+            'TZ': 'America/New_York',
+            'PGTZ': 'America/New_York'},
         name='test_postgres',
         ports={'5432/tcp': ('127.0.0.1', 5432)},
         detach=True,
@@ -36,9 +42,15 @@ def psql_docker():
     container.stop()
 
 
-def drop_tables(cn):
-    for table in [schema.Node, schema.Check, schema.Audit, schema.Inst, schema.Claim]:
+def drop_tables(cn, config):
+    tables = schema.get_table_names(config)
+    for table in [tables['Node'], tables['Check'], tables['Audit'], tables['Inst'], tables['Claim']]:
         db.execute(cn, f'drop table {table}')
+
+
+def create_extensions(cn):
+    sql = 'CREATE EXTENSION IF NOT EXISTS hstore'
+    db.execute(cn, sql)
 
 
 def terminate_postgres_connections(cn):
@@ -54,25 +66,26 @@ where
     db.select(cn, sql)
 
 
-@pytest.fixture()
+@pytest.fixture
 def postgres():
     cn = db.connect('postgres', config)
+    create_extensions(cn)
     terminate_postgres_connections(cn)
-    schema.init_database(cn, is_test=True)
+    schema.init_database(cn, config, is_test=True)
     try:
         yield cn
     finally:
         terminate_postgres_connections(cn)
-        drop_tables(cn)
+        drop_tables(cn, config)
         cn.close()
 
 
-@pytest.fixture()
+@pytest.fixture
 def sqlite():
     cn = db.connect('sqlite', config)
-    schema.init_database(cn, is_test=True)
+    schema.init_database(cn, config, is_test=True)
     try:
         yield cn
     finally:
-        drop_tables(cn)
+        drop_tables(cn, config)
         cn.close()
