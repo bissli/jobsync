@@ -36,7 +36,7 @@ class Task:
         return self.id < other.id
 
     def __gt__(self, other):
-        return not self.__lt__(other)
+        return self.id > other.id
 
 
 class Job:
@@ -178,7 +178,7 @@ class Job:
         inform other nodes.
         """
         if isiterable(item):
-            this = [{'node': self.node_name, 'created_on': now(), 'item': i} for i in item]
+            this = [{'node': self.node_name, 'created_on': now(), 'item': str(i)} for i in item]
             db.insert_rows(self._cn, self._tables['Claim'], *this)
         else:
             sql = f'insert into {self._tables["Claim"]} (node, item, created_on) values (%s, %s, %s) on conflict do nothing'
@@ -218,7 +218,7 @@ class Job:
         rows = [{
             'date': self._date,
             'node': self.node_name,
-            'item': task.id,
+            'item': str(task.id),
             'created_on': created
             } for task, created in self._tasks]
         i = db.insert_rows(self._cn, self._tables['Audit'], rows)

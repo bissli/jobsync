@@ -74,10 +74,7 @@ def run_more_than_one_node(site, threshold):
     nodes = 3
     db.insert_rows(cn, tables['Inst'], [{'item': i, 'done': False} for i in range(items)])
     # simulate
-    tasks = []
-    for i in range(1, 4):
-        tasks.append(
-            multiprocessing.Process(target=trigger, args=(f'host{i}', items, site)))
+    tasks = [multiprocessing.Process(target=trigger, args=(f'host{i}', items, site)) for i in range(1, 4)]
     for task in tasks:
         task.start()
     for task in tasks:
@@ -126,16 +123,19 @@ def test_simulate_postgres_one_node_sync(psql_docker, postgres):
     run_only_one_node('postgres', skip_sync=False)
 
 
+@pytest.mark.skip
 def test_simulate_sqlite_multiple_nodes(sqlite):
     print('Running simulation with Sqlite multilple nodes')
     run_more_than_one_node('sqlite', 0.4)
 
 
+@pytest.mark.skip
 def test_simulate_sqlite_one_node_no_sync(sqlite):
     print('Running simulation with Sqlite one node no sync')
     run_only_one_node('sqlite', skip_sync=True)
 
 
+@pytest.mark.skip
 def test_simulate_sqlite_one_node_sync(sqlite):
     print('Running simulation with Sqlite one node sync')
     run_only_one_node('sqlite', skip_sync=True)

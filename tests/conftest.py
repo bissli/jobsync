@@ -8,10 +8,11 @@ import docker
 import pytest
 
 from jobsync import schema
+import pathlib
 
 logger = logging.getLogger(__name__)
 
-current_path = os.path.dirname(os.path.realpath(__file__))
+current_path = pathlib.Path(os.path.realpath(__file__)).parent
 
 
 @pytest.fixture(scope='module')
@@ -84,8 +85,12 @@ def postgres():
 def sqlite():
     cn = db.connect('sqlite', config)
     schema.init_database(cn, config, is_test=True)
+    db_path = config.sqlite.database
     try:
         yield cn
     finally:
         drop_tables(cn, config)
         cn.close()
+        if pathlib.Path(db_path).exists():
+            pathlib.Path(db_path).unlink()
+            logger.debug(f'Removed SQLite database file: {db_path}')
