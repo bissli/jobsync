@@ -1,5 +1,6 @@
 import logging
 import os
+import pathlib
 import time
 
 import config
@@ -8,7 +9,6 @@ import docker
 import pytest
 
 from jobsync import schema
-import pathlib
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +45,19 @@ def psql_docker():
 
 def drop_tables(cn, config):
     tables = schema.get_table_names(config)
-    for table in [tables['Node'], tables['Check'], tables['Audit'], tables['Inst'], tables['Claim']]:
-        db.execute(cn, f'drop table {table}')
+    for table in [
+        tables['Rebalance'],
+        tables['RebalanceLock'],
+        tables['LeaderLock'],
+        tables['Lock'],
+        tables['Token'],
+        tables['Claim'],
+        tables['Inst'],
+        tables['Audit'],
+        tables['Check'],
+        tables['Node']
+    ]:
+        db.execute(cn, f'drop table if exists {table}')
 
 
 def create_extensions(cn):
