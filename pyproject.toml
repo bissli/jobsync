@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "jobsync"
-version = "1.1.0"
+version = "1.1.1"
 description = "Simple Sync Manager"
 authors = ["bissli <bissli@xyz.com>"]
 
