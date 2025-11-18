@@ -10,8 +10,8 @@ python = "^3.10"
 more-itertools = "*"
 opendate = "*"
 
-# database = { git = "https://github.com/bissli/database" }
-# libb-util = { git = "https://github.com/bissli/libb-util" }
+database = { git = "https://github.com/bissli/database" }
+libb-util = { git = "https://github.com/bissli/libb-util" }
 
 # == test
 asserts = { version = "*", optional = true }
