@@ -14,7 +14,7 @@ from datetime import timedelta
 from functools import total_ordering
 from types import ModuleType
 
-import database as db
+from sqlalchemy import create_engine, text
 
 from date import Date, now, today
 from jobsync.schema import get_table_names, init_database
@@ -54,12 +54,6 @@ class CoordinationConfig:
     locks_enabled: bool = True
     leader_lock_timeout_sec: int = 30
     health_check_interval_sec: int = 30
-
-
-def _normalize_db_result(result) -> list[dict]:
-    """Normalize database result to list of dicts.
-    """
-    return result if isinstance(result, list) else result.to_dict('records')
 
 
 def compute_minimal_move_distribution(
@@ -211,7 +205,6 @@ class Job:
     def __init__(
         self,
         node_name: str,
-        site: str,
         config: ModuleType,
         date: Date = None,
         wait_on_enter: int = 120,
@@ -220,13 +213,12 @@ class Job:
         lock_provider: callable = None,
         clear_existing_locks: bool = False,
         coordination_config: CoordinationConfig = None,
-        db_connection = None,
+        connection_string: str = None,
     ):
         """Initialize job sync manager with hybrid coordination support.
 
         Args:
             node_name: Unique identifier for this node
-            site: Database site name
             config: Configuration module (coordination params read from config.sync.coordination if coordination_config not provided)
             date: Processing date (defaults to today)
             wait_on_enter: Seconds to wait for cluster formation (default 120)
@@ -235,19 +227,21 @@ class Job:
             lock_provider: Callback(job) to register task locks during __enter__
             clear_existing_locks: If True, clear locks created by this node before invoking lock_provider
             coordination_config: Optional CoordinationConfig to override config module settings
-            db_connection: Optional database connection (for testing, defaults to creating new connection)
+            connection_string: Optional SQLAlchemy connection string (for testing, defaults to building from config)
         """
         self._state = JobState.INITIALIZING
         self.node_name = node_name
-        self._site = site
         self._wait_on_enter = int(abs(wait_on_enter))
         self._wait_on_exit = int(abs(wait_on_exit))
         self._tasks = []
         self._nodes = [attrdict(node=self.node_name)]
         self._date = date or today()
-        self._cn = db_connection or db.connect(site, config)
         self._config = config
         self._tables = get_table_names(config)
+
+        if connection_string is None:
+            connection_string = self._build_connection_string(config)
+        self._engine = create_engine(connection_string, pool_pre_ping=True, pool_size=10, max_overflow=5)
 
         if coordination_config:
             self._coordination_enabled = coordination_config.enabled
@@ -305,7 +299,16 @@ class Job:
         self._refresh_thread = None
 
         if not skip_db_init:
-            init_database(self._cn, config)
+            init_database(self._engine, config)
+
+    def _build_connection_string(self, config: ModuleType) -> str:
+        """Build PostgreSQL connection string from config.
+        """
+        sql_config = config.sync.sql
+        return (
+            f'postgresql+psycopg://{sql_config.user}:{sql_config.passwd}'
+            f'@{sql_config.host}:{sql_config.port}/{sql_config.dbname}'
+        )
 
     # ============================================================
     # CONTEXT MANAGER LIFECYCLE
@@ -413,7 +416,7 @@ class Job:
         self.__cleanup()
 
         with contextlib.suppress(Exception):
-            self._cn.close()
+            self._engine.dispose()
 
     @property
     def nodes(self):
@@ -424,12 +427,16 @@ class Job:
     def set_claim(self, item):
         """Claim an item or items and publish to database.
         """
-        if isiterable(item):
-            this = [{'node': self.node_name, 'created_on': now(), 'item': str(i)} for i in item]
-            db.insert_rows(self._cn, self._tables['Claim'], *this)
-        else:
-            sql = f'insert into {self._tables["Claim"]} (node, item, created_on) values (%s, %s, %s) on conflict do nothing'
-            db.execute(self._cn, sql, self.node_name, str(item), now())
+        with self._engine.connect() as conn:
+            if isiterable(item):
+                rows = [{'node': self.node_name, 'created_on': now(), 'item': str(i)} for i in item]
+                for row in rows:
+                    sql = f'INSERT INTO {self._tables["Claim"]} (node, item, created_on) VALUES (:node, :item, :created_on) ON CONFLICT DO NOTHING'
+                    conn.execute(text(sql), row)
+            else:
+                sql = f'INSERT INTO {self._tables["Claim"]} (node, item, created_on) VALUES (:node, :item, :created_on) ON CONFLICT DO NOTHING'
+                conn.execute(text(sql), {'node': self.node_name, 'item': str(item), 'created_on': now()})
+            conn.commit()
 
     def add_task(self, task: Task):
         """Add task to processing queue if claimable in coordination mode.
@@ -453,16 +460,23 @@ class Job:
             'item': str(task.id),
             'created_on': created
             } for task, created in self._tasks]
-        i = db.insert_rows(self._cn, self._tables['Audit'], rows)
-        logger.debug(f'Flushed {i} task to {self._tables["Audit"]}')
+
+        with self._engine.connect() as conn:
+            for row in rows:
+                sql = f'INSERT INTO {self._tables["Audit"]} (date, node, item, created_on) VALUES (:date, :node, :item, :created_on)'
+                conn.execute(text(sql), row)
+            conn.commit()
+
+        logger.debug(f'Flushed {len(rows)} task to {self._tables["Audit"]}')
         self._tasks.clear()
 
     def get_audit(self) -> list[attrdict]:
         """Get audit records for current date.
         """
-        sql = f'select node, item from {self._tables["Audit"]} where date = %s'
-        return [attrdict(node=row['node'], item=row['item']) for row in
-                db.select(self._cn, sql, self._date).to_dict('records')]
+        sql = f'SELECT node, item FROM {self._tables["Audit"]} WHERE date = :date'
+        with self._engine.connect() as conn:
+            result = conn.execute(text(sql), {'date': self._date})
+            return [attrdict(node=row[0], item=row[1]) for row in result]
 
     def can_claim_task(self, task: Task) -> bool:
         """Check if this node can claim the given task based on token ownership.
@@ -491,8 +505,11 @@ class Job:
         Returns
             Number of locks removed
         """
-        sql = f'DELETE FROM {self._tables["Lock"]} WHERE created_by = %s'
-        rows = db.execute(self._cn, sql, creator)
+        sql = f'DELETE FROM {self._tables["Lock"]} WHERE created_by = :creator'
+        with self._engine.connect() as conn:
+            result = conn.execute(text(sql), {'creator': creator})
+            conn.commit()
+            rows = result.rowcount
         logger.info(f'Cleared {rows} locks created by {creator}')
         return rows
 
@@ -503,7 +520,10 @@ class Job:
             Number of locks removed
         """
         sql = f'DELETE FROM {self._tables["Lock"]}'
-        rows = db.execute(self._cn, sql)
+        with self._engine.connect() as conn:
+            result = conn.execute(text(sql))
+            conn.commit()
+            rows = result.rowcount
         logger.warning(f'Cleared ALL {rows} locks from system')
         return rows
 
@@ -516,11 +536,12 @@ class Job:
         sql = f"""
         SELECT token_id, node_pattern, reason, created_at, created_by, expires_at
         FROM {self._tables["Lock"]}
-        WHERE expires_at IS NULL OR expires_at > %s
+        WHERE expires_at IS NULL OR expires_at > :now
         ORDER BY created_at DESC
         """
-        result = _normalize_db_result(db.select(self._cn, sql, now()))
-        return result
+        with self._engine.connect() as conn:
+            result = conn.execute(text(sql), {'now': now()})
+            return [dict(row._mapping) for row in result]
 
     def register_task_lock(self, task_id: Hashable, node_pattern: str, reason: str = None, expires_in_days: int = None) -> None:
         """Register a lock to pin task to specific node pattern."""
@@ -529,10 +550,19 @@ class Job:
 
         sql = f"""
         INSERT INTO {self._tables["Lock"]} (token_id, node_pattern, reason, created_at, created_by, expires_at)
-        VALUES (%s, %s, %s, %s, %s, %s)
+        VALUES (:token_id, :pattern, :reason, :created_at, :created_by, :expires_at)
         ON CONFLICT (token_id) DO NOTHING
         """
-        db.execute(self._cn, sql, token_id, node_pattern, reason, now(), self.node_name, expires_at)
+        with self._engine.connect() as conn:
+            conn.execute(text(sql), {
+                'token_id': token_id,
+                'pattern': node_pattern,
+                'reason': reason,
+                'created_at': now(),
+                'created_by': self.node_name,
+                'expires_at': expires_at
+            })
+            conn.commit()
         logger.debug(f'Registered lock: task {task_id} -> token {token_id} -> pattern "{node_pattern}"')
 
     def register_task_locks_bulk(self, locks: list[tuple[Hashable, str, str]]):
@@ -554,17 +584,17 @@ class Job:
             }
             for task_id, pattern, reason in locks
         ]
-        for row in rows:
-            db.execute(
-                self._cn,
-                f"""
-                INSERT INTO {self._tables["Lock"]} (token_id, node_pattern, reason, created_at, created_by, expires_at)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (token_id) DO NOTHING
-                """,
-                row['token_id'], row['node_pattern'], row['reason'],
-                row['created_at'], row['created_by'], row['expires_at']
-            )
+
+        sql = f"""
+        INSERT INTO {self._tables["Lock"]} (token_id, node_pattern, reason, created_at, created_by, expires_at)
+        VALUES (:token_id, :node_pattern, :reason, :created_at, :created_by, :expires_at)
+        ON CONFLICT (token_id) DO NOTHING
+        """
+
+        with self._engine.connect() as conn:
+            for row in rows:
+                conn.execute(text(sql), row)
+            conn.commit()
 
         logger.info(f'Registered {len(locks)} locks in bulk')
 
@@ -580,7 +610,8 @@ class Job:
                 age = now() - self._last_heartbeat_sent
                 if age.total_seconds() > self._heartbeat_timeout:
                     return False
-            db.select_scalar(self._cn, 'SELECT 1')
+            with self._engine.connect() as conn:
+                conn.execute(text('SELECT 1'))
             return True
         except Exception:
             return False
@@ -600,13 +631,12 @@ class Job:
         sql = f"""
         SELECT name, created_on, last_heartbeat
         FROM {self._tables["Node"]}
-        WHERE last_heartbeat > %s
+        WHERE last_heartbeat > :cutoff
         ORDER BY created_on ASC, name ASC
         """
-        result = db.select(self._cn, sql, cutoff)
-        records = result if isinstance(result, list) else result.to_dict('records')
-        return [attrdict(name=row['name'], created_on=row['created_on'], last_heartbeat=row['last_heartbeat'])
-                for row in records]
+        with self._engine.connect() as conn:
+            result = conn.execute(text(sql), {'cutoff': cutoff})
+            return [attrdict(name=row[0], created_on=row[1], last_heartbeat=row[2]) for row in result]
 
     def get_dead_nodes(self) -> list[str]:
         """Get list of dead nodes (heartbeat older than timeout threshold)."""
@@ -614,11 +644,11 @@ class Job:
         sql = f"""
         SELECT name
         FROM {self._tables["Node"]}
-        WHERE last_heartbeat <= %s OR last_heartbeat IS NULL
+        WHERE last_heartbeat <= :cutoff OR last_heartbeat IS NULL
         """
-        result = db.select(self._cn, sql, cutoff)
-        records = result if isinstance(result, list) else result.to_dict('records')
-        return [row['name'] for row in records]
+        with self._engine.connect() as conn:
+            result = conn.execute(text(sql), {'cutoff': cutoff})
+            return [row[0] for row in result]
 
     # ============================================================
     # NODE COORDINATION (ALL NODES)
@@ -628,11 +658,17 @@ class Job:
         """Register node with initial heartbeat."""
         sql = f"""
         INSERT INTO {self._tables["Node"]} (name, created_on, last_heartbeat)
-        VALUES (%s, %s, %s)
+        VALUES (:name, :created_on, :heartbeat)
         ON CONFLICT (name) DO UPDATE
         SET last_heartbeat = EXCLUDED.last_heartbeat
         """
-        db.execute(self._cn, sql, self.node_name, self._created_on, now())
+        with self._engine.connect() as conn:
+            conn.execute(text(sql), {
+                'name': self.node_name,
+                'created_on': self._created_on,
+                'heartbeat': now()
+            })
+            conn.commit()
         logger.info(f'Node {self.node_name} registered with heartbeat')
 
     def _start_heartbeat_thread(self) -> None:
@@ -640,26 +676,35 @@ class Job:
         self._last_heartbeat_sent = now()
 
         def heartbeat_loop():
-            cn = db.connect(self._site, self._config)
+            conn = self._engine.connect()
             try:
                 while not self._shutdown:
                     try:
                         sql = f"""
                         UPDATE {self._tables["Node"]}
-                        SET last_heartbeat = %s
-                        WHERE name = %s
+                        SET last_heartbeat = :heartbeat
+                        WHERE name = :name
                         """
-                        db.execute(cn, sql, now(), self.node_name)
-                        self._last_heartbeat_sent = now()
+                        heartbeat_time = now()
+                        conn.execute(text(sql), {'heartbeat': heartbeat_time, 'name': self.node_name})
+                        conn.commit()
+                        self._last_heartbeat_sent = heartbeat_time
                         logger.debug(f'Heartbeat sent by {self.node_name}')
                     except Exception as e:
                         logger.error(f'Heartbeat failed for {self.node_name}: {e}')
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        conn = self._engine.connect()
 
                     if self._shutdown_event.wait(timeout=self._heartbeat_interval):
                         break
             finally:
-                with contextlib.suppress(Exception):
-                    cn.close()
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
         self._heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True, name=f'heartbeat-{self.node_name}')
         self._heartbeat_thread.start()
@@ -668,7 +713,7 @@ class Job:
     def _start_health_monitor(self) -> None:
         """Start health monitoring thread that checks heartbeat and database connectivity."""
         def health_loop():
-            cn = db.connect(self._site, self._config)
+            conn = self._engine.connect()
             try:
                 while not self._shutdown:
                     try:
@@ -677,9 +722,14 @@ class Job:
                             if age.total_seconds() > self._heartbeat_timeout:
                                 logger.error(f'Heartbeat thread appears dead (>{self._heartbeat_timeout}s old)')
                         try:
-                            db.select_scalar(cn, 'SELECT 1')
+                            conn.execute(text('SELECT 1'))
                         except Exception as e:
                             logger.error(f'Database connectivity test failed: {e}')
+                            try:
+                                conn.close()
+                            except Exception:
+                                pass
+                            conn = self._engine.connect()
 
                     except Exception as e:
                         logger.error(f'Health monitor error: {e}')
@@ -687,8 +737,10 @@ class Job:
                     if self._shutdown_event.wait(timeout=self._health_check_interval):
                         break
             finally:
-                with contextlib.suppress(Exception):
-                    cn.close()
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
         self._health_thread = threading.Thread(target=health_loop, daemon=True, name=f'health-{self.node_name}')
         self._health_thread.start()
@@ -714,26 +766,36 @@ class Job:
         start_time = time.time()
         while time.time() - start_time < self._leader_lock_timeout:
             try:
-                sql = f"""
-                INSERT INTO {self._tables["LeaderLock"]} (singleton, node, acquired_at, operation)
-                VALUES (1, %s, %s, %s)
-                ON CONFLICT (singleton) DO NOTHING
-                """
-                rows_affected = db.execute(self._cn, sql, self.node_name, now(), operation)
+                with self._engine.connect() as conn:
+                    sql = f"""
+                    INSERT INTO {self._tables["LeaderLock"]} (singleton, node, acquired_at, operation)
+                    VALUES (1, :node, :acquired_at, :operation)
+                    ON CONFLICT (singleton) DO NOTHING
+                    """
+                    result = conn.execute(text(sql), {
+                        'node': self.node_name,
+                        'acquired_at': now(),
+                        'operation': operation
+                    })
+                    conn.commit()
+                    rows_affected = result.rowcount
 
-                if rows_affected > 0:
-                    logger.info(f'Leader lock acquired by {self.node_name} for {operation}')
-                    return True
-                sql = f'SELECT node, acquired_at FROM {self._tables["LeaderLock"]} WHERE singleton = 1'
-                result = db.select(self._cn, sql).to_dict('records')
+                    if rows_affected > 0:
+                        logger.info(f'Leader lock acquired by {self.node_name} for {operation}')
+                        return True
 
-                if result:
-                    lock = result[0]
-                    age = now() - lock['acquired_at']
-                    if age.total_seconds() > 300:
-                        logger.warning(f'Stale leader lock detected (age: {age.total_seconds()}s), forcing release')
-                        db.execute(self._cn, f'DELETE FROM {self._tables["LeaderLock"]} WHERE singleton = 1')
-                        continue
+                    sql = f'SELECT node, acquired_at FROM {self._tables["LeaderLock"]} WHERE singleton = 1'
+                    result = conn.execute(text(sql))
+                    lock_row = result.first()
+
+                    if lock_row:
+                        age = now() - lock_row[1]
+                        if age.total_seconds() > 300:
+                            logger.warning(f'Stale leader lock detected (age: {age.total_seconds()}s), forcing release')
+                            conn.execute(text(f'DELETE FROM {self._tables["LeaderLock"]} WHERE singleton = 1'))
+                            conn.commit()
+                            continue
+
                 time.sleep(0.5)
 
             except Exception as e:
@@ -746,8 +808,10 @@ class Job:
     def _release_leader_lock(self) -> None:
         """Release leader lock."""
         try:
-            sql = f'DELETE FROM {self._tables["LeaderLock"]} WHERE node = %s'
-            db.execute(self._cn, sql, self.node_name)
+            sql = f'DELETE FROM {self._tables["LeaderLock"]} WHERE node = :node'
+            with self._engine.connect() as conn:
+                conn.execute(text(sql), {'node': self.node_name})
+                conn.commit()
             logger.debug(f'Leader lock released by {self.node_name}')
         except Exception as e:
             logger.error(f'Leader lock release failed: {e}')
@@ -771,17 +835,22 @@ class Job:
         Returns dictionary mapping token IDs to node patterns. Expired locks
         are removed as a side effect.
         """
-        sql = f'SELECT token_id, node_pattern, expires_at FROM {self._tables["Lock"]}'
-        records = _normalize_db_result(db.select(self._cn, sql))
+        with self._engine.connect() as conn:
+            sql = f'SELECT token_id, node_pattern, expires_at FROM {self._tables["Lock"]}'
+            result = conn.execute(text(sql))
+            records = [dict(row._mapping) for row in result]
 
-        locked_tokens = {}
-        for row in records:
-            if row['expires_at'] and row['expires_at'] < now():
-                db.execute(self._cn, f'DELETE FROM {self._tables["Lock"]} WHERE token_id = %s', row['token_id'])
-                continue
-            locked_tokens[row['token_id']] = row['node_pattern']
+            locked_tokens = {}
+            current_time = now()
+            for row in records:
+                if row['expires_at'] and row['expires_at'] < current_time:
+                    conn.execute(text(f'DELETE FROM {self._tables["Lock"]} WHERE token_id = :token_id'),
+                                {'token_id': row['token_id']})
+                    continue
+                locked_tokens[row['token_id']] = row['node_pattern']
 
-        return locked_tokens
+            conn.commit()
+            return locked_tokens
 
     def _distribute_tokens_minimal_move(self, total_tokens: int) -> None:
         """Distribute tokens using minimal-move algorithm."""
@@ -794,9 +863,10 @@ class Job:
             logger.error('No active nodes for token distribution')
             return
 
-        sql = f'SELECT token_id, node FROM {self._tables["Token"]}'
-        current_assignments = {row['token_id']: row['node']
-                              for row in _normalize_db_result(db.select(self._cn, sql))}
+        with self._engine.connect() as conn:
+            sql = f'SELECT token_id, node FROM {self._tables["Token"]}'
+            result = conn.execute(text(sql))
+            current_assignments = {row[0]: row[1] for row in result}
 
         locked_tokens = self._get_active_locks()
 
@@ -808,13 +878,24 @@ class Job:
         new_assignments, tokens_moved = compute_minimal_move_distribution(
             total_tokens, active_node_names, current_assignments, locked_tokens, self._matches_pattern)
 
-        current_version = db.select_scalar_or_none(self._cn, f'SELECT MAX(version) FROM {self._tables["Token"]}') or 0
-        new_version = current_version + 1
+        with self._engine.connect() as conn:
+            result = conn.execute(text(f'SELECT MAX(version) FROM {self._tables["Token"]}'))
+            current_version = result.scalar() or 0
+            new_version = current_version + 1
 
-        db.execute(self._cn, f'DELETE FROM {self._tables["Token"]}')
-        rows = [{'token_id': tid, 'node': node, 'assigned_at': now(), 'version': new_version}
-                for tid, node in new_assignments.items()]
-        db.insert_rows(self._cn, self._tables['Token'], rows)
+            conn.execute(text(f'DELETE FROM {self._tables["Token"]}'))
+
+            assignment_time = now()
+            for tid, node in new_assignments.items():
+                sql = f'INSERT INTO {self._tables["Token"]} (token_id, node, assigned_at, version) VALUES (:token_id, :node, :assigned_at, :version)'
+                conn.execute(text(sql), {
+                    'token_id': tid,
+                    'node': node,
+                    'assigned_at': assignment_time,
+                    'version': new_version
+                })
+
+            conn.commit()
 
         duration_ms = int((time.time() - start_time) * 1000)
         self._log_rebalance('distribution', len(active_node_names), len(active_node_names), tokens_moved, duration_ms)
@@ -825,7 +906,7 @@ class Job:
     def _start_dead_node_monitor(self) -> None:
         """Start leader monitoring thread for dead node detection."""
         def monitor_loop():
-            cn = db.connect(self._site, self._config)
+            conn = self._engine.connect()
             try:
                 while not self._shutdown:
                     try:
@@ -833,22 +914,27 @@ class Job:
                             logger.debug('No longer leader, stopping dead node monitor')
                             break
 
+                        cutoff = now() - timedelta(seconds=self._heartbeat_timeout)
                         sql = f"""
                         SELECT name
                         FROM {self._tables["Node"]}
-                        WHERE last_heartbeat <= %s OR last_heartbeat IS NULL
+                        WHERE last_heartbeat <= :cutoff OR last_heartbeat IS NULL
                         """
-                        cutoff = now() - timedelta(seconds=self._heartbeat_timeout)
-                        dead_nodes = [row['name'] for row in _normalize_db_result(db.select(cn, sql, cutoff))]
+
+                        result = conn.execute(text(sql), {'cutoff': cutoff})
+                        dead_nodes = [row[0] for row in result]
 
                         if dead_nodes:
                             logger.warning(f'Detected dead nodes: {dead_nodes}')
                             if self._acquire_rebalance_lock('dead_node_monitor'):
                                 try:
                                     for node in dead_nodes:
-                                        db.execute(cn, f'DELETE FROM {self._tables["Node"]} WHERE name = %s', node)
-                                        db.execute(cn, f'DELETE FROM {self._tables["Claim"]} WHERE node = %s', node)
+                                        conn.execute(text(f'DELETE FROM {self._tables["Node"]} WHERE name = :name'),
+                                                    {'name': node})
+                                        conn.execute(text(f'DELETE FROM {self._tables["Claim"]} WHERE node = :node'),
+                                                    {'node': node})
                                         logger.info(f'Removed dead node: {node}')
+                                    conn.commit()
                                     self._distribute_tokens_safe()
                                 finally:
                                     self._release_rebalance_lock()
@@ -857,12 +943,19 @@ class Job:
 
                     except Exception as e:
                         logger.error(f'Dead node monitor failed: {e}', exc_info=True)
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        conn = self._engine.connect()
 
                     if self._shutdown_event.wait(timeout=self._dead_node_check_interval):
                         break
             finally:
-                with contextlib.suppress(Exception):
-                    cn.close()
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
         self._monitor_thread = threading.Thread(target=monitor_loop, daemon=True, name=f'dead-node-monitor-{self.node_name}')
         self._monitor_thread.start()
@@ -872,10 +965,14 @@ class Job:
         """Acquire rebalance lock."""
         sql = f"""
         UPDATE {self._tables["RebalanceLock"]}
-        SET in_progress = TRUE, started_at = %s, started_by = %s
+        SET in_progress = TRUE, started_at = :started_at, started_by = :started_by
         WHERE singleton = 1 AND in_progress = FALSE
         """
-        rows_affected = db.execute(self._cn, sql, now(), started_by)
+        with self._engine.connect() as conn:
+            result = conn.execute(text(sql), {'started_at': now(), 'started_by': started_by})
+            conn.commit()
+            rows_affected = result.rowcount
+
         success = rows_affected > 0
 
         if success:
@@ -892,22 +989,26 @@ class Job:
         SET in_progress = FALSE, started_at = NULL, started_by = NULL
         WHERE singleton = 1
         """
-        db.execute(self._cn, sql)
+        with self._engine.connect() as conn:
+            conn.execute(text(sql))
+            conn.commit()
         logger.debug('Rebalance lock released')
 
     def _start_rebalance_monitor(self) -> None:
         """Start leader monitoring thread for membership changes."""
         def rebalance_loop():
-            cn = db.connect(self._site, self._config)
+            conn = self._engine.connect()
             try:
                 cutoff = now() - timedelta(seconds=self._heartbeat_timeout)
                 sql = f"""
                 SELECT name, created_on, last_heartbeat
                 FROM {self._tables["Node"]}
-                WHERE last_heartbeat > %s
+                WHERE last_heartbeat > :cutoff
                 ORDER BY created_on ASC, name ASC
                 """
-                last_node_count = len(_normalize_db_result(db.select(cn, sql, cutoff)))
+
+                result = conn.execute(text(sql), {'cutoff': cutoff})
+                last_node_count = len(list(result))
 
                 while not self._shutdown:
                     try:
@@ -916,13 +1017,8 @@ class Job:
                             break
 
                         cutoff = now() - timedelta(seconds=self._heartbeat_timeout)
-                        sql = f"""
-                        SELECT name, created_on, last_heartbeat
-                        FROM {self._tables["Node"]}
-                        WHERE last_heartbeat > %s
-                        ORDER BY created_on ASC, name ASC
-                        """
-                        current_count = len(_normalize_db_result(db.select(cn, sql, cutoff)))
+                        result = conn.execute(text(sql), {'cutoff': cutoff})
+                        current_count = len(list(result))
 
                         if current_count != last_node_count:
                             logger.info(f'Node count changed: {last_node_count} -> {current_count}')
@@ -938,12 +1034,19 @@ class Job:
 
                     except Exception as e:
                         logger.error(f'Rebalance monitor failed: {e}', exc_info=True)
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        conn = self._engine.connect()
 
                     if self._shutdown_event.wait(timeout=self._rebalance_check_interval):
                         break
             finally:
-                with contextlib.suppress(Exception):
-                    cn.close()
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
         self._rebalance_thread = threading.Thread(target=rebalance_loop, daemon=True, name=f'rebalance-monitor-{self.node_name}')
         self._rebalance_thread.start()
@@ -956,7 +1059,7 @@ class Job:
     def _start_token_refresh_thread(self) -> None:
         """Start follower thread that detects token reassignments."""
         def refresh_loop():
-            cn = db.connect(self._site, self._config)
+            conn = self._engine.connect()
             try:
                 start_time = time.time()
                 check_count = 0
@@ -966,8 +1069,9 @@ class Job:
                         elapsed = time.time() - start_time
                         check_interval = self._token_refresh_initial if elapsed < 300 else self._token_refresh_steady
 
-                        sql = f'SELECT token_id, version FROM {self._tables["Token"]} WHERE node = %s'
-                        records = _normalize_db_result(db.select(cn, sql, self.node_name))
+                        sql = f'SELECT token_id, version FROM {self._tables["Token"]} WHERE node = :node'
+                        result = conn.execute(text(sql), {'node': self.node_name})
+                        records = [dict(row._mapping) for row in result]
 
                         if not records:
                             new_tokens, new_version = set(), 0
@@ -992,12 +1096,19 @@ class Job:
 
                     except Exception as e:
                         logger.error(f'Token refresh failed: {e}', exc_info=True)
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        conn = self._engine.connect()
 
                     if self._shutdown_event.wait(timeout=check_interval):
                         break
             finally:
-                with contextlib.suppress(Exception):
-                    cn.close()
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
         self._refresh_thread = threading.Thread(target=refresh_loop, daemon=True, name=f'token-refresh-{self.node_name}')
         self._refresh_thread.start()
@@ -1031,18 +1142,20 @@ class Job:
 
     def _get_my_tokens(self) -> set[int]:
         """Get token IDs assigned to this node."""
-        sql = f'SELECT token_id FROM {self._tables["Token"]} WHERE node = %s'
-        result = db.select(self._cn, sql, self.node_name)
-        records = result if isinstance(result, list) else result.to_dict('records')
-        tokens = {row['token_id'] for row in records}
+        sql = f'SELECT token_id FROM {self._tables["Token"]} WHERE node = :node'
+        with self._engine.connect() as conn:
+            result = conn.execute(text(sql), {'node': self.node_name})
+            tokens = {row[0] for row in result}
         logger.debug(f'Node {self.node_name} owns {len(tokens)} tokens')
         return tokens
 
     def _get_my_tokens_versioned(self) -> tuple[set[int], int]:
         """Get token IDs and version assigned to this node.
         """
-        sql = f'SELECT token_id, version FROM {self._tables["Token"]} WHERE node = %s'
-        records = _normalize_db_result(db.select(self._cn, sql, self.node_name))
+        sql = f'SELECT token_id, version FROM {self._tables["Token"]} WHERE node = :node'
+        with self._engine.connect() as conn:
+            result = conn.execute(text(sql), {'node': self.node_name})
+            records = [dict(row._mapping) for row in result]
 
         if not records:
             return set(), 0
@@ -1057,7 +1170,10 @@ class Job:
         """Wait for initial token distribution to complete."""
         start = time.time()
         while time.time() - start < timeout_sec:
-            count = db.select_scalar(self._cn, f'SELECT COUNT(*) FROM {self._tables["Token"]}')
+            with self._engine.connect() as conn:
+                result = conn.execute(text(f'SELECT COUNT(*) FROM {self._tables["Token"]}'))
+                count = result.scalar()
+
             if count > 0:
                 logger.info(f'Token distribution detected ({count} tokens)')
                 return
@@ -1071,9 +1187,19 @@ class Job:
         sql = f"""
         INSERT INTO {self._tables["Rebalance"]}
         (triggered_at, trigger_reason, leader_node, nodes_before, nodes_after, tokens_moved, duration_ms)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        VALUES (:triggered_at, :reason, :leader, :before, :after, :moved, :duration)
         """
-        db.execute(self._cn, sql, now(), reason, self.node_name, nodes_before, nodes_after, tokens_moved, duration_ms)
+        with self._engine.connect() as conn:
+            conn.execute(text(sql), {
+                'triggered_at': now(),
+                'reason': reason,
+                'leader': self.node_name,
+                'before': nodes_before,
+                'after': nodes_after,
+                'moved': tokens_moved,
+                'duration': duration_ms
+            })
+            conn.commit()
 
     # ============================================================
     # CLEANUP
@@ -1082,22 +1208,28 @@ class Job:
     def __cleanup_node_table(self) -> None:
         """Remove node from Node table.
         """
-        sql = f'delete from {self._tables["Node"]} where name = %s'
-        db.execute(self._cn, sql, self.node_name)
+        sql = f'DELETE FROM {self._tables["Node"]} WHERE name = :name'
+        with self._engine.connect() as conn:
+            conn.execute(text(sql), {'name': self.node_name})
+            conn.commit()
         logger.debug(f'Cleared {self.node_name} from {self._tables["Node"]}')
 
     def __cleanup_check_table(self) -> None:
         """Remove node from Check table.
         """
-        sql = f'delete from {self._tables["Check"]} where node = %s'
-        db.execute(self._cn, sql, self.node_name)
+        sql = f'DELETE FROM {self._tables["Check"]} WHERE node = :node'
+        with self._engine.connect() as conn:
+            conn.execute(text(sql), {'node': self.node_name})
+            conn.commit()
         logger.debug(f'Cleaned {self.node_name} from {self._tables["Check"]}')
 
     def __cleanup_claim_table(self) -> None:
         """Remove node from Claim table.
         """
-        sql = f'delete from {self._tables["Claim"]} where node = %s'
-        db.execute(self._cn, sql, self.node_name)
+        sql = f'DELETE FROM {self._tables["Claim"]} WHERE node = :node'
+        with self._engine.connect() as conn:
+            conn.execute(text(sql), {'node': self.node_name})
+            conn.commit()
         logger.debug(f'Cleaned {self.node_name} from {self._tables["Claim"]}')
 
     def __cleanup(self) -> None:

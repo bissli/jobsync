@@ -5,9 +5,9 @@ Tests each coordination component in isolation.
 import logging
 
 import config as test_config
-import database as db
 import pytest
 from asserts import assert_equal, assert_true
+from sqlalchemy import text
 
 from jobsync import schema
 from jobsync.client import CoordinationConfig, Job, Task
@@ -43,10 +43,10 @@ def get_unit_test_config():
 class TestTaskToToken:
     """Test consistent hashing of tasks to tokens."""
 
-    def test_consistent_hashing(self, psql_docker, postgres):
+    def test_consistent_hashing(self, postgres):
         """Same task ID should always map to same token."""
         config = get_unit_test_config()
-        job = Job('node1', 'postgres', config, skip_db_init=True)
+        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
 
         task_id = 'test-task-123'
         token1 = job._task_to_token(task_id)
@@ -55,10 +55,10 @@ class TestTaskToToken:
         assert_equal(token1, token2, 'Same task should map to same token')
         assert_true(0 <= token1 < 100, 'Token should be in valid range')
 
-    def test_different_tasks_different_tokens(self, psql_docker, postgres):
+    def test_different_tasks_different_tokens(self, postgres):
         """Different task IDs should map to different tokens (usually)."""
         config = get_unit_test_config()
-        job = Job('node1', 'postgres', config, skip_db_init=True)
+        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
 
         tokens = set()
         for i in range(20):
@@ -68,10 +68,10 @@ class TestTaskToToken:
         # With 20 tasks and 100 tokens, expect most to be unique
         assert_true(len(tokens) >= 15, 'Most tasks should map to different tokens')
 
-    def test_numeric_and_string_ids(self, psql_docker, postgres):
+    def test_numeric_and_string_ids(self, postgres):
         """Test hashing works for different ID types."""
         config = get_unit_test_config()
-        job = Job('node1', 'postgres', config, skip_db_init=True)
+        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
 
         # Numeric IDs
         token1 = job._task_to_token(123)
@@ -88,46 +88,46 @@ class TestTaskToToken:
 class TestPatternMatching:
     """Test SQL LIKE pattern matching."""
 
-    def test_exact_match(self, psql_docker, postgres):
+    def test_exact_match(self, postgres):
         """Test exact node name matching."""
         config = get_unit_test_config()
-        job = Job('node1', 'postgres', config, skip_db_init=True)
+        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
 
         assert_true(job._matches_pattern('node1', 'node1'), 'Exact match should succeed')
         assert_equal(job._matches_pattern('node1', 'node2'), False, 'Different names should not match')
 
-    def test_prefix_wildcard(self, psql_docker, postgres):
+    def test_prefix_wildcard(self, postgres):
         """Test prefix patterns with % wildcard."""
         config = get_unit_test_config()
-        job = Job('node1', 'postgres', config, skip_db_init=True)
+        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
 
         assert_true(job._matches_pattern('prod-alpha', 'prod-%'), 'Prefix pattern should match')
         assert_true(job._matches_pattern('prod-beta', 'prod-%'), 'Prefix pattern should match')
         assert_equal(job._matches_pattern('test-alpha', 'prod-%'), False, 'Wrong prefix should not match')
 
-    def test_suffix_wildcard(self, psql_docker, postgres):
+    def test_suffix_wildcard(self, postgres):
         """Test suffix patterns with % wildcard."""
         config = get_unit_test_config()
-        job = Job('node1', 'postgres', config, skip_db_init=True)
+        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
 
         assert_true(job._matches_pattern('alpha-gpu', '%-gpu'), 'Suffix pattern should match')
         assert_true(job._matches_pattern('beta-gpu', '%-gpu'), 'Suffix pattern should match')
         assert_equal(job._matches_pattern('alpha-cpu', '%-gpu'), False, 'Wrong suffix should not match')
 
-    def test_contains_wildcard(self, psql_docker, postgres):
+    def test_contains_wildcard(self, postgres):
         """Test contains patterns with % wildcards."""
         config = get_unit_test_config()
-        job = Job('node1', 'postgres', config, skip_db_init=True)
+        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
 
         assert_true(job._matches_pattern('prod-special-001', '%special%'), 'Contains pattern should match')
         assert_true(job._matches_pattern('special', '%special%'), 'Contains pattern should match')
         assert_equal(job._matches_pattern('prod-regular-001', '%special%'), False,
                     'Missing substring should not match')
 
-    def test_single_char_wildcard(self, psql_docker, postgres):
+    def test_single_char_wildcard(self, postgres):
         """Test single character _ wildcard."""
         config = get_unit_test_config()
-        job = Job('node1', 'postgres', config, skip_db_init=True)
+        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
 
         assert_true(job._matches_pattern('node1', 'node_'), 'Single char wildcard should match')
         assert_true(job._matches_pattern('node2', 'node_'), 'Single char wildcard should match')
@@ -137,61 +137,62 @@ class TestPatternMatching:
 class TestLeaderElection:
     """Test leader election logic."""
 
-    def test_oldest_node_elected(self, psql_docker, postgres):
+    def test_oldest_node_elected(self, postgres):
         """Test that oldest node becomes leader."""
         config = get_unit_test_config()
-        cn = db.connect('postgres', config)
         tables = schema.get_table_names(config)
 
-        # Manually create nodes with different timestamps
         from datetime import timedelta
 
         from date import now
 
         base_time = now()
-        db.execute(cn, f"""
-            INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
-            VALUES ('node2', %s, %s)
-        """, base_time - timedelta(seconds=10), base_time)
+        with postgres.connect() as conn:
+            conn.execute(text(f"""
+                INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
+                VALUES (:name, :created_on, :heartbeat)
+            """), {'name': 'node2', 'created_on': base_time - timedelta(seconds=10), 'heartbeat': base_time})
 
-        db.execute(cn, f"""
-            INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
-            VALUES ('node1', %s, %s)
-        """, base_time - timedelta(seconds=20), base_time)  # Oldest
+            conn.execute(text(f"""
+                INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
+                VALUES (:name, :created_on, :heartbeat)
+            """), {'name': 'node1', 'created_on': base_time - timedelta(seconds=20), 'heartbeat': base_time})
 
-        db.execute(cn, f"""
-            INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
-            VALUES ('node3', %s, %s)
-        """, base_time - timedelta(seconds=5), base_time)
+            conn.execute(text(f"""
+                INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
+                VALUES (:name, :created_on, :heartbeat)
+            """), {'name': 'node3', 'created_on': base_time - timedelta(seconds=5), 'heartbeat': base_time})
+            conn.commit()
 
-        job = Job('test', 'postgres', config, skip_db_init=True)
+        job = Job('test', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
         leader = job._elect_leader()
 
         assert_equal(leader, 'node1', 'Oldest node should be elected leader')
 
-    def test_name_tiebreaker(self, psql_docker, postgres):
+    def test_name_tiebreaker(self, postgres):
         """Test that name is used as tiebreaker when timestamps equal."""
         config = get_unit_test_config()
-        cn = db.connect('postgres', config)
         tables = schema.get_table_names(config)
 
         from date import now
 
         same_time = now()
-        db.execute(cn, f"""
-            INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
-            VALUES ('node-c', %s, %s), ('node-a', %s, %s), ('node-b', %s, %s)
-        """, same_time, same_time, same_time, same_time, same_time, same_time)
+        with postgres.connect() as conn:
+            for name in ['node-c', 'node-a', 'node-b']:
+                conn.execute(text(f"""
+                    INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
+                    VALUES (:name, :created_on, :heartbeat)
+                """), {'name': name, 'created_on': same_time, 'heartbeat': same_time})
+            conn.commit()
 
-        job = Job('test', 'postgres', config, skip_db_init=True)
+        job = Job('test', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
         leader = job._elect_leader()
 
         assert_equal(leader, 'node-a', 'Alphabetically first node should win tiebreaker')
 
-    def test_dead_nodes_filtered(self, psql_docker, postgres):
+    def test_dead_nodes_filtered(self, postgres):
         """Test that dead nodes are not considered for leader election."""
         config = get_unit_test_config()
-        cn = db.connect('postgres', config)
         tables = schema.get_table_names(config)
 
         from datetime import timedelta
@@ -199,21 +200,21 @@ class TestLeaderElection:
         from date import now
 
         current_time = now()
-        stale_time = current_time - timedelta(seconds=30)  # Older than timeout
+        stale_time = current_time - timedelta(seconds=30)
 
-        # Oldest node is dead
-        db.execute(cn, f"""
-            INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
-            VALUES ('node1', %s, %s)
-        """, current_time - timedelta(seconds=30), stale_time)
+        with postgres.connect() as conn:
+            conn.execute(text(f"""
+                INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
+                VALUES (:name, :created_on, :heartbeat)
+            """), {'name': 'node1', 'created_on': current_time - timedelta(seconds=30), 'heartbeat': stale_time})
 
-        # Alive node
-        db.execute(cn, f"""
-            INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
-            VALUES ('node2', %s, %s)
-        """, current_time - timedelta(seconds=20), current_time)
+            conn.execute(text(f"""
+                INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
+                VALUES (:name, :created_on, :heartbeat)
+            """), {'name': 'node2', 'created_on': current_time - timedelta(seconds=20), 'heartbeat': current_time})
+            conn.commit()
 
-        job = Job('test', 'postgres', config, skip_db_init=True)
+        job = Job('test', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
         leader = job._elect_leader()
 
         assert_equal(leader, 'node2', 'Only alive nodes should be considered')
@@ -222,104 +223,102 @@ class TestLeaderElection:
 class TestTokenDistribution:
     """Test token distribution algorithm."""
 
-    def test_even_distribution(self, psql_docker, postgres):
+    def test_even_distribution(self, postgres):
         """Test that tokens are distributed evenly across nodes."""
         config = get_unit_test_config()
-        cn = db.connect('postgres', config)
         tables = schema.get_table_names(config)
 
         from date import now
 
-        # Create 3 nodes
         current = now()
-        for i in range(1, 4):
-            db.execute(cn, f"""
-                INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
-                VALUES (%s, %s, %s)
-            """, f'node{i}', current, current)
+        with postgres.connect() as conn:
+            for i in range(1, 4):
+                conn.execute(text(f"""
+                    INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
+                    VALUES (:name, :created_on, :heartbeat)
+                """), {'name': f'node{i}', 'created_on': current, 'heartbeat': current})
+            conn.commit()
 
         coord_config = CoordinationConfig(total_tokens=99)
-        job = Job('node1', 'postgres', config, skip_db_init=True,
+        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False),
                  coordination_config=coord_config)
 
-        # Distribute tokens
         job._distribute_tokens_minimal_move(99)
 
-        # Check distribution
         for i in range(1, 4):
-            count = db.select_scalar(cn, f"""
-                SELECT COUNT(*) FROM {tables["Token"]} WHERE node = %s
-            """, f'node{i}')
+            with postgres.connect() as conn:
+                result = conn.execute(text(f"""
+                    SELECT COUNT(*) FROM {tables["Token"]} WHERE node = :node
+                """), {'node': f'node{i}'})
+                count = result.scalar()
             print(f'node{i}: {count} tokens')
             assert_true(30 <= count <= 36, f'node{i} should have ~33 tokens (got {count})')
 
-    def test_locked_tokens_respected(self, psql_docker, postgres):
+    def test_locked_tokens_respected(self, postgres):
         """Test that locked tokens are assigned to matching nodes only."""
         config = get_unit_test_config()
-        cn = db.connect('postgres', config)
         tables = schema.get_table_names(config)
 
-        # Clean up any existing data
-        db.execute(cn, f'DELETE FROM {tables["Token"]}')
-        db.execute(cn, f'DELETE FROM {tables["Lock"]}')
-        db.execute(cn, f'DELETE FROM {tables["Node"]}')
+        with postgres.connect() as conn:
+            conn.execute(text(f'DELETE FROM {tables["Token"]}'))
+            conn.execute(text(f'DELETE FROM {tables["Lock"]}'))
+            conn.execute(text(f'DELETE FROM {tables["Node"]}'))
+            conn.commit()
 
         from date import now
 
-        # Create 2 regular nodes and 1 special node
         current = now()
-        for name in ['node1', 'node2', 'special-alpha']:
-            db.execute(cn, f"""
-                INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
-                VALUES (%s, %s, %s)
-            """, name, current, current)
+        with postgres.connect() as conn:
+            for name in ['node1', 'node2', 'special-alpha']:
+                conn.execute(text(f"""
+                    INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
+                    VALUES (:name, :created_on, :heartbeat)
+                """), {'name': name, 'created_on': current, 'heartbeat': current})
 
-        # Lock tokens 0-9 to 'special-%' pattern
-        for token_id in range(10):
-            db.execute(cn, f"""
-                INSERT INTO {tables["Lock"]} (token_id, node_pattern, reason, created_at, created_by)
-                VALUES (%s, %s, %s, %s, %s)
-            """, token_id, 'special-%', 'test', current, 'test')
+            for token_id in range(10):
+                conn.execute(text(f"""
+                    INSERT INTO {tables["Lock"]} (token_id, node_pattern, reason, created_at, created_by)
+                    VALUES (:token_id, :pattern, :reason, :created_at, :created_by)
+                """), {'token_id': token_id, 'pattern': 'special-%', 'reason': 'test', 'created_at': current, 'created_by': 'test'})
+            conn.commit()
 
         coord_config = CoordinationConfig(total_tokens=30)
-        job = Job('node1', 'postgres', config, skip_db_init=True,
+        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False),
                  coordination_config=coord_config)
 
-        # Distribute tokens
         job._distribute_tokens_minimal_move(30)
 
-        # The main goal: verify that locked tokens go to nodes matching the pattern
-        # Check that locked tokens went to special-alpha
         locked_correct = 0
         for token_id in range(10):
-            owner = db.select_scalar(cn, f"""
-                SELECT node FROM {tables["Token"]} WHERE token_id = %s
-            """, token_id)
+            with postgres.connect() as conn:
+                result = conn.execute(text(f"""
+                    SELECT node FROM {tables["Token"]} WHERE token_id = :token_id
+                """), {'token_id': token_id})
+                owner = result.scalar()
             if owner == 'special-alpha':
                 locked_correct += 1
 
-        # All locked tokens should go to special-alpha (matches 'special-%')
         assert_equal(locked_correct, 10,
                     f'All 10 locked tokens should be assigned to special-alpha (got {locked_correct})')
 
-        # Verify that tokens were distributed to all nodes
-        all_tokens = db.select(cn, f"""
-            SELECT node, COUNT(*) as cnt
-            FROM {tables["Token"]}
-            GROUP BY node
-            ORDER BY node
-        """)
+        with postgres.connect() as conn:
+            result = conn.execute(text(f"""
+                SELECT node, COUNT(*) as cnt
+                FROM {tables["Token"]}
+                GROUP BY node
+                ORDER BY node
+            """))
+            all_tokens = [dict(row._mapping) for row in result]
+
         print('\nToken distribution:')
-        for row in all_tokens.to_dict('records'):
+        for row in all_tokens:
             print(f'  {row["node"]}: {row["cnt"]} tokens')
 
-        # Verify each node got some tokens
-        node_counts = {row['node']: row['cnt'] for row in all_tokens.to_dict('records')}
+        node_counts = {row['node']: row['cnt'] for row in all_tokens}
         for node in ['node1', 'node2', 'special-alpha']:
             assert_true(node in node_counts and node_counts[node] > 0,
                        f'{node} should have some tokens')
 
-        # Verify special-alpha got at least the locked tokens
         assert_true(node_counts['special-alpha'] >= 10,
                    'special-alpha should have at least the 10 locked tokens')
 
@@ -327,39 +326,39 @@ class TestTokenDistribution:
 class TestLockRegistration:
     """Test lock registration API."""
 
-    def test_register_single_lock(self, psql_docker, postgres):
+    def test_register_single_lock(self, postgres):
         """Test registering a single lock."""
         config = get_unit_test_config()
-        cn = db.connect('postgres', config)
         tables = schema.get_table_names(config)
 
-        job = Job('node1', 'postgres', config, skip_db_init=True)
+        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
 
         task_id = 'task-123'
         job.register_task_lock(task_id, 'special-%', 'test reason')
 
-        # Verify lock created
-        lock = db.select(cn, f"""
-            SELECT node_pattern, reason, created_by
-            FROM {tables["Lock"]}
-            WHERE token_id = %s
-        """, job._task_to_token(task_id)).to_dict('records')
+        with postgres.connect() as conn:
+            result = conn.execute(text(f"""
+                SELECT node_pattern, reason, created_by
+                FROM {tables["Lock"]}
+                WHERE token_id = :token_id
+            """), {'token_id': job._task_to_token(task_id)})
+            lock = [dict(row._mapping) for row in result]
 
         assert_equal(len(lock), 1, 'Lock should be created')
         assert_equal(lock[0]['node_pattern'], 'special-%')
         assert_equal(lock[0]['reason'], 'test reason')
         assert_equal(lock[0]['created_by'], 'node1')
 
-    def test_register_bulk_locks(self, psql_docker, postgres):
+    def test_register_bulk_locks(self, postgres):
         """Test registering multiple locks in bulk."""
         config = get_unit_test_config()
-        cn = db.connect('postgres', config)
         tables = schema.get_table_names(config)
 
-        # Clean up any existing data
-        db.execute(cn, f'DELETE FROM {tables["Lock"]}')
+        with postgres.connect() as conn:
+            conn.execute(text(f'DELETE FROM {tables["Lock"]}'))
+            conn.commit()
 
-        job = Job('node1', 'postgres', config, skip_db_init=True)
+        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
 
         locks = [
             ('task-1', 'pattern-1', 'reason-1'),
@@ -369,30 +368,32 @@ class TestLockRegistration:
 
         job.register_task_locks_bulk(locks)
 
-        # Verify all locks created
-        lock_count = db.select_scalar(cn, f'SELECT COUNT(*) FROM {tables["Lock"]}')
+        with postgres.connect() as conn:
+            result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Lock"]}'))
+            lock_count = result.scalar()
         assert_equal(lock_count, 3, 'All 3 locks should be created')
 
-    def test_lock_idempotency(self, psql_docker, postgres):
+    def test_lock_idempotency(self, postgres):
         """Test that registering same lock twice is idempotent."""
         config = get_unit_test_config()
-        cn = db.connect('postgres', config)
         tables = schema.get_table_names(config)
 
-        # Clean up any existing data
-        db.execute(cn, f'DELETE FROM {tables["Lock"]}')
+        with postgres.connect() as conn:
+            conn.execute(text(f'DELETE FROM {tables["Lock"]}'))
+            conn.commit()
 
-        job = Job('node1', 'postgres', config, skip_db_init=True)
+        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
 
         task_id = 'task-123'
         job.register_task_lock(task_id, 'pattern-1', 'reason-1')
         job.register_task_lock(task_id, 'pattern-2', 'reason-2')  # Different pattern, same token
 
-        # Should only have 1 lock (first one wins)
-        locks = db.select(cn, f"""
-            SELECT node_pattern FROM {tables["Lock"]}
-            WHERE token_id = %s
-        """, job._task_to_token(task_id)).to_dict('records')
+        with postgres.connect() as conn:
+            result = conn.execute(text(f"""
+                SELECT node_pattern FROM {tables["Lock"]}
+                WHERE token_id = :token_id
+            """), {'token_id': job._task_to_token(task_id)})
+            locks = [dict(row._mapping) for row in result]
 
         assert_equal(len(locks), 1, 'Should only have 1 lock (ON CONFLICT DO NOTHING)')
         assert_equal(locks[0]['node_pattern'], 'pattern-1', 'First pattern should be kept')
@@ -401,27 +402,27 @@ class TestLockRegistration:
 class TestCanClaimTask:
     """Test task claiming logic."""
 
-    def test_can_claim_owned_token(self, psql_docker, postgres):
+    def test_can_claim_owned_token(self, postgres):
         """Test that node can claim task if it owns the token."""
         config = get_unit_test_config()
-        cn = db.connect('postgres', config)
         tables = schema.get_table_names(config)
 
-        # Clean up any existing data
-        db.execute(cn, f'DELETE FROM {tables["Token"]}')
+        with postgres.connect() as conn:
+            conn.execute(text(f'DELETE FROM {tables["Token"]}'))
+            conn.commit()
 
-        # Create job without skipping sync to enable coordination
-        job = Job('node1', 'postgres', config, skip_db_init=True)
-        # Set coordination flags manually to avoid full __enter__() flow
+        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
         job._coordination_enabled = True
-        
 
-        # Manually assign token 5 to node1
         token_id = 5
-        db.execute(cn, f"""
-            INSERT INTO {tables["Token"]} (token_id, node, assigned_at, version)
-            VALUES (%s, %s, %s, %s)
-        """, token_id, 'node1', db.select_scalar(cn, 'SELECT NOW()'), 1)
+        with postgres.connect() as conn:
+            result = conn.execute(text('SELECT NOW()'))
+            assigned_at = result.scalar()
+            conn.execute(text(f"""
+                INSERT INTO {tables["Token"]} (token_id, node, assigned_at, version)
+                VALUES (:token_id, :node, :assigned_at, :version)
+            """), {'token_id': token_id, 'node': 'node1', 'assigned_at': assigned_at, 'version': 1})
+            conn.commit()
 
         # Update job's token cache
         job._my_tokens = {5}
@@ -436,15 +437,12 @@ class TestCanClaimTask:
         assert_true(task is not None, 'Should find a task that maps to token 5')
         assert_true(job.can_claim_task(task), 'Should be able to claim task with owned token')
 
-    def test_cannot_claim_unowned_token(self, psql_docker, postgres):
+    def test_cannot_claim_unowned_token(self, postgres):
         """Test that node cannot claim task if it doesn't own the token."""
         config = get_unit_test_config()
 
-        # Create job without skipping sync to enable coordination
-        job = Job('node1', 'postgres', config, skip_db_init=True)
-        # Set coordination flags manually to avoid full __enter__() flow
+        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
         job._coordination_enabled = True
-        
 
         # Node has no tokens
         job._my_tokens = set()
@@ -457,14 +455,14 @@ class TestCanClaimTask:
 class TestThreadShutdown:
     """Test thread shutdown behavior and responsiveness."""
 
-    def test_fast_shutdown(self, psql_docker, postgres):
+    def test_fast_shutdown(self, postgres):
         """Verify shutdown completes quickly without thread timeouts.
         """
         import time
 
         config = get_unit_test_config()
 
-        node = Job('node1', 'postgres', config, wait_on_enter=5, skip_db_init=True)
+        node = Job('node1', config, wait_on_enter=5, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
         node.__enter__()
 
         delay(2)
@@ -476,12 +474,12 @@ class TestThreadShutdown:
         assert_true(elapsed < 3, f'Shutdown took {elapsed:.1f}s (should be < 3s)')
         logger.info(f'✓ Shutdown completed in {elapsed:.1f}s')
 
-    def test_all_threads_wake_on_shutdown(self, psql_docker, postgres):
+    def test_all_threads_wake_on_shutdown(self, postgres):
         """Verify all thread types respond immediately to shutdown event.
         """
         config = get_unit_test_config()
 
-        node = Job('node1', 'postgres', config, wait_on_enter=5, skip_db_init=True)
+        node = Job('node1', config, wait_on_enter=5, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
         node.__enter__()
         delay(1)
 
@@ -502,21 +500,22 @@ class TestThreadShutdown:
 
         logger.info('✓ All threads responded to shutdown within 1 second')
 
-    def test_leader_threads_shutdown(self, psql_docker, postgres):
+    def test_leader_threads_shutdown(self, postgres):
         """Verify leader-specific threads respond to shutdown event.
         """
         config = get_unit_test_config()
-        cn = db.connect('postgres', config)
         tables = schema.get_table_names(config)
 
         from date import now
 
-        db.execute(cn, f"""
-            INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
-            VALUES ('node1', %s, %s)
-        """, now(), now())
+        with postgres.connect() as conn:
+            conn.execute(text(f"""
+                INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
+                VALUES (:name, :created_on, :heartbeat)
+            """), {'name': 'node1', 'created_on': now(), 'heartbeat': now()})
+            conn.commit()
 
-        node = Job('node1', 'postgres', config, wait_on_enter=5, skip_db_init=True)
+        node = Job('node1', config, wait_on_enter=5, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
         node.__enter__()
 
         delay(2)
@@ -537,7 +536,7 @@ class TestThreadShutdown:
 
         logger.info('✓ Leader threads responded to shutdown within 2 seconds')
 
-    def test_no_thread_timeout_warnings(self, psql_docker, postgres, caplog):
+    def test_no_thread_timeout_warnings(self, postgres, caplog):
         """Verify no thread timeout warnings during normal shutdown.
         """
         import logging
@@ -545,7 +544,7 @@ class TestThreadShutdown:
         config = get_unit_test_config()
 
         with caplog.at_level(logging.WARNING):
-            node = Job('node1', 'postgres', config, wait_on_enter=5, skip_db_init=True)
+            node = Job('node1', config, wait_on_enter=5, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
             node.__enter__()
             delay(1)
             node.__exit__(None, None, None)
@@ -558,7 +557,7 @@ class TestThreadShutdown:
 
         logger.info('✓ No thread timeout warnings during shutdown')
 
-    def test_shutdown_with_long_intervals(self, psql_docker, postgres):
+    def test_shutdown_with_long_intervals(self, postgres):
         """Verify shutdown is fast even with long check intervals.
         """
         import time
@@ -573,7 +572,7 @@ class TestThreadShutdown:
         finally:
             Setting.lock()
 
-        node = Job('node1', 'postgres', config, wait_on_enter=5, skip_db_init=True)
+        node = Job('node1', config, wait_on_enter=5, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
         node.__enter__()
 
         delay(1)

@@ -1,3 +1,4 @@
+"""Unit tests for Task class."""
 import pytest
 
 from jobsync.client import Task

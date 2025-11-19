@@ -10,7 +10,9 @@ python = "^3.10"
 more-itertools = "*"
 opendate = "*"
 
-database = { git = "https://github.com/bissli/database" }
+psycopg = { extras = ["binary"], version = "3.2.10" }
+sqlalchemy = "^2.0.0"
+
 libb-util = { git = "https://github.com/bissli/libb-util" }
 
 # == test

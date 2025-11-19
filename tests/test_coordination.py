@@ -14,9 +14,9 @@ import multiprocessing
 import threading
 
 import config as test_config
-import database as db
 import pytest
 from asserts import assert_equal, assert_true
+from sqlalchemy import create_engine, text
 
 from jobsync import schema
 from jobsync.client import Job, Task
@@ -52,22 +52,22 @@ def get_coordination_config():
     return coord_config
 
 
-def node_worker(node_name: str, site: str, items: list, barrier: multiprocessing.Barrier, results: dict):
+def node_worker(node_name: str, connection_string: str, items: list, barrier: multiprocessing.Barrier, results: dict):
     """Worker function for multiprocessing node simulation.
 
     Args:
         node_name: Name of this node
-        site: Database site (postgres/sqlite)
+        connection_string: SQLAlchemy connection string
         items: List of task IDs to attempt
         barrier: Synchronization barrier
         results: Shared dict for results
     """
     try:
         config = get_coordination_config()
-        cn = db.connect(site, config)
+        engine = create_engine(connection_string, pool_pre_ping=True, pool_size=10, max_overflow=5)
         tables = schema.get_table_names(config)
 
-        with Job(node_name, site, config, wait_on_enter=10, skip_db_init=True) as job:
+        with Job(node_name, config, wait_on_enter=10, skip_db_init=True, connection_string=connection_string) as job:
             # Wait for all nodes to be ready
             barrier.wait()
 
@@ -80,8 +80,9 @@ def node_worker(node_name: str, site: str, items: list, barrier: multiprocessing
                 if job.can_claim_task(task):
                     job.add_task(task)
                     claimed.append(item_id)
-                    # Simulate work
-                    db.execute(cn, f'UPDATE {tables["Inst"]} SET done=TRUE WHERE item=%s', str(item_id))
+                    with engine.connect() as conn:
+                        conn.execute(text(f'UPDATE {tables["Inst"]} SET done=TRUE WHERE item=:item'), {'item': str(item_id)})
+                        conn.commit()
 
             logger.info(f'{node_name}: Claimed {len(claimed)} tasks')
             results[node_name] = claimed
@@ -91,18 +92,17 @@ def node_worker(node_name: str, site: str, items: list, barrier: multiprocessing
         results[node_name] = {'error': str(e)}
 
 
-def test_3node_cluster_formation(psql_docker, postgres):
+def test_3node_cluster_formation(postgres):
     """Test that 3 nodes form a cluster, elect leader, and distribute tokens."""
     print('\n=== Testing 3-node cluster formation ===')
 
     config = get_coordination_config()
-    cn = db.connect('postgres', config)
     tables = schema.get_table_names(config)
+    connection_string = postgres.url.render_as_string(hide_password=False)
 
-    # Create 3 node objects
     nodes = []
     for i in range(1, 4):
-        node = Job(f'node{i}', 'postgres', config, wait_on_enter=15, skip_db_init=True)
+        node = Job(f'node{i}', config, wait_on_enter=15, skip_db_init=True, connection_string=connection_string)
         nodes.append(node)
 
     # Start all nodes in parallel so they discover each other during wait_on_enter
@@ -160,16 +160,19 @@ def test_3node_cluster_formation(psql_docker, postgres):
             node.__exit__(None, None, None)
 
 
-def test_token_based_task_claiming(psql_docker, postgres):
+def test_token_based_task_claiming(postgres):
     """Test that nodes only claim tasks they own tokens for."""
     print('\n=== Testing token-based task claiming ===')
 
     config = get_coordination_config()
-    cn = db.connect('postgres', config)
     tables = schema.get_table_names(config)
+    connection_string = postgres.url.render_as_string(hide_password=False)
 
-    # Create test data
-    db.insert_rows(cn, tables['Inst'], [{'item': str(i), 'done': False} for i in range(30)])
+    with postgres.connect() as conn:
+        for i in range(30):
+            conn.execute(text(f'INSERT INTO {tables["Inst"]} (item, done) VALUES (:item, :done)'), 
+                        {'item': str(i), 'done': False})
+        conn.commit()
 
     # Start 3 nodes with multiprocessing
     barrier = multiprocessing.Barrier(3)
@@ -180,7 +183,7 @@ def test_token_based_task_claiming(psql_docker, postgres):
     processes = [
         multiprocessing.Process(
             target=node_worker,
-            args=(f'node{i}', 'postgres', items, barrier, results)
+            args=(f'node{i}', connection_string, items, barrier, results)
         )
         for i in range(1, 4)
     ]
@@ -209,24 +212,24 @@ def test_token_based_task_claiming(psql_docker, postgres):
     total_claims = sum(len(tasks) for tasks in results.values() if isinstance(tasks, list))
     assert_equal(total_claims, 30, 'No duplicate claims')
 
-    # Verify all tasks marked done
-    done_count = db.select_scalar(cn, f'SELECT COUNT(*) FROM {tables["Inst"]} WHERE done=TRUE')
+    with postgres.connect() as conn:
+        result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Inst"]} WHERE done=TRUE'))
+        done_count = result.scalar()
     assert_equal(done_count, 30, 'All tasks should be marked done')
 
     print('✓ Token-based claiming successful')
 
 
-def test_node_death_and_rebalancing(psql_docker, postgres):
+def test_node_death_and_rebalancing(postgres):
     """Test that when a node dies, its tokens are redistributed."""
     print('\n=== Testing node death and rebalancing ===')
 
     config = get_coordination_config()
-    cn = db.connect('postgres', config)
+    connection_string = postgres.url.render_as_string(hide_password=False)
 
-    # Start 3 nodes
     nodes = []
     for i in range(1, 4):
-        node = Job(f'node{i}', 'postgres', config, wait_on_enter=15, skip_db_init=True)
+        node = Job(f'node{i}', config, wait_on_enter=15, skip_db_init=True, connection_string=connection_string)
         node.__enter__()
         nodes.append(node)
 
@@ -277,13 +280,13 @@ def test_node_death_and_rebalancing(psql_docker, postgres):
                 pass
 
 
-def test_lock_registration_and_enforcement(psql_docker, postgres):
+def test_lock_registration_and_enforcement(postgres):
     """Test that locked tasks are only assigned to nodes matching the pattern."""
     print('\n=== Testing lock registration and enforcement ===')
 
     config = get_coordination_config()
-    cn = db.connect('postgres', config)
     tables = schema.get_table_names(config)
+    connection_string = postgres.url.render_as_string(hide_password=False)
 
     # Lock registration callback
     def register_locks(job):
@@ -292,12 +295,11 @@ def test_lock_registration_and_enforcement(psql_docker, postgres):
         job.register_task_locks_bulk(locks)
         print(f'{job.node_name}: Registered {len(locks)} locks')
 
-    # Start 2 regular nodes and 1 special node
-    node1 = Job('node1', 'postgres', config, wait_on_enter=15, skip_db_init=True,
+    node1 = Job('node1', config, wait_on_enter=15, skip_db_init=True, connection_string=connection_string,
                 lock_provider=register_locks)
-    node2 = Job('node2', 'postgres', config, wait_on_enter=15, skip_db_init=True,
+    node2 = Job('node2', config, wait_on_enter=15, skip_db_init=True, connection_string=connection_string,
                 lock_provider=register_locks)
-    special = Job('special-alpha', 'postgres', config, wait_on_enter=15, skip_db_init=True,
+    special = Job('special-alpha', config, wait_on_enter=15, skip_db_init=True, connection_string=connection_string,
                   lock_provider=register_locks)
 
     node1.__enter__()
@@ -307,14 +309,14 @@ def test_lock_registration_and_enforcement(psql_docker, postgres):
     try:
         delay(5)
 
-        # Check which node owns locked tokens
         locked_token_owners = {}
         for task_id in range(10):
             token_id = node1._task_to_token(task_id)
 
-            # Query who owns this token
-            sql = f'SELECT node FROM {tables["Token"]} WHERE token_id = %s'
-            owner = db.select_scalar(cn, sql, token_id)
+            with postgres.connect() as conn:
+                result = conn.execute(text(f'SELECT node FROM {tables["Token"]} WHERE token_id = :token_id'), 
+                                     {'token_id': token_id})
+                owner = result.scalar()
             locked_token_owners[task_id] = owner
             print(f'Task {task_id} (token {token_id}) -> {owner}')
 
@@ -341,13 +343,14 @@ def test_lock_registration_and_enforcement(psql_docker, postgres):
         special.__exit__(None, None, None)
 
 
-def test_health_monitoring(psql_docker, postgres):
+def test_health_monitoring(postgres):
     """Test that nodes monitor their own health correctly."""
     print('\n=== Testing health monitoring ===')
 
     config = get_coordination_config()
+    connection_string = postgres.url.render_as_string(hide_password=False)
 
-    node = Job('node1', 'postgres', config, wait_on_enter=15, skip_db_init=True)
+    node = Job('node1', config, wait_on_enter=15, skip_db_init=True, connection_string=connection_string)
     node.__enter__()
 
     try:
@@ -373,19 +376,19 @@ def test_health_monitoring(psql_docker, postgres):
         node.__exit__(None, None, None)
 
 
-def test_leader_failover(psql_docker, postgres):
+def test_leader_failover(postgres):
     """Test that when leader dies, a new leader is elected."""
     print('\n=== Testing leader failover ===')
 
     config = get_coordination_config()
+    connection_string = postgres.url.render_as_string(hide_password=False)
 
-    # Start 3 nodes (node1 will be leader - oldest)
     nodes = []
     for i in range(1, 4):
-        node = Job(f'node{i}', 'postgres', config, wait_on_enter=15, skip_db_init=True)
+        node = Job(f'node{i}', config, wait_on_enter=15, skip_db_init=True, connection_string=connection_string)
         node.__enter__()
         nodes.append(node)
-        delay(1)  # Stagger to ensure node1 is oldest
+        delay(1)
 
     try:
         delay(5)
