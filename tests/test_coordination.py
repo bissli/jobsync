@@ -425,5 +425,107 @@ def test_leader_failover(postgres):
                 pass
 
 
+def test_node_rejoin_restores_original_allocation(postgres):
+    """Test that when a dead node rejoins, it gets back its original token allocation."""
+    print('\n=== Testing node rejoin restores original allocation ===')
+
+    config = get_coordination_config()
+    connection_string = postgres.url.render_as_string(hide_password=False)
+
+    # Phase 1: Start all 4 nodes and record initial state
+    print('Phase 1: Starting 4 nodes...')
+    nodes = []
+    for name in ['nodeA', 'nodeB', 'nodeC', 'nodeD']:
+        node = Job(name, config, wait_on_enter=15, skip_db_init=True, connection_string=connection_string)
+        nodes.append(node)
+
+    def enter_node(node):
+        node.__enter__()
+
+    threads = []
+    for node in nodes:
+        t = threading.Thread(target=enter_node, args=(node,))
+        t.start()
+        threads.append(t)
+        delay(0.1)
+
+    for t in threads:
+        t.join()
+
+    try:
+        delay(5)
+
+        # Record initial token allocations
+        original_tokens = {}
+        for node in nodes:
+            tokens = node._get_my_tokens()
+            original_tokens[node.node_name] = tokens.copy()
+            print(f'{node.node_name}: {len(tokens)} tokens initially')
+
+        # Verify all 100 tokens are distributed
+        total_initial = sum(len(tokens) for tokens in original_tokens.values())
+        assert_equal(total_initial, 100, 'All 100 tokens should be distributed initially')
+
+        # Phase 2: Kill nodeD
+        print('\nPhase 2: Killing nodeD...')
+        nodeD = nodes[3]
+        nodeD._shutdown = True
+        nodeD.__exit__(None, None, None)
+
+        # Wait for dead node detection and rebalancing
+        delay(15)
+
+        # Verify nodeD's tokens were redistributed to A, B, C
+        print('Verifying redistribution after nodeD death:')
+        surviving_nodes = nodes[:3]
+        for node in surviving_nodes:
+            new_tokens = node._get_my_tokens()
+            print(f'{node.node_name}: {len(original_tokens[node.node_name])} -> {len(new_tokens)} tokens')
+            assert_true(len(new_tokens) > len(original_tokens[node.node_name]),
+                       f'{node.node_name} should have gained tokens after nodeD died')
+
+        # Phase 3: Rejoin nodeD
+        print('\nPhase 3: Rejoining nodeD...')
+        nodeD_rejoined = Job('nodeD', config, wait_on_enter=15, skip_db_init=True, connection_string=connection_string)
+        nodeD_rejoined.__enter__()
+        nodes[3] = nodeD_rejoined
+
+        # Wait for rebalancing to complete
+        delay(15)
+
+        # Phase 4: Verify original allocations are restored
+        print('\nPhase 4: Verifying original allocations restored:')
+        all_restored = True
+        for node in nodes:
+            current_tokens = node._get_my_tokens()
+            original = original_tokens[node.node_name]
+            
+            print(f'{node.node_name}: original={len(original)}, current={len(current_tokens)}, '
+                  f'match={current_tokens == original}')
+            
+            if current_tokens != original:
+                all_restored = False
+                missing = original - current_tokens
+                extra = current_tokens - original
+                print(f'  Missing {len(missing)} tokens: {sorted(list(missing))[:10]}...')
+                print(f'  Extra {len(extra)} tokens: {sorted(list(extra))[:10]}...')
+
+        assert_true(all_restored, 'All nodes should have their original token allocations restored')
+
+        # Verify total is still 100
+        total_final = sum(len(node._get_my_tokens()) for node in nodes)
+        assert_equal(total_final, 100, 'All 100 tokens should be distributed after rejoin')
+
+        print('✓ Node rejoin successfully restored original allocation')
+
+    finally:
+        # Cleanup all nodes
+        for node in nodes:
+            try:
+                node.__exit__(None, None, None)
+            except:
+                pass
+
+
 if __name__ == '__main__':
     pytest.main(args=['-sx', __file__])

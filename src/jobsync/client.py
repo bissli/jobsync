@@ -22,7 +22,7 @@ from libb import attrdict, delay, isiterable
 
 logger = logging.getLogger(__name__)
 
-__all__ = ['Job', 'Task', 'CoordinationConfig', 'compute_minimal_move_distribution']
+__all__ = ['Job', 'Task', 'CoordinationConfig', 'JobState', 'compute_minimal_move_distribution']
 
 
 class JobState(enum.Enum):
@@ -106,10 +106,18 @@ def compute_minimal_move_distribution(
         if count < target:
             receivers.append((node, target - count))
 
+    has_over_quota_nodes = any(node_token_counts[node] > target_per_node for node in active_nodes)
+    has_under_quota_nodes = len(receivers) > 0
+
+    if has_over_quota_nodes and has_under_quota_nodes:
+        token_iteration_order = sorted(unlocked_token_ids, reverse=True)
+    else:
+        token_iteration_order = sorted(unlocked_token_ids)
+
     new_assignments = {}
     tokens_moved = 0
 
-    for token_id in unlocked_token_ids:
+    for token_id in token_iteration_order:
         if token_id in locked_assignments:
             new_assignments[token_id] = locked_assignments[token_id]
         elif token_id in current_assignments and current_assignments[token_id] in active_nodes:
@@ -186,6 +194,22 @@ class Job:
     6. SHUTTING_DOWN (__exit__): Stop threads, cleanup database
     7. STOPPED: All resources released
 
+    Callback Lifecycle (Long-Running Task Support):
+    - on_tokens_added(token_ids: set[int]): Called when tokens are assigned
+      * Invoked during __enter__ for initial allocation
+      * Invoked in refresh thread on rebalances
+      * Use to start subscriptions/long-running tasks
+    - on_tokens_removed(token_ids: set[int]): Called when tokens are removed
+      * Invoked in refresh thread on rebalances
+      * Always called BEFORE on_tokens_added in same rebalance
+      * Use to stop subscriptions/long-running tasks
+
+    Callback Requirements:
+    - Callbacks run in background thread (heartbeat or refresh thread)
+    - Keep callbacks fast (<1s) or delegate work to separate threads
+    - Exceptions are logged but don't stop coordination
+    - Applications must handle thread safety (use locks for shared state)
+
     Threading Model (all daemon threads):
     - heartbeat_thread: ALL nodes send periodic heartbeats
     - health_thread: ALL nodes monitor own health status
@@ -214,6 +238,8 @@ class Job:
         clear_existing_locks: bool = False,
         coordination_config: CoordinationConfig = None,
         connection_string: str = None,
+        on_tokens_added: callable = None,
+        on_tokens_removed: callable = None,
     ):
         """Initialize job sync manager with hybrid coordination support.
 
@@ -228,6 +254,8 @@ class Job:
             clear_existing_locks: If True, clear locks created by this node before invoking lock_provider
             coordination_config: Optional CoordinationConfig to override config module settings
             connection_string: Optional SQLAlchemy connection string (for testing, defaults to building from config)
+            on_tokens_added: Callback(token_ids: set[int]) invoked when tokens are assigned to this node
+            on_tokens_removed: Callback(token_ids: set[int]) invoked when tokens are removed from this node
         """
         self._state = JobState.INITIALIZING
         self.node_name = node_name
@@ -298,6 +326,12 @@ class Job:
         self._rebalance_thread = None
         self._refresh_thread = None
 
+        self._on_tokens_added = on_tokens_added
+        self._on_tokens_removed = on_tokens_removed
+
+        if not self._coordination_enabled and (on_tokens_added or on_tokens_removed):
+            logger.warning('Token callbacks provided but coordination_enabled=False - callbacks will never fire')
+
         if not skip_db_init:
             init_database(self._engine, config)
 
@@ -366,6 +400,25 @@ class Job:
             self._my_tokens, self._token_version = self._get_my_tokens_versioned()
             logger.info(f'Node {self.node_name} assigned {len(self._my_tokens)} tokens, version {self._token_version}')
 
+            if self._my_tokens and self._on_tokens_added:
+                def invoke_initial_callback():
+                    try:
+                        logger.info(f'Invoking on_tokens_added for {len(self._my_tokens)} initial tokens')
+                        start = time.time()
+                        self._on_tokens_added(self._my_tokens.copy())
+                        duration_ms = int((time.time() - start) * 1000)
+                        logger.info(f'on_tokens_added completed in {duration_ms}ms')
+                    except Exception as e:
+                        logger.error(f'on_tokens_added callback failed during initialization: {e}')
+
+                callback_thread = threading.Thread(
+                    target=invoke_initial_callback,
+                    daemon=True,
+                    name=f'initial-callback-{self.node_name}'
+                )
+                callback_thread.start()
+                callback_thread.join()
+
             self._start_token_refresh_thread()
             if is_leader:
                 logger.info('Starting leader monitoring threads...')
@@ -423,6 +476,18 @@ class Job:
         """Safely expose internal nodes (for name matching, for example).
         """
         return deepcopy(self._nodes)
+
+    @property
+    def my_tokens(self) -> set[int]:
+        """Get current token IDs owned by this node (read-only copy).
+        """
+        return self._my_tokens.copy()
+
+    @property
+    def token_version(self) -> int:
+        """Get current token distribution version.
+        """
+        return self._token_version
 
     def set_claim(self, item):
         """Claim an item or items and publish to database.
@@ -491,6 +556,40 @@ class Job:
             logger.debug(f'Cannot claim task {task.id} (token {token_id} not owned by {self.node_name})')
 
         return can_claim
+
+    def task_to_token(self, task_id: Hashable) -> int:
+        """Map task ID to token ID using consistent hashing.
+
+        This is a pure function - same task_id always maps to same token_id.
+        Applications can call this to build efficient lookup structures.
+        """
+        return self._task_to_token(task_id)
+
+    def get_task_ids_for_token(self, token_id: int, all_task_ids: list[Hashable]) -> list[Hashable]:
+        """Get task IDs that hash to the given token.
+
+        Note: Performs linear scan. For large task sets, consider caching
+        the result or building inverse lookup using task_to_token().
+
+        Args:
+            token_id: Token ID to match
+            all_task_ids: Complete list of possible task IDs
+
+        Returns
+            List of task IDs that hash to this token
+        """
+        return [task_id for task_id in all_task_ids if self._task_to_token(task_id) == token_id]
+
+    def get_my_task_ids(self, all_task_ids: list[Hashable]) -> list[Hashable]:
+        """Get all task IDs owned by this node based on current token allocation.
+
+        Args:
+            all_task_ids: Complete list of possible task IDs
+
+        Returns
+            List of task IDs this node currently owns
+        """
+        return [task_id for task_id in all_task_ids if self._task_to_token(task_id) in self._my_tokens]
 
     # ============================================================
     # PUBLIC API - Lock Management
@@ -1088,6 +1187,25 @@ class Job:
 
                             self._my_tokens = new_tokens
                             self._token_version = new_version
+
+                            if removed and self._on_tokens_removed:
+                                try:
+                                    start = time.time()
+                                    self._on_tokens_removed(removed)
+                                    duration_ms = int((time.time() - start) * 1000)
+                                    logger.info(f'on_tokens_removed completed in {duration_ms}ms for {len(removed)} tokens')
+                                except Exception as e:
+                                    logger.error(f'on_tokens_removed callback failed: {e}')
+
+                            if added and self._on_tokens_added:
+                                try:
+                                    start = time.time()
+                                    self._on_tokens_added(added)
+                                    duration_ms = int((time.time() - start) * 1000)
+                                    logger.info(f'on_tokens_added completed in {duration_ms}ms for {len(added)} tokens')
+                                except Exception as e:
+                                    logger.error(f'on_tokens_added callback failed: {e}')
+
                             start_time = time.time()
 
                         check_count += 1

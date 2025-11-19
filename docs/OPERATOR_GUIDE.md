@@ -38,6 +38,7 @@
 - **Rebalance frequency**: Should be rare (<1 per hour in stable cluster)
 - **Task claiming rate**: Should be consistent across nodes
 - **Leader stability**: Leader should not change frequently
+- **Callback performance**: Token callbacks should complete in <1 second
 
 ## Deployment Procedures
 
@@ -656,6 +657,140 @@ with Job('admin', 'production', config) as job:
     register_correct_locks(job)
 ```
 
+### Problem: Callbacks taking too long
+
+**Symptoms**:
+- Log shows "on_tokens_added completed in 5000ms"
+- Warning: "Callback took >1000ms"
+- Coordination appears slow or unresponsive
+- Rebalancing takes longer than expected
+
+**Diagnosis**:
+```python
+# Check application logs for callback timing
+grep "on_tokens_added completed" app.log | tail -20
+grep "on_tokens_removed completed" app.log | tail -20
+
+# Look for slow callback warnings
+grep "Slow callback detected" app.log
+```
+
+**Possible causes**:
+1. **Synchronous heavy work in callback**: Loading data, making API calls, etc.
+2. **Too many tasks per token**: Callback processing large token sets
+3. **Blocking operations**: Synchronous I/O without threading
+
+**Solutions**:
+
+**Delegate heavy work to background threads**:
+```python
+def on_tokens_added(token_ids: set[int]):
+    # Quick acknowledgment
+    logger.info(f'Received {len(token_ids)} tokens')
+    
+    # Delegate heavy work
+    def background_work():
+        for token_id in token_ids:
+            expensive_operation(token_id)
+    
+    thread = threading.Thread(target=background_work)
+    thread.daemon = True
+    thread.start()
+```
+
+**Batch operations efficiently**:
+```python
+def on_tokens_added(token_ids: set[int]):
+    # Collect all work first
+    all_tasks = []
+    for token_id in token_ids:
+        tasks = job.get_task_ids_for_token(token_id, all_task_ids)
+        all_tasks.extend(tasks)
+    
+    # Process in bulk
+    start_bulk_subscriptions(all_tasks)
+```
+
+**Monitor callback performance**:
+```python
+import time
+
+def on_tokens_added(token_ids: set[int]):
+    start = time.time()
+    try:
+        process_tokens(token_ids)
+    finally:
+        duration_ms = int((time.time() - start) * 1000)
+        if duration_ms > 1000:
+            logger.warning(f'Callback took {duration_ms}ms for {len(token_ids)} tokens')
+```
+
+### Problem: Callbacks failing with exceptions
+
+**Symptoms**:
+- Log shows "on_tokens_added callback failed: ..."
+- Resources not started/stopped correctly
+- Inconsistent state between tokens and active resources
+
+**Diagnosis**:
+```bash
+# Check for callback exceptions
+grep "callback failed" app.log
+
+# Check if resources are leaked
+# (app-specific - check your resource tracking)
+```
+
+**Possible causes**:
+1. **Unhandled exceptions in callback**: Code doesn't handle errors
+2. **Partial failures**: Some resources fail to start/stop
+3. **Resource conflicts**: Multiple callbacks trying to use same resource
+
+**Solutions**:
+
+**Wrap callback logic in try/except**:
+```python
+def on_tokens_added(token_ids: set[int]):
+    for token_id in token_ids:
+        try:
+            start_processing(token_id)
+        except Exception as e:
+            logger.error(f'Failed to process token {token_id}: {e}')
+            # Continue with other tokens
+```
+
+**Track resource state**:
+```python
+class ResourceTracker:
+    def __init__(self):
+        self.active = {}
+        self.failed = {}
+    
+    def on_tokens_added(self, token_ids: set[int]):
+        for token_id in token_ids:
+            try:
+                resource = start_resource(token_id)
+                self.active[token_id] = resource
+            except Exception as e:
+                logger.error(f'Failed to start token {token_id}: {e}')
+                self.failed[token_id] = str(e)
+```
+
+**Implement retry logic**:
+```python
+def on_tokens_added(token_ids: set[int]):
+    for token_id in token_ids:
+        for attempt in range(3):
+            try:
+                start_processing(token_id)
+                break
+            except Exception as e:
+                if attempt == 2:
+                    logger.error(f'Failed after 3 attempts for token {token_id}: {e}')
+                else:
+                    time.sleep(1)
+```
+
 ### Problem: Node health check failing
 
 **Symptoms**:
@@ -975,6 +1110,9 @@ SELECT * FROM sync_node WHERE last_heartbeat > NOW() - INTERVAL '15 seconds';
 10. **Clean up dead nodes periodically** - prevent table bloat
 11. **Vacuum coordination tables weekly** - maintain performance
 12. **Back up before major changes** - can restore if issues arise
+13. **Keep callbacks fast** - delegate heavy work to background threads (<1s completion)
+14. **Monitor callback performance** - log timing and alert on slow callbacks
+15. **Handle callback exceptions** - don't let one token failure stop others
 
 ## Contact and Escalation
 

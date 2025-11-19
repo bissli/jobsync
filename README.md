@@ -36,6 +36,37 @@ with Job('worker-01', 'production', config) as job:
             process_item(item_id)
 ```
 
+### Long-Running Task Example
+
+```python
+# For subscriptions, WebSockets, or continuous processing
+active_subscriptions = {}
+
+def on_tokens_added(token_ids: set[int]):
+    """Start subscriptions for newly assigned tokens."""
+    for token_id in token_ids:
+        task_ids = job.get_task_ids_for_token(token_id, all_task_ids)
+        for task_id in task_ids:
+            subscription = start_websocket_subscription(task_id)
+            active_subscriptions[task_id] = subscription
+
+def on_tokens_removed(token_ids: set[int]):
+    """Stop subscriptions for removed tokens."""
+    for token_id in token_ids:
+        task_ids = job.get_task_ids_for_token(token_id, all_task_ids)
+        for task_id in task_ids:
+            if task_id in active_subscriptions:
+                active_subscriptions[task_id].close()
+                del active_subscriptions[task_id]
+
+with Job('worker-01', 'production', config,
+         on_tokens_added=on_tokens_added,
+         on_tokens_removed=on_tokens_removed) as job:
+    # Callbacks handle starting/stopping subscriptions
+    while not shutdown:
+        time.sleep(1)
+```
+
 Run multiple workers - they automatically coordinate:
 
 ```bash
@@ -139,6 +170,48 @@ kill -TERM $(pgrep -f worker_v1.py)
 
 The leader automatically rebalances tokens as workers join and leave.
 
+### Long-Running Tasks and Subscriptions
+
+Use callbacks to manage persistent resources based on token ownership:
+
+```python
+def manage_data_streams():
+    """Manage streaming data connections based on token ownership."""
+    streams = {}
+    
+    def handle_tokens_added(token_ids: set[int]):
+        for token_id in token_ids:
+            # Get tasks that hash to this token
+            my_tasks = job.get_task_ids_for_token(token_id, all_customer_ids)
+            for customer_id in my_tasks:
+                # Start streaming connection for this customer
+                stream = start_data_stream(customer_id)
+                streams[customer_id] = stream
+                logger.info(f'Started stream for customer {customer_id}')
+    
+    def handle_tokens_removed(token_ids: set[int]):
+        for token_id in token_ids:
+            my_tasks = job.get_task_ids_for_token(token_id, all_customer_ids)
+            for customer_id in my_tasks:
+                if customer_id in streams:
+                    streams[customer_id].close()
+                    del streams[customer_id]
+                    logger.info(f'Stopped stream for customer {customer_id}')
+    
+    with Job('stream-worker-01', 'production', config,
+             on_tokens_added=handle_tokens_added,
+             on_tokens_removed=handle_tokens_removed) as job:
+        # Streams are automatically managed
+        while not shutdown_requested():
+            time.sleep(1)
+```
+
+**Callback Guarantees:**
+- `on_tokens_removed` always called **before** `on_tokens_added` during rebalancing
+- Callbacks run in background thread (heartbeat or refresh thread)
+- Keep callbacks fast (<1s) or delegate work to separate threads
+- Exceptions logged but don't stop coordination
+
 ### Task Pinning
 
 Lock specific tasks to specific workers using patterns:
@@ -241,7 +314,78 @@ with Job('worker-01', 'production', base_config, coordination_config=config) as 
 
 ## Real-World Examples
 
-### Example 1: ETL Pipeline
+### Example 1: WebSocket Subscription Management
+
+```python
+import threading
+from collections import defaultdict
+
+class SubscriptionManager:
+    """Manage WebSocket subscriptions based on token ownership."""
+    
+    def __init__(self):
+        self.subscriptions = {}
+        self.lock = threading.Lock()
+    
+    def on_tokens_added(self, token_ids: set[int]):
+        """Start subscriptions for assigned tokens."""
+        with self.lock:
+            for token_id in token_ids:
+                # Get all symbols that hash to this token
+                symbols = job.get_task_ids_for_token(token_id, all_symbols)
+                
+                for symbol in symbols:
+                    ws = websocket.create_connection(
+                        f'wss://api.example.com/stream/{symbol}'
+                    )
+                    self.subscriptions[symbol] = ws
+                    
+                    # Start background thread to process messages
+                    thread = threading.Thread(
+                        target=self._process_messages,
+                        args=(symbol, ws)
+                    )
+                    thread.daemon = True
+                    thread.start()
+                
+                logger.info(f'Started {len(symbols)} subscriptions for token {token_id}')
+    
+    def on_tokens_removed(self, token_ids: set[int]):
+        """Stop subscriptions for removed tokens."""
+        with self.lock:
+            for token_id in token_ids:
+                symbols = job.get_task_ids_for_token(token_id, all_symbols)
+                
+                for symbol in symbols:
+                    if symbol in self.subscriptions:
+                        self.subscriptions[symbol].close()
+                        del self.subscriptions[symbol]
+                
+                logger.info(f'Stopped {len(symbols)} subscriptions for token {token_id}')
+    
+    def _process_messages(self, symbol, ws):
+        """Process incoming WebSocket messages."""
+        while symbol in self.subscriptions:
+            try:
+                message = ws.recv()
+                process_market_data(symbol, message)
+            except Exception as e:
+                logger.error(f'Error processing {symbol}: {e}')
+                break
+
+def run_subscription_worker():
+    """Run worker with subscription management."""
+    manager = SubscriptionManager()
+    
+    with Job('subscription-worker-01', 'production', config,
+             on_tokens_added=manager.on_tokens_added,
+             on_tokens_removed=manager.on_tokens_removed) as job:
+        # Keep worker alive while subscriptions run
+        while not shutdown_requested():
+            time.sleep(1)
+```
+
+### Example 2: ETL Pipeline
 
 ```python
 def run_daily_etl():
@@ -263,7 +407,7 @@ def run_daily_etl():
         job.write_audit()
 ```
 
-### Example 2: GPU Task Processing
+### Example 3: GPU Task Processing
 
 ```python
 def process_gpu_tasks():
@@ -282,7 +426,7 @@ def process_gpu_tasks():
                 run_model_inference(task_id)
 ```
 
-### Example 3: Continuous Processing
+### Example 4: Continuous Processing
 
 ```python
 def continuous_processor():

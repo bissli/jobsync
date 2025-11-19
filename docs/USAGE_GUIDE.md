@@ -5,11 +5,12 @@
 1. [Overview](#overview)
 2. [Basic Job Creation](#basic-job-creation)
 3. [Coordination Configuration](#coordination-configuration)
-4. [Task Locking and Pinning](#task-locking-and-pinning)
-5. [Task Processing Patterns](#task-processing-patterns)
-6. [Health Monitoring](#health-monitoring)
-7. [Database Queries](#database-queries)
-8. [Best Practices](#best-practices)
+4. [Long-Running Tasks and Callbacks](#long-running-tasks-and-callbacks)
+5. [Task Locking and Pinning](#task-locking-and-pinning)
+6. [Task Processing Patterns](#task-processing-patterns)
+7. [Health Monitoring](#health-monitoring)
+8. [Database Queries](#database-queries)
+9. [Best Practices](#best-practices)
 
 ## Overview
 
@@ -238,6 +239,666 @@ with Job(
 | `locks_enabled`                      | `True`    | Enable task locking                 |
 | `leader_lock_timeout_sec`            | `30`      | Leader lock timeout                 |
 | `health_check_interval_sec`          | `30`      | Health check frequency              |
+
+## Long-Running Tasks and Callbacks
+
+### Overview
+
+JobSync supports long-running tasks like WebSocket subscriptions, message queue consumers, or continuous data streams through token ownership callbacks. These callbacks notify your application when token ownership changes, allowing you to start/stop persistent resources automatically.
+
+**When to Use Callbacks:**
+- WebSocket or streaming data connections
+- Message queue subscriptions (Kafka, RabbitMQ, etc.)
+- Background threads processing specific tasks
+- Cache warming/invalidation based on ownership
+- Database connection pools per task set
+
+**Callback Lifecycle:**
+
+```
+Node Startup:
+├── Register node
+├── Token distribution
+└── on_tokens_added(initial_tokens)  ← Start initial subscriptions
+
+During Rebalancing:
+├── on_tokens_removed(removed_tokens)  ← Always called first
+└── on_tokens_added(added_tokens)      ← Then called (may overlap)
+
+Node Shutdown:
+└── __exit__ cleanup  ← Application responsible for cleanup
+```
+
+**Callback Contract:**
+1. **Thread Safety Required**: Callbacks run in background threads (heartbeat or refresh thread)
+2. **Keep Fast**: Callbacks should complete in <1 second or delegate work to other threads
+3. **Exception Handling**: Exceptions are logged but don't stop coordination
+4. **No Blocking**: Don't make synchronous calls that could block the coordination thread
+5. **Order Guarantee**: `on_tokens_removed` always called before `on_tokens_added` during rebalancing
+
+### Basic Callback Usage
+
+```python
+def simple_callback_example():
+    """Basic token ownership callbacks.
+    """
+    def handle_tokens_added(token_ids: set[int]):
+        """Called when tokens are assigned to this node.
+        
+        Args:
+            token_ids: Set of token IDs now owned by this node
+        """
+        logger.info(f'Received {len(token_ids)} new tokens')
+        
+        # Get all task IDs that hash to these tokens
+        for token_id in token_ids:
+            task_ids = job.get_task_ids_for_token(token_id, all_possible_tasks)
+            for task_id in task_ids:
+                start_processing(task_id)
+    
+    def handle_tokens_removed(token_ids: set[int]):
+        """Called when tokens are removed from this node.
+        
+        Args:
+            token_ids: Set of token IDs no longer owned by this node
+        """
+        logger.info(f'Lost {len(token_ids)} tokens')
+        
+        for token_id in token_ids:
+            task_ids = job.get_task_ids_for_token(token_id, all_possible_tasks)
+            for task_id in task_ids:
+                stop_processing(task_id)
+    
+    with Job(
+        node_name='worker-01',
+        site='production',
+        config=config,
+        on_tokens_added=handle_tokens_added,
+        on_tokens_removed=handle_tokens_removed
+    ) as job:
+        # Callbacks handle token changes
+        # Keep worker alive
+        while not shutdown_requested():
+            time.sleep(1)
+```
+
+### WebSocket Subscription Management
+
+```python
+import threading
+import websocket
+from collections import defaultdict
+
+class WebSocketManager:
+    """Manage WebSocket connections based on token ownership.
+    """
+    
+    def __init__(self, job, all_symbols):
+        self.job = job
+        self.all_symbols = all_symbols
+        self.connections = {}
+        self.threads = {}
+        self.lock = threading.Lock()
+        self.shutdown = False
+    
+    def on_tokens_added(self, token_ids: set[int]):
+        """Start WebSocket connections for assigned tokens.
+        """
+        with self.lock:
+            for token_id in token_ids:
+                symbols = self.job.get_task_ids_for_token(token_id, self.all_symbols)
+                
+                for symbol in symbols:
+                    if symbol in self.connections:
+                        continue
+                    
+                    try:
+                        ws = websocket.WebSocketApp(
+                            f'wss://stream.example.com/quotes/{symbol}',
+                            on_message=lambda ws, msg: self._handle_message(symbol, msg),
+                            on_error=lambda ws, err: self._handle_error(symbol, err),
+                            on_close=lambda ws: self._handle_close(symbol)
+                        )
+                        
+                        self.connections[symbol] = ws
+                        
+                        thread = threading.Thread(
+                            target=ws.run_forever,
+                            name=f'ws-{symbol}'
+                        )
+                        thread.daemon = True
+                        thread.start()
+                        self.threads[symbol] = thread
+                        
+                        logger.info(f'Started WebSocket for {symbol}')
+                    except Exception as e:
+                        logger.error(f'Failed to start WebSocket for {symbol}: {e}')
+                
+                logger.info(f'Managing {len(self.connections)} WebSocket connections')
+    
+    def on_tokens_removed(self, token_ids: set[int]):
+        """Stop WebSocket connections for removed tokens.
+        """
+        with self.lock:
+            for token_id in token_ids:
+                symbols = self.job.get_task_ids_for_token(token_id, self.all_symbols)
+                
+                for symbol in symbols:
+                    if symbol in self.connections:
+                        try:
+                            self.connections[symbol].close()
+                            del self.connections[symbol]
+                            if symbol in self.threads:
+                                del self.threads[symbol]
+                            logger.info(f'Closed WebSocket for {symbol}')
+                        except Exception as e:
+                            logger.error(f'Error closing WebSocket for {symbol}: {e}')
+    
+    def _handle_message(self, symbol, message):
+        """Process incoming WebSocket message.
+        """
+        try:
+            data = json.loads(message)
+            process_quote_update(symbol, data)
+        except Exception as e:
+            logger.error(f'Error processing message for {symbol}: {e}')
+    
+    def _handle_error(self, symbol, error):
+        """Handle WebSocket error.
+        """
+        logger.error(f'WebSocket error for {symbol}: {error}')
+    
+    def _handle_close(self, symbol):
+        """Handle WebSocket closure.
+        """
+        logger.warning(f'WebSocket closed for {symbol}')
+        
+        with self.lock:
+            if symbol in self.connections and not self.shutdown:
+                logger.info(f'Reconnecting WebSocket for {symbol}')
+                del self.connections[symbol]
+    
+    def close_all(self):
+        """Close all WebSocket connections (for shutdown).
+        """
+        self.shutdown = True
+        with self.lock:
+            for symbol, ws in list(self.connections.items()):
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+            self.connections.clear()
+            self.threads.clear()
+
+def run_websocket_worker():
+    """Run worker managing WebSocket subscriptions.
+    """
+    all_symbols = get_all_symbols()
+    
+    with Job('ws-worker-01', 'production', config) as job:
+        manager = WebSocketManager(job, all_symbols)
+        
+        with Job(
+            node_name='ws-worker-01',
+            site='production',
+            config=config,
+            on_tokens_added=manager.on_tokens_added,
+            on_tokens_removed=manager.on_tokens_removed
+        ) as job:
+            try:
+                while not shutdown_requested():
+                    time.sleep(1)
+            finally:
+                manager.close_all()
+```
+
+### Message Queue Consumer Management
+
+```python
+import threading
+from kafka import KafkaConsumer
+
+class KafkaConsumerManager:
+    """Manage Kafka consumers based on token ownership.
+    """
+    
+    def __init__(self, job, all_topics):
+        self.job = job
+        self.all_topics = all_topics
+        self.consumers = {}
+        self.threads = {}
+        self.lock = threading.Lock()
+        self.shutdown = False
+    
+    def on_tokens_added(self, token_ids: set[int]):
+        """Start Kafka consumers for assigned tokens.
+        """
+        with self.lock:
+            for token_id in token_ids:
+                topics = self.job.get_task_ids_for_token(token_id, self.all_topics)
+                
+                for topic in topics:
+                    if topic in self.consumers:
+                        continue
+                    
+                    try:
+                        consumer = KafkaConsumer(
+                            topic,
+                            bootstrap_servers=['kafka:9092'],
+                            group_id='my-consumer-group',
+                            auto_offset_reset='latest'
+                        )
+                        
+                        self.consumers[topic] = consumer
+                        
+                        thread = threading.Thread(
+                            target=self._consume_messages,
+                            args=(topic, consumer),
+                            name=f'kafka-{topic}'
+                        )
+                        thread.daemon = True
+                        thread.start()
+                        self.threads[topic] = thread
+                        
+                        logger.info(f'Started Kafka consumer for {topic}')
+                    except Exception as e:
+                        logger.error(f'Failed to start consumer for {topic}: {e}')
+                
+                logger.info(f'Managing {len(self.consumers)} Kafka consumers')
+    
+    def on_tokens_removed(self, token_ids: set[int]):
+        """Stop Kafka consumers for removed tokens.
+        """
+        with self.lock:
+            for token_id in token_ids:
+                topics = self.job.get_task_ids_for_token(token_id, self.all_topics)
+                
+                for topic in topics:
+                    if topic in self.consumers:
+                        try:
+                            self.consumers[topic].close()
+                            del self.consumers[topic]
+                            if topic in self.threads:
+                                del self.threads[topic]
+                            logger.info(f'Closed Kafka consumer for {topic}')
+                        except Exception as e:
+                            logger.error(f'Error closing consumer for {topic}: {e}')
+    
+    def _consume_messages(self, topic, consumer):
+        """Consume messages from Kafka topic.
+        """
+        while not self.shutdown and topic in self.consumers:
+            try:
+                for message in consumer:
+                    if self.shutdown or topic not in self.consumers:
+                        break
+                    
+                    process_kafka_message(topic, message)
+            except Exception as e:
+                logger.error(f'Error consuming from {topic}: {e}')
+                time.sleep(5)
+    
+    def close_all(self):
+        """Close all Kafka consumers (for shutdown).
+        """
+        self.shutdown = True
+        with self.lock:
+            for topic, consumer in list(self.consumers.items()):
+                try:
+                    consumer.close()
+                except Exception:
+                    pass
+            self.consumers.clear()
+            self.threads.clear()
+
+def run_kafka_worker():
+    """Run worker managing Kafka consumers.
+    """
+    all_topics = ['topic-1', 'topic-2', 'topic-3', 'topic-4']
+    
+    with Job('kafka-worker-01', 'production', config) as job:
+        manager = KafkaConsumerManager(job, all_topics)
+        
+        with Job(
+            node_name='kafka-worker-01',
+            site='production',
+            config=config,
+            on_tokens_added=manager.on_tokens_added,
+            on_tokens_removed=manager.on_tokens_removed
+        ) as job:
+            try:
+                while not shutdown_requested():
+                    time.sleep(1)
+            finally:
+                manager.close_all()
+```
+
+### Background Thread Management
+
+```python
+import threading
+import queue
+
+class BackgroundProcessor:
+    """Manage background processing threads per token.
+    """
+    
+    def __init__(self, job, all_task_ids):
+        self.job = job
+        self.all_task_ids = all_task_ids
+        self.threads = {}
+        self.queues = {}
+        self.lock = threading.Lock()
+        self.shutdown = False
+    
+    def on_tokens_added(self, token_ids: set[int]):
+        """Start processing threads for assigned tokens.
+        """
+        with self.lock:
+            for token_id in token_ids:
+                if token_id in self.threads:
+                    continue
+                
+                task_queue = queue.Queue()
+                self.queues[token_id] = task_queue
+                
+                thread = threading.Thread(
+                    target=self._process_token,
+                    args=(token_id, task_queue),
+                    name=f'processor-{token_id}'
+                )
+                thread.daemon = True
+                thread.start()
+                self.threads[token_id] = thread
+                
+                task_ids = self.job.get_task_ids_for_token(token_id, self.all_task_ids)
+                for task_id in task_ids:
+                    task_queue.put(task_id)
+                
+                logger.info(f'Started thread for token {token_id} with {len(task_ids)} tasks')
+    
+    def on_tokens_removed(self, token_ids: set[int]):
+        """Stop processing threads for removed tokens.
+        """
+        with self.lock:
+            for token_id in token_ids:
+                if token_id in self.queues:
+                    self.queues[token_id].put(None)
+                    del self.queues[token_id]
+                
+                if token_id in self.threads:
+                    del self.threads[token_id]
+                
+                logger.info(f'Stopped thread for token {token_id}')
+    
+    def _process_token(self, token_id, task_queue):
+        """Process tasks for a specific token.
+        """
+        while not self.shutdown:
+            try:
+                task_id = task_queue.get(timeout=1)
+                
+                if task_id is None:
+                    break
+                
+                process_long_running_task(task_id)
+                
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f'Error processing token {token_id}: {e}')
+    
+    def close_all(self):
+        """Stop all processing threads (for shutdown).
+        """
+        self.shutdown = True
+        with self.lock:
+            for token_id in list(self.queues.keys()):
+                self.queues[token_id].put(None)
+            self.queues.clear()
+            self.threads.clear()
+
+def run_background_processor():
+    """Run worker with background processing threads.
+    """
+    all_task_ids = get_all_task_ids()
+    
+    with Job('processor-01', 'production', config) as job:
+        processor = BackgroundProcessor(job, all_task_ids)
+        
+        with Job(
+            node_name='processor-01',
+            site='production',
+            config=config,
+            on_tokens_added=processor.on_tokens_added,
+            on_tokens_removed=processor.on_tokens_removed
+        ) as job:
+            try:
+                while not shutdown_requested():
+                    time.sleep(1)
+            finally:
+                processor.close_all()
+```
+
+### Cache Management Based on Ownership
+
+```python
+from functools import lru_cache
+import threading
+
+class TokenBasedCache:
+    """Manage cache warming/invalidation based on token ownership.
+    """
+    
+    def __init__(self, job, all_customer_ids):
+        self.job = job
+        self.all_customer_ids = all_customer_ids
+        self.cached_data = {}
+        self.lock = threading.Lock()
+    
+    def on_tokens_added(self, token_ids: set[int]):
+        """Warm cache for newly assigned tokens.
+        """
+        with self.lock:
+            for token_id in token_ids:
+                customer_ids = self.job.get_task_ids_for_token(token_id, self.all_customer_ids)
+                
+                for customer_id in customer_ids:
+                    if customer_id not in self.cached_data:
+                        self.cached_data[customer_id] = load_customer_data(customer_id)
+                
+                logger.info(f'Warmed cache for {len(customer_ids)} customers in token {token_id}')
+    
+    def on_tokens_removed(self, token_ids: set[int]):
+        """Invalidate cache for removed tokens.
+        """
+        with self.lock:
+            for token_id in token_ids:
+                customer_ids = self.job.get_task_ids_for_token(token_id, self.all_customer_ids)
+                
+                for customer_id in customer_ids:
+                    if customer_id in self.cached_data:
+                        del self.cached_data[customer_id]
+                
+                logger.info(f'Invalidated cache for {len(customer_ids)} customers in token {token_id}')
+    
+    def get_data(self, customer_id):
+        """Get cached data for customer.
+        """
+        with self.lock:
+            if customer_id not in self.cached_data:
+                self.cached_data[customer_id] = load_customer_data(customer_id)
+            return self.cached_data[customer_id]
+
+def run_cached_processor():
+    """Run worker with token-based caching.
+    """
+    all_customer_ids = get_all_customers()
+    
+    with Job('cached-worker-01', 'production', config) as job:
+        cache = TokenBasedCache(job, all_customer_ids)
+        
+        with Job(
+            node_name='cached-worker-01',
+            site='production',
+            config=config,
+            on_tokens_added=cache.on_tokens_added,
+            on_tokens_removed=cache.on_tokens_removed
+        ) as job:
+            while not shutdown_requested():
+                for customer_id in get_pending_requests():
+                    if job.can_claim_task(Task(customer_id)):
+                        data = cache.get_data(customer_id)
+                        process_request(customer_id, data)
+                
+                time.sleep(1)
+```
+
+### Helper Methods for Callback Implementation
+
+```python
+def token_ownership_helpers():
+    """Demonstrate helper methods for working with token ownership.
+    """
+    with Job('worker-01', 'production', config) as job:
+        # Get all task IDs currently owned by this node
+        all_task_ids = ['task-1', 'task-2', 'task-3', ...]
+        my_tasks = job.get_my_task_ids(all_task_ids)
+        logger.info(f'I own {len(my_tasks)} tasks')
+        
+        # Get task IDs for a specific token
+        token_id = 100
+        tasks_in_token = job.get_task_ids_for_token(token_id, all_task_ids)
+        logger.info(f'Token {token_id} contains {len(tasks_in_token)} tasks')
+        
+        # Check which token a task hashes to
+        task_id = 'customer-12345'
+        token = job.task_to_token(task_id)
+        logger.info(f'Task {task_id} hashes to token {token}')
+        
+        # Check if we own this task
+        can_process = job.can_claim_task(Task(task_id))
+        logger.info(f'Can process {task_id}: {can_process}')
+        
+        # Get current token ownership info
+        my_tokens = job.my_tokens  # Read-only copy
+        token_version = job.token_version
+        logger.info(f'Own {len(my_tokens)} tokens at version {token_version}')
+```
+
+### Callback Best Practices
+
+**1. Delegate Heavy Work to Background Threads:**
+
+```python
+def on_tokens_added(token_ids: set[int]):
+    """Don't block the coordination thread!"""
+    # BAD: Synchronous heavy work
+    for token_id in token_ids:
+        load_heavy_data(token_id)  # Blocks coordination!
+    
+    # GOOD: Delegate to worker thread
+    def background_work():
+        for token_id in token_ids:
+            load_heavy_data(token_id)
+    
+    thread = threading.Thread(target=background_work)
+    thread.daemon = True
+    thread.start()
+```
+
+**2. Handle Exceptions Gracefully:**
+
+```python
+def on_tokens_added(token_ids: set[int]):
+    """Always handle exceptions in callbacks.
+    """
+    for token_id in token_ids:
+        try:
+            start_subscription(token_id)
+        except Exception as e:
+            logger.error(f'Failed to start subscription for token {token_id}: {e}')
+            # Continue processing other tokens
+```
+
+**3. Use Locks for Shared State:**
+
+```python
+class SafeCallbackHandler:
+    """Thread-safe callback handler.
+    """
+    
+    def __init__(self):
+        self.active_resources = {}
+        self.lock = threading.Lock()
+    
+    def on_tokens_added(self, token_ids: set[int]):
+        with self.lock:
+            for token_id in token_ids:
+                self.active_resources[token_id] = start_resource(token_id)
+    
+    def on_tokens_removed(self, token_ids: set[int]):
+        with self.lock:
+            for token_id in token_ids:
+                if token_id in self.active_resources:
+                    self.active_resources[token_id].close()
+                    del self.active_resources[token_id]
+```
+
+**4. Track Callback Performance:**
+
+```python
+import time
+
+def on_tokens_added(token_ids: set[int]):
+    """Monitor callback performance.
+    """
+    start = time.time()
+    
+    try:
+        for token_id in token_ids:
+            start_processing(token_id)
+        
+        duration_ms = int((time.time() - start) * 1000)
+        logger.info(f'on_tokens_added completed in {duration_ms}ms for {len(token_ids)} tokens')
+        
+        if duration_ms > 1000:
+            logger.warning(f'Callback took >{duration_ms}ms - consider delegating work')
+    
+    except Exception as e:
+        logger.error(f'Callback failed: {e}')
+```
+
+**5. Handle Overlapping Token Sets During Rebalancing:**
+
+```python
+class OverlapAwareHandler:
+    """Handle token changes that may overlap.
+    """
+    
+    def __init__(self):
+        self.active_tokens = set()
+        self.lock = threading.Lock()
+    
+    def on_tokens_removed(self, token_ids: set[int]):
+        """Always called first during rebalancing.
+        """
+        with self.lock:
+            for token_id in token_ids:
+                if token_id in self.active_tokens:
+                    stop_processing(token_id)
+                    self.active_tokens.discard(token_id)
+    
+    def on_tokens_added(self, token_ids: set[int]):
+        """Called after on_tokens_removed during rebalancing.
+        """
+        with self.lock:
+            for token_id in token_ids:
+                if token_id not in self.active_tokens:
+                    start_processing(token_id)
+                    self.active_tokens.add(token_id)
+```
 
 ## Task Locking and Pinning
 
@@ -1248,7 +1909,29 @@ def process_tasks_with_logging(job):
     logger.debug(f'Token version: {job._token_version}')
 ```
 
-### 10. Use clear_existing_locks for Dynamic Locks
+### 10. Keep Callbacks Fast
+
+```python
+def process_with_fast_callbacks():
+    """Ensure callbacks complete quickly.
+    """
+    def on_tokens_added(token_ids: set[int]):
+        # BAD: Synchronous heavy work
+        for token_id in token_ids:
+            expensive_operation(token_id)  # Blocks coordination thread!
+        
+        # GOOD: Quick work only
+        logger.info(f'Received {len(token_ids)} tokens')
+        
+        # GOOD: Delegate to background thread
+        threading.Thread(target=lambda: heavy_work(token_ids)).start()
+    
+    with Job('worker-01', 'production', config,
+             on_tokens_added=on_tokens_added) as job:
+        process_tasks(job)
+```
+
+### 11. Use clear_existing_locks for Dynamic Locks
 
 ```python
 def process_with_dynamic_locks():
@@ -1270,7 +1953,34 @@ def process_with_dynamic_locks():
         process_tasks(job)
 ```
 
-### 11. Test in Staging First
+### 12. Monitor Callback Performance
+
+```python
+def monitor_callbacks():
+    """Track callback execution time in production.
+    """
+    import time
+    
+    def on_tokens_added(token_ids: set[int]):
+        start = time.time()
+        try:
+            for token_id in token_ids:
+                start_processing(token_id)
+            
+            duration_ms = int((time.time() - start) * 1000)
+            logger.info(f'Callback completed in {duration_ms}ms')
+            
+            if duration_ms > 1000:
+                logger.warning(f'Slow callback detected: {duration_ms}ms')
+        except Exception as e:
+            logger.error(f'Callback failed: {e}')
+    
+    with Job('worker-01', 'production', config,
+             on_tokens_added=on_tokens_added) as job:
+        process_tasks(job)
+```
+
+### 13. Test in Staging First
 
 ```python
 def test_coordination(config):

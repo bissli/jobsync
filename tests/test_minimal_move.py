@@ -1,5 +1,4 @@
 """Unit tests for minimal-move token distribution algorithm."""
-import pytest
 
 from jobsync.client import compute_minimal_move_distribution
 
@@ -37,7 +36,7 @@ class TestBasicDistribution:
             locked_tokens={},
             pattern_matcher=exact_match
         )
-        
+
         assert assignments == {}
         assert moved == 0
 
@@ -51,7 +50,7 @@ class TestBasicDistribution:
             locked_tokens={},
             pattern_matcher=exact_match
         )
-        
+
         assert len(assignments) == 100
         assert all(node == 'node1' for node in assignments.values())
         assert moved == 100
@@ -66,11 +65,11 @@ class TestBasicDistribution:
             locked_tokens={},
             pattern_matcher=exact_match
         )
-        
+
         assert len(assignments) == 100
         node1_count = sum(1 for node in assignments.values() if node == 'node1')
         node2_count = sum(1 for node in assignments.values() if node == 'node2')
-        
+
         assert node1_count == 50
         assert node2_count == 50
         assert moved == 100
@@ -85,12 +84,12 @@ class TestBasicDistribution:
             locked_tokens={},
             pattern_matcher=exact_match
         )
-        
+
         assert len(assignments) == 100
         counts = {}
         for node in assignments.values():
             counts[node] = counts.get(node, 0) + 1
-        
+
         assert counts['node1'] == 34
         assert counts['node2'] == 33
         assert counts['node3'] == 33
@@ -104,7 +103,7 @@ class TestMinimalMovement:
         """Verify no tokens move when distribution is already balanced.
         """
         current = {i: f'node{i % 2 + 1}' for i in range(100)}
-        
+
         assignments, moved = compute_minimal_move_distribution(
             total_tokens=100,
             active_nodes=['node1', 'node2'],
@@ -112,7 +111,7 @@ class TestMinimalMovement:
             locked_tokens={},
             pattern_matcher=exact_match
         )
-        
+
         assert len(assignments) == 100
         assert moved == 0
         assert assignments == current
@@ -120,9 +119,9 @@ class TestMinimalMovement:
     def test_minimal_movement_on_rebalance(self):
         """Verify minimal tokens move when slight rebalance needed.
         """
-        current = {i: 'node1' for i in range(60)}
-        current.update({i: 'node2' for i in range(60, 100)})
-        
+        current = dict.fromkeys(range(60), 'node1')
+        current.update(dict.fromkeys(range(60, 100), 'node2'))
+
         assignments, moved = compute_minimal_move_distribution(
             total_tokens=100,
             active_nodes=['node1', 'node2'],
@@ -130,10 +129,10 @@ class TestMinimalMovement:
             locked_tokens={},
             pattern_matcher=exact_match
         )
-        
+
         assert len(assignments) == 100
         assert moved == 10
-        
+
         node1_count = sum(1 for node in assignments.values() if node == 'node1')
         node2_count = sum(1 for node in assignments.values() if node == 'node2')
         assert node1_count == 50
@@ -143,7 +142,7 @@ class TestMinimalMovement:
         """Verify existing assignments preserved when within target range.
         """
         current = {0: 'node1', 1: 'node1', 2: 'node2', 3: 'node2'}
-        
+
         assignments, moved = compute_minimal_move_distribution(
             total_tokens=4,
             active_nodes=['node1', 'node2'],
@@ -151,7 +150,7 @@ class TestMinimalMovement:
             locked_tokens={},
             pattern_matcher=exact_match
         )
-        
+
         assert moved == 0
         assert assignments == current
 
@@ -169,7 +168,7 @@ class TestLockedTokens:
             locked_tokens={0: 'node1', 1: 'node2'},
             pattern_matcher=exact_match
         )
-        
+
         assert assignments[0] == 'node1'
         assert assignments[1] == 'node2'
 
@@ -183,16 +182,16 @@ class TestLockedTokens:
             locked_tokens={0: 'node1', 1: 'node1', 2: 'node1'},
             pattern_matcher=exact_match
         )
-        
+
         assert assignments[0] == 'node1'
         assert assignments[1] == 'node1'
         assert assignments[2] == 'node1'
-        
-        unlocked_node1 = sum(1 for tid, node in assignments.items() 
+
+        unlocked_node1 = sum(1 for tid, node in assignments.items()
                             if node == 'node1' and tid >= 3)
-        unlocked_node2 = sum(1 for tid, node in assignments.items() 
+        unlocked_node2 = sum(1 for tid, node in assignments.items()
                             if node == 'node2' and tid >= 3)
-        
+
         assert abs(unlocked_node1 - unlocked_node2) <= 1
 
     def test_wildcard_pattern_matching(self):
@@ -205,8 +204,8 @@ class TestLockedTokens:
             locked_tokens={0: 'worker%', 5: 'manager%'},
             pattern_matcher=wildcard_match
         )
-        
-        assert assignments[0] in ['worker1', 'worker2']
+
+        assert assignments[0] in {'worker1', 'worker2'}
         assert assignments[5] == 'manager1'
 
     def test_no_matching_node_for_locked_token(self):
@@ -219,7 +218,7 @@ class TestLockedTokens:
             locked_tokens={0: 'node3'},
             pattern_matcher=exact_match
         )
-        
+
         assert 0 not in assignments
 
 
@@ -229,9 +228,9 @@ class TestNodeFailure:
     def test_dead_node_tokens_redistributed(self):
         """Verify tokens from dead nodes get redistributed.
         """
-        current = {i: 'dead_node' for i in range(50)}
-        current.update({i: 'node1' for i in range(50, 100)})
-        
+        current = dict.fromkeys(range(50), 'dead_node')
+        current.update(dict.fromkeys(range(50, 100), 'node1'))
+
         assignments, moved = compute_minimal_move_distribution(
             total_tokens=100,
             active_nodes=['node1', 'node2'],
@@ -239,11 +238,11 @@ class TestNodeFailure:
             locked_tokens={},
             pattern_matcher=exact_match
         )
-        
+
         assert len(assignments) == 100
         assert 'dead_node' not in assignments.values()
         assert moved == 50
-        
+
         node1_count = sum(1 for node in assignments.values() if node == 'node1')
         node2_count = sum(1 for node in assignments.values() if node == 'node2')
         assert node1_count == 50
@@ -253,7 +252,7 @@ class TestNodeFailure:
         """Verify new node receives balanced token allocation.
         """
         current = {i: f'node{i % 2 + 1}' for i in range(100)}
-        
+
         assignments, moved = compute_minimal_move_distribution(
             total_tokens=100,
             active_nodes=['node1', 'node2', 'node3'],
@@ -261,12 +260,12 @@ class TestNodeFailure:
             locked_tokens={},
             pattern_matcher=exact_match
         )
-        
+
         assert len(assignments) == 100
         counts = {}
         for node in assignments.values():
             counts[node] = counts.get(node, 0) + 1
-        
+
         assert set(counts.values()) == {33, 34}
         assert counts['node3'] == 33
         assert moved >= 33
@@ -285,7 +284,7 @@ class TestEdgeCases:
             locked_tokens={},
             pattern_matcher=exact_match
         )
-        
+
         assert len(assignments) == 5
         assert len(set(assignments.values())) == 5
 
@@ -293,7 +292,7 @@ class TestEdgeCases:
         """Verify behavior when all tokens are locked.
         """
         locked = {i: f'node{i % 2 + 1}' for i in range(10)}
-        
+
         assignments, moved = compute_minimal_move_distribution(
             total_tokens=10,
             active_nodes=['node1', 'node2'],
@@ -301,7 +300,7 @@ class TestEdgeCases:
             locked_tokens=locked,
             pattern_matcher=exact_match
         )
-        
+
         assert len(assignments) == 10
         for tid, pattern in locked.items():
             assert assignments[tid] == pattern
@@ -316,9 +315,9 @@ class TestEdgeCases:
             locked_tokens={},
             pattern_matcher=exact_match
         )
-        
+
         assert len(assignments) == 1
-        assert assignments[0] in ['node1', 'node2']
+        assert assignments[0] in {'node1', 'node2'}
 
     def test_deterministic_sorting(self):
         """Verify distribution is deterministic with same inputs.
@@ -330,7 +329,7 @@ class TestEdgeCases:
             locked_tokens={},
             pattern_matcher=exact_match
         )
-        
+
         result2 = compute_minimal_move_distribution(
             total_tokens=100,
             active_nodes=['node1', 'node2', 'node3'],
@@ -338,9 +337,84 @@ class TestEdgeCases:
             locked_tokens={},
             pattern_matcher=exact_match
         )
-        
+
         assert result1[0] == result2[0]
         assert result1[1] == result2[1]
+
+
+class TestTokenIterationOrder:
+    """Test token iteration order logic during rebalancing."""
+
+    def test_reverse_iteration_when_rebalancing_imbalance(self):
+        """Verify tokens processed in reverse order when nodes are over/under quota.
+        """
+        current = dict.fromkeys(range(80), 'node1')
+        current.update(dict.fromkeys(range(80, 100), 'node2'))
+
+        assignments, moved = compute_minimal_move_distribution(
+            total_tokens=100,
+            active_nodes=['node1', 'node2'],
+            current_assignments=current,
+            locked_tokens={},
+            pattern_matcher=exact_match
+        )
+
+        moved_tokens = [tid for tid, node in assignments.items()
+                       if current.get(tid) != node]
+
+        assert len(moved_tokens) == 30
+        assert all(tid >= 50 for tid in moved_tokens)
+
+    def test_normal_iteration_when_balanced(self):
+        """Verify normal iteration order when already balanced.
+        """
+        current = {i: f'node{i % 2 + 1}' for i in range(100)}
+
+        assignments, moved = compute_minimal_move_distribution(
+            total_tokens=100,
+            active_nodes=['node1', 'node2'],
+            current_assignments=current,
+            locked_tokens={},
+            pattern_matcher=exact_match
+        )
+
+        assert moved == 0
+
+    def test_normal_iteration_when_adding_nodes(self):
+        """Verify normal iteration order when no nodes are over quota.
+        """
+        current = {}
+
+        assignments, moved = compute_minimal_move_distribution(
+            total_tokens=100,
+            active_nodes=['node1', 'node2'],
+            current_assignments=current,
+            locked_tokens={},
+            pattern_matcher=exact_match
+        )
+
+        assigned_tids = sorted(assignments.keys())
+        assert assigned_tids == list(range(100))
+
+    def test_reverse_iteration_moves_high_tokens_from_overloaded_node(self):
+        """Verify reverse iteration moves high tokens from over-quota nodes.
+        """
+        current = dict.fromkeys(range(70), 'node1')
+        current.update(dict.fromkeys(range(70, 100), 'node2'))
+
+        assignments, moved = compute_minimal_move_distribution(
+            total_tokens=100,
+            active_nodes=['node1', 'node2'],
+            current_assignments=current,
+            locked_tokens={},
+            pattern_matcher=exact_match
+        )
+
+        moved_tokens = [tid for tid in range(70)
+                       if assignments.get(tid) != 'node1']
+
+        assert len(moved_tokens) == 20
+        assert all(tid >= 50 for tid in moved_tokens)
 
 
 class TestLargeScale:
@@ -356,12 +430,12 @@ class TestLargeScale:
             locked_tokens={},
             pattern_matcher=exact_match
         )
-        
+
         assert len(assignments) == 10000
         counts = {}
         for node in assignments.values():
             counts[node] = counts.get(node, 0) + 1
-        
+
         for count in counts.values():
             assert 950 <= count <= 1050
 
@@ -375,12 +449,12 @@ class TestLargeScale:
             locked_tokens={},
             pattern_matcher=exact_match
         )
-        
+
         assert len(assignments) == 1000
         counts = {}
         for node in assignments.values():
             counts[node] = counts.get(node, 0) + 1
-        
+
         for count in counts.values():
             assert 8 <= count <= 12
 
@@ -388,7 +462,7 @@ class TestLargeScale:
         """Verify locked token handling at scale.
         """
         locked = {i: f'node{i % 3}' for i in range(0, 1000, 10)}
-        
+
         assignments, moved = compute_minimal_move_distribution(
             total_tokens=1000,
             active_nodes=['node0', 'node1', 'node2'],
@@ -396,7 +470,11 @@ class TestLargeScale:
             locked_tokens=locked,
             pattern_matcher=exact_match
         )
-        
+
         assert len(assignments) == 1000
         for tid, pattern in locked.items():
             assert assignments[tid] == pattern
+
+
+if __name__ == '__main__':
+    __import__('pytest').main([__file__])
