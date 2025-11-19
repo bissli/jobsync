@@ -3,7 +3,9 @@
 Tests each coordination component in isolation.
 """
 import logging
+import time
 from datetime import timedelta
+from types import SimpleNamespace
 
 import config as test_config
 import pendulum
@@ -13,32 +15,32 @@ from sqlalchemy import text
 
 from jobsync import schema
 from jobsync.client import CoordinationConfig, Job, Task
-from libb import Setting, delay
+from libb import delay
 
 logger = logging.getLogger(__name__)
 
 
 def get_unit_test_config():
     """Create a config with coordination enabled for unit tests."""
-    Setting.unlock()
-
-    config = Setting()
+    config = SimpleNamespace()
     config.postgres = test_config.postgres
-    config.sync.sql.appname = 'sync_'
-    config.sync.coordination.enabled = True
-    config.sync.coordination.heartbeat_interval_sec = 5
-    config.sync.coordination.heartbeat_timeout_sec = 15
-    config.sync.coordination.rebalance_check_interval_sec = 30
-    config.sync.coordination.dead_node_check_interval_sec = 10
-    config.sync.coordination.token_refresh_initial_interval_sec = 5
-    config.sync.coordination.token_refresh_steady_interval_sec = 30
-    config.sync.coordination.total_tokens = 100
-    config.sync.coordination.locks_enabled = True
-    config.sync.coordination.lock_orphan_warning_hours = 24
-    config.sync.coordination.leader_lock_timeout_sec = 30
-    config.sync.coordination.health_check_interval_sec = 30
-
-    Setting.lock()
+    config.sync = SimpleNamespace(
+        sql=SimpleNamespace(appname='sync_'),
+        coordination=SimpleNamespace(
+            enabled=True,
+            heartbeat_interval_sec=5,
+            heartbeat_timeout_sec=15,
+            rebalance_check_interval_sec=30,
+            dead_node_check_interval_sec=10,
+            token_refresh_initial_interval_sec=5,
+            token_refresh_steady_interval_sec=30,
+            total_tokens=100,
+            locks_enabled=True,
+            lock_orphan_warning_hours=24,
+            leader_lock_timeout_sec=30,
+            health_check_interval_sec=30
+        )
+    )
     return config
 
 
@@ -446,8 +448,6 @@ class TestThreadShutdown:
     def test_fast_shutdown(self, postgres):
         """Verify shutdown completes quickly without thread timeouts.
         """
-        import time
-
         config = get_unit_test_config()
 
         node = Job('node1', config, wait_on_enter=5, connection_string=postgres.url.render_as_string(hide_password=False))
@@ -494,8 +494,6 @@ class TestThreadShutdown:
         config = get_unit_test_config()
         tables = schema.get_table_names(config)
 
-        from date import now
-
         with postgres.connect() as conn:
             conn.execute(text(f"""
                 INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
@@ -527,8 +525,6 @@ class TestThreadShutdown:
     def test_no_thread_timeout_warnings(self, postgres, caplog):
         """Verify no thread timeout warnings during normal shutdown.
         """
-        import logging
-
         config = get_unit_test_config()
 
         with caplog.at_level(logging.WARNING):
@@ -548,17 +544,11 @@ class TestThreadShutdown:
     def test_shutdown_with_long_intervals(self, postgres):
         """Verify shutdown is fast even with long check intervals.
         """
-        import time
-
         config = get_unit_test_config()
 
-        Setting.unlock()
-        try:
-            config.sync.coordination.heartbeat_interval_sec = 60
-            config.sync.coordination.health_check_interval_sec = 60
-            config.sync.coordination.token_refresh_steady_interval_sec = 60
-        finally:
-            Setting.lock()
+        config.sync.coordination.heartbeat_interval_sec = 60
+        config.sync.coordination.health_check_interval_sec = 60
+        config.sync.coordination.token_refresh_steady_interval_sec = 60
 
         node = Job('node1', config, wait_on_enter=5, connection_string=postgres.url.render_as_string(hide_password=False))
         node.__enter__()

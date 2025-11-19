@@ -3,7 +3,9 @@
 Tests lock creation, listing, and cleanup APIs.
 """
 import logging
+import threading
 from datetime import timedelta
+from types import SimpleNamespace
 
 import config as test_config
 import pendulum
@@ -13,7 +15,6 @@ from sqlalchemy import text
 
 from jobsync import schema
 from jobsync.client import Job
-from libb import Setting
 
 logger = logging.getLogger(__name__)
 
@@ -21,25 +22,25 @@ logger = logging.getLogger(__name__)
 def get_lock_test_config():
     """Create a config with coordination enabled for lock tests.
     """
-    Setting.unlock()
-
-    config = Setting()
+    config = SimpleNamespace()
     config.postgres = test_config.postgres
-    config.sync.sql.appname = 'sync_'
-    config.sync.coordination.enabled = True
-    config.sync.coordination.heartbeat_interval_sec = 5
-    config.sync.coordination.heartbeat_timeout_sec = 15
-    config.sync.coordination.rebalance_check_interval_sec = 30
-    config.sync.coordination.dead_node_check_interval_sec = 10
-    config.sync.coordination.token_refresh_initial_interval_sec = 5
-    config.sync.coordination.token_refresh_steady_interval_sec = 30
-    config.sync.coordination.total_tokens = 100
-    config.sync.coordination.locks_enabled = True
-    config.sync.coordination.lock_orphan_warning_hours = 24
-    config.sync.coordination.leader_lock_timeout_sec = 30
-    config.sync.coordination.health_check_interval_sec = 30
-
-    Setting.lock()
+    config.sync = SimpleNamespace(
+        sql=SimpleNamespace(appname='sync_'),
+        coordination=SimpleNamespace(
+            enabled=True,
+            heartbeat_interval_sec=5,
+            heartbeat_timeout_sec=15,
+            rebalance_check_interval_sec=30,
+            dead_node_check_interval_sec=10,
+            token_refresh_initial_interval_sec=5,
+            token_refresh_steady_interval_sec=30,
+            total_tokens=100,
+            locks_enabled=True,
+            lock_orphan_warning_hours=24,
+            leader_lock_timeout_sec=30,
+            health_check_interval_sec=30
+        )
+    )
     return config
 
 
@@ -238,7 +239,7 @@ class TestClearExistingLocks:
             job1._lock_provider(job1)
 
         with postgres.connect() as conn:
-            count_after_first = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Lock"]} WHERE created_by = :creator'), 
+            count_after_first = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Lock"]} WHERE created_by = :creator'),
                                             {'creator': 'node1'}).scalar()
         assert_equal(count_after_first, 2, 'Should have 2 locks after first run')
 
@@ -254,7 +255,7 @@ class TestClearExistingLocks:
             job2._lock_provider(job2)
 
         with postgres.connect() as conn:
-            result = conn.execute(text(f'SELECT node_pattern FROM {tables["Lock"]} WHERE created_by = :creator'), 
+            result = conn.execute(text(f'SELECT node_pattern FROM {tables["Lock"]} WHERE created_by = :creator'),
                                  {'creator': 'node1'})
             locks = [dict(row._mapping) for row in result]
         patterns = [l['node_pattern'] for l in locks]
@@ -295,7 +296,7 @@ class TestClearExistingLocks:
             job2._lock_provider(job2)
 
         with postgres.connect() as conn:
-            result = conn.execute(text(f'SELECT node_pattern FROM {tables["Lock"]} WHERE created_by = :creator ORDER BY node_pattern'), 
+            result = conn.execute(text(f'SELECT node_pattern FROM {tables["Lock"]} WHERE created_by = :creator ORDER BY node_pattern'),
                                  {'creator': 'node1'})
             locks = [dict(row._mapping) for row in result]
         patterns = [l['node_pattern'] for l in locks]
@@ -347,8 +348,6 @@ class TestConcurrentLockRegistration:
             conn.commit()
 
         connection_string = postgres.url.render_as_string(hide_password=False)
-
-        import threading
 
         def register_lock(node_name):
             job = Job(node_name, config, connection_string=connection_string)

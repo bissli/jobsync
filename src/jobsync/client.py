@@ -10,19 +10,19 @@ import threading
 import time
 from collections.abc import Hashable
 from copy import deepcopy
-from dataclasses import dataclass
 from functools import total_ordering
 from types import ModuleType
 
 import pendulum
 from sqlalchemy import create_engine, text
 
+from jobsync.config import CoordinationConfig
 from jobsync.schema import ensure_database_ready, get_table_names
 from libb import attrdict, delay, isiterable
 
 logger = logging.getLogger(__name__)
 
-__all__ = ['Job', 'Task', 'CoordinationConfig', 'JobState', 'compute_minimal_move_distribution']
+__all__ = ['Job', 'Task']
 
 
 class JobState(enum.Enum):
@@ -35,26 +35,6 @@ class JobState(enum.Enum):
     RUNNING = 5
     SHUTTING_DOWN = 6
     STOPPED = 7
-
-
-@dataclass
-class CoordinationConfig:
-    """Configuration for hybrid coordination system.
-
-    All timing parameters are in seconds.
-    """
-    enabled: bool = True
-    total_tokens: int = 10000
-    heartbeat_interval_sec: int = 5
-    heartbeat_timeout_sec: int = 15
-    rebalance_check_interval_sec: int = 30
-    dead_node_check_interval_sec: int = 10
-    token_refresh_initial_interval_sec: int = 5
-    token_refresh_steady_interval_sec: int = 30
-    locks_enabled: bool = True
-    leader_lock_timeout_sec: int = 30
-    health_check_interval_sec: int = 30
-    stale_leader_lock_age_sec: int = 300
 
 
 def compute_minimal_move_distribution(
@@ -291,32 +271,18 @@ class Job:
             self._leader_lock_timeout = coordination_config.leader_lock_timeout_sec
             self._health_check_interval = coordination_config.health_check_interval_sec
         else:
-            coord_config = getattr(config, 'sync', None)
-            if coord_config and 'coordination' in coord_config:
-                coord = coord_config.coordination
-                self._coordination_enabled = coord.get('enabled', True)
-                self._total_tokens = coord.get('total_tokens', 10000)
-                self._heartbeat_interval = coord.get('heartbeat_interval_sec', 5)
-                self._heartbeat_timeout = coord.get('heartbeat_timeout_sec', 15)
-                self._rebalance_check_interval = coord.get('rebalance_check_interval_sec', 30)
-                self._dead_node_check_interval = coord.get('dead_node_check_interval_sec', 10)
-                self._token_refresh_initial = coord.get('token_refresh_initial_interval_sec', 5)
-                self._token_refresh_steady = coord.get('token_refresh_steady_interval_sec', 30)
-                self._locks_enabled = coord.get('locks_enabled', True)
-                self._leader_lock_timeout = coord.get('leader_lock_timeout_sec', 30)
-                self._health_check_interval = coord.get('health_check_interval_sec', 30)
-            else:
-                self._coordination_enabled = True
-                self._total_tokens = 10000
-                self._heartbeat_interval = 5
-                self._heartbeat_timeout = 15
-                self._rebalance_check_interval = 30
-                self._dead_node_check_interval = 10
-                self._token_refresh_initial = 5
-                self._token_refresh_steady = 30
-                self._locks_enabled = True
-                self._leader_lock_timeout = 30
-                self._health_check_interval = 30
+            coord = config.sync.coordination
+            self._coordination_enabled = getattr(coord, 'enabled', True)
+            self._total_tokens = getattr(coord, 'total_tokens', 10000)
+            self._heartbeat_interval = getattr(coord, 'heartbeat_interval_sec', 5)
+            self._heartbeat_timeout = getattr(coord, 'heartbeat_timeout_sec', 15)
+            self._rebalance_check_interval = getattr(coord, 'rebalance_check_interval_sec', 30)
+            self._dead_node_check_interval = getattr(coord, 'dead_node_check_interval_sec', 10)
+            self._token_refresh_initial = getattr(coord, 'token_refresh_initial_interval_sec', 5)
+            self._token_refresh_steady = getattr(coord, 'token_refresh_steady_interval_sec', 30)
+            self._locks_enabled = getattr(coord, 'locks_enabled', True)
+            self._leader_lock_timeout = getattr(coord, 'leader_lock_timeout_sec', 30)
+            self._health_check_interval = getattr(coord, 'health_check_interval_sec', 30)
 
         self._lock_provider = lock_provider
         self._clear_existing_locks = clear_existing_locks

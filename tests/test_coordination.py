@@ -12,6 +12,7 @@ These tests verify:
 import logging
 import multiprocessing
 import threading
+from types import SimpleNamespace
 
 import config as test_config
 import pytest
@@ -20,7 +21,7 @@ from sqlalchemy import create_engine, text
 
 from jobsync import schema
 from jobsync.client import Job, Task
-from libb import Setting, delay
+from libb import delay
 
 logger = logging.getLogger(__name__)
 
@@ -28,26 +29,25 @@ logger = logging.getLogger(__name__)
 # Create coordination-enabled config for these tests
 def get_coordination_config():
     """Create a config with coordination enabled for testing."""
-    Setting.unlock()
-
-    coord_config = Setting()
+    coord_config = SimpleNamespace()
     coord_config.postgres = test_config.postgres
-
-    coord_config.sync.sql.appname = 'sync_'
-    coord_config.sync.coordination.enabled = True
-    coord_config.sync.coordination.heartbeat_interval_sec = 2  # Faster for tests
-    coord_config.sync.coordination.heartbeat_timeout_sec = 6
-    coord_config.sync.coordination.rebalance_check_interval_sec = 5
-    coord_config.sync.coordination.dead_node_check_interval_sec = 3
-    coord_config.sync.coordination.token_refresh_initial_interval_sec = 2
-    coord_config.sync.coordination.token_refresh_steady_interval_sec = 5
-    coord_config.sync.coordination.total_tokens = 100  # Smaller for faster tests
-    coord_config.sync.coordination.locks_enabled = True
-    coord_config.sync.coordination.lock_orphan_warning_hours = 24
-    coord_config.sync.coordination.leader_lock_timeout_sec = 10
-    coord_config.sync.coordination.health_check_interval_sec = 5
-
-    Setting.lock()
+    coord_config.sync = SimpleNamespace(
+        sql=SimpleNamespace(appname='sync_'),
+        coordination=SimpleNamespace(
+            enabled=True,
+            heartbeat_interval_sec=2,
+            heartbeat_timeout_sec=6,
+            rebalance_check_interval_sec=5,
+            dead_node_check_interval_sec=3,
+            token_refresh_initial_interval_sec=2,
+            token_refresh_steady_interval_sec=5,
+            total_tokens=100,
+            locks_enabled=True,
+            lock_orphan_warning_hours=24,
+            leader_lock_timeout_sec=10,
+            health_check_interval_sec=5
+        )
+    )
     return coord_config
 
 

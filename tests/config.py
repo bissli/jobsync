@@ -1,32 +1,31 @@
-from libb import Setting
+from types import SimpleNamespace
 
-Setting.unlock()
+postgres = SimpleNamespace(
+    drivername='postgresql',
+    database='jobsync',
+    hostname='localhost',
+    username='postgres',
+    password='postgres',
+    port=5432,
+    timeout=30,
+    check_connection=True,
+    cleanup=True
+)
 
-postgres = Setting()
-postgres.drivername = 'postgresql'
-postgres.database = 'jobsync'
-postgres.hostname = 'localhost'
-postgres.username = 'postgres'
-postgres.password = 'postgres'
-postgres.port = 5432
-postgres.timeout = 30
-postgres.check_connection = True
-postgres.cleanup = True
-
-# Coordination settings (disabled for legacy tests)
-sync = Setting()
-sync.sql.appname = 'sync_'
-sync.coordination.enabled = False  # Disable for backward compatibility with existing tests
-sync.coordination.heartbeat_interval_sec = 5
-sync.coordination.heartbeat_timeout_sec = 15
-sync.coordination.rebalance_check_interval_sec = 30
-sync.coordination.dead_node_check_interval_sec = 10
-sync.coordination.token_refresh_initial_interval_sec = 5
-sync.coordination.token_refresh_steady_interval_sec = 30
-sync.coordination.total_tokens = 10000
-sync.coordination.locks_enabled = True
-sync.coordination.lock_orphan_warning_hours = 24
-sync.coordination.leader_lock_timeout_sec = 30
-sync.coordination.health_check_interval_sec = 30
-
-Setting.lock()
+sync = SimpleNamespace(
+    sql=SimpleNamespace(appname='sync_'),
+    coordination=SimpleNamespace(
+        enabled=False,  # Disable for backward compatibility with existing tests
+        heartbeat_interval_sec=5,
+        heartbeat_timeout_sec=15,
+        rebalance_check_interval_sec=30,
+        dead_node_check_interval_sec=10,
+        token_refresh_initial_interval_sec=5,
+        token_refresh_steady_interval_sec=30,
+        total_tokens=10000,
+        locks_enabled=True,
+        lock_orphan_warning_hours=24,
+        leader_lock_timeout_sec=30,
+        health_check_interval_sec=30
+    )
+)

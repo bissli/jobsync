@@ -8,16 +8,15 @@ Tests verify:
 - Missing tables are created automatically
 """
 import logging
+from types import SimpleNamespace
 
 import config as test_config
-import pendulum
 import pytest
 from asserts import assert_equal, assert_false, assert_true
 from sqlalchemy import text
 
 from jobsync import schema
 from jobsync.client import CoordinationConfig, Job
-from libb import Setting
 
 logger = logging.getLogger(__name__)
 
@@ -25,17 +24,17 @@ logger = logging.getLogger(__name__)
 def get_structure_test_config():
     """Create a config for structure testing.
     """
-    Setting.unlock()
-
-    config = Setting()
+    config = SimpleNamespace()
     config.postgres = test_config.postgres
-    config.sync.sql.appname = 'sync_'
-    config.sync.coordination.enabled = True
-    config.sync.coordination.heartbeat_interval_sec = 5
-    config.sync.coordination.heartbeat_timeout_sec = 15
-    config.sync.coordination.total_tokens = 100
-
-    Setting.lock()
+    config.sync = SimpleNamespace(
+        sql=SimpleNamespace(appname='sync_'),
+        coordination=SimpleNamespace(
+            enabled=True,
+            heartbeat_interval_sec=5,
+            heartbeat_timeout_sec=15,
+            total_tokens=100
+        )
+    )
     return config
 
 
@@ -113,7 +112,7 @@ class TestCoreTableCreation:
 
         with postgres.connect() as conn:
             for table in ['Node', 'Check', 'Audit', 'Claim']:
-                result = conn.execute(text(f"""
+                result = conn.execute(text("""
                     SELECT EXISTS (
                         SELECT FROM information_schema.tables
                         WHERE table_schema = 'public'
@@ -132,7 +131,7 @@ class TestCoreTableCreation:
         schema.ensure_database_ready(postgres, config, coordination_enabled=False)
 
         with postgres.connect() as conn:
-            result = conn.execute(text(f"""
+            result = conn.execute(text("""
                 SELECT indexname FROM pg_indexes
                 WHERE tablename = :table_name
                 AND schemaname = 'public'
@@ -140,7 +139,7 @@ class TestCoreTableCreation:
             indexes = [row[0] for row in result]
 
         expected_index = f'idx_{tables["Node"]}_heartbeat'
-        assert_true(expected_index in indexes, f'Node table should have heartbeat index')
+        assert_true(expected_index in indexes, 'Node table should have heartbeat index')
 
 
 class TestCoordinationTableCreation:
@@ -161,7 +160,7 @@ class TestCoordinationTableCreation:
 
         with postgres.connect() as conn:
             for table in ['Token', 'Lock', 'LeaderLock', 'RebalanceLock', 'Rebalance']:
-                result = conn.execute(text(f"""
+                result = conn.execute(text("""
                     SELECT EXISTS (
                         SELECT FROM information_schema.tables
                         WHERE table_schema = 'public'
@@ -186,7 +185,7 @@ class TestCoordinationTableCreation:
 
         with postgres.connect() as conn:
             for table in ['Token', 'Lock', 'LeaderLock', 'RebalanceLock', 'Rebalance']:
-                result = conn.execute(text(f"""
+                result = conn.execute(text("""
                     SELECT EXISTS (
                         SELECT FROM information_schema.tables
                         WHERE table_schema = 'public'
@@ -211,7 +210,7 @@ class TestCoordinationTableCreation:
 
         with postgres.connect() as conn:
             for table_name, expected in expected_indexes.items():
-                result = conn.execute(text(f"""
+                result = conn.execute(text("""
                     SELECT indexname FROM pg_indexes
                     WHERE tablename = :table_name
                     AND schemaname = 'public'
@@ -274,7 +273,7 @@ class TestJobInitialization:
 
         with postgres.connect() as conn:
             for table in ['Node', 'Check', 'Audit', 'Claim']:
-                result = conn.execute(text(f"""
+                result = conn.execute(text("""
                     SELECT EXISTS (
                         SELECT FROM information_schema.tables
                         WHERE table_schema = 'public'
@@ -301,7 +300,7 @@ class TestJobInitialization:
 
         with postgres.connect() as conn:
             for table in ['Token', 'Lock', 'LeaderLock', 'RebalanceLock', 'Rebalance']:
-                result = conn.execute(text(f"""
+                result = conn.execute(text("""
                     SELECT EXISTS (
                         SELECT FROM information_schema.tables
                         WHERE table_schema = 'public'
@@ -328,7 +327,7 @@ class TestJobInitialization:
 
         with postgres.connect() as conn:
             for table in ['Token', 'Lock', 'LeaderLock', 'RebalanceLock', 'Rebalance']:
-                result = conn.execute(text(f"""
+                result = conn.execute(text("""
                     SELECT EXISTS (
                         SELECT FROM information_schema.tables
                         WHERE table_schema = 'public'
@@ -358,7 +357,7 @@ class TestMixedModeOperations:
         job1 = Job('test-node-1', config, wait_on_enter=0, connection_string=connection_string, coordination_config=coord_config)
 
         with postgres.connect() as conn:
-            result = conn.execute(text(f"""
+            result = conn.execute(text("""
                 SELECT EXISTS (
                     SELECT FROM information_schema.tables
                     WHERE table_schema = 'public'
@@ -373,7 +372,7 @@ class TestMixedModeOperations:
         job2 = Job('test-node-2', config, wait_on_enter=0, connection_string=connection_string, coordination_config=coord_config)
 
         with postgres.connect() as conn:
-            result = conn.execute(text(f"""
+            result = conn.execute(text("""
                 SELECT EXISTS (
                     SELECT FROM information_schema.tables
                     WHERE table_schema = 'public'

@@ -10,16 +10,17 @@ Tests verify:
 """
 import logging
 import time
+from types import SimpleNamespace
 
 import config as test_config
 import pendulum
 import pytest
 from asserts import assert_equal, assert_false, assert_true
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 from jobsync import schema
 from jobsync.client import CoordinationConfig, Job, Task
-from libb import Setting, delay
+from libb import delay
 
 logger = logging.getLogger(__name__)
 
@@ -27,25 +28,25 @@ logger = logging.getLogger(__name__)
 def get_edge_case_config():
     """Create a config with short timeouts for edge case testing.
     """
-    Setting.unlock()
-
-    config = Setting()
+    config = SimpleNamespace()
     config.postgres = test_config.postgres
-    config.sync.sql.appname = 'sync_'
-    config.sync.coordination.enabled = True
-    config.sync.coordination.heartbeat_interval_sec = 0.3
-    config.sync.coordination.heartbeat_timeout_sec = 1.5
-    config.sync.coordination.rebalance_check_interval_sec = 0.5
-    config.sync.coordination.dead_node_check_interval_sec = 0.5
-    config.sync.coordination.token_refresh_initial_interval_sec = 0.3
-    config.sync.coordination.token_refresh_steady_interval_sec = 0.5
-    config.sync.coordination.total_tokens = 50
-    config.sync.coordination.locks_enabled = True
-    config.sync.coordination.lock_orphan_warning_hours = 24
-    config.sync.coordination.leader_lock_timeout_sec = 2
-    config.sync.coordination.health_check_interval_sec = 0.5
-
-    Setting.lock()
+    config.sync = SimpleNamespace(
+        sql=SimpleNamespace(appname='sync_'),
+        coordination=SimpleNamespace(
+            enabled=True,
+            heartbeat_interval_sec=0.3,
+            heartbeat_timeout_sec=1.5,
+            rebalance_check_interval_sec=0.5,
+            dead_node_check_interval_sec=0.5,
+            token_refresh_initial_interval_sec=0.3,
+            token_refresh_steady_interval_sec=0.5,
+            total_tokens=50,
+            locks_enabled=True,
+            lock_orphan_warning_hours=24,
+            leader_lock_timeout_sec=2,
+            health_check_interval_sec=0.5
+        )
+    )
     return config
 
 
@@ -77,7 +78,6 @@ class TestCleanupFailureScenarios:
             audit_count = result.scalar()
 
         assert_equal(audit_count, 2, 'Both pending tasks should be written to audit')
-
 
     def test_double_cleanup_is_safe(self, postgres):
         """Verify calling __exit__ twice doesn't cause errors.

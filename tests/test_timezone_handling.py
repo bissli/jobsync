@@ -11,6 +11,7 @@ Tests verify:
 import datetime
 import logging
 from datetime import timezone
+from types import SimpleNamespace
 
 import config as test_config
 import pendulum
@@ -20,7 +21,7 @@ from sqlalchemy import text
 
 from jobsync import schema
 from jobsync.client import CoordinationConfig, Job, Task
-from libb import Setting, delay
+from libb import delay
 
 logger = logging.getLogger(__name__)
 
@@ -28,25 +29,25 @@ logger = logging.getLogger(__name__)
 def get_timezone_test_config():
     """Create a config with short timeouts for timezone testing.
     """
-    Setting.unlock()
-
-    config = Setting()
+    config = SimpleNamespace()
     config.postgres = test_config.postgres
-    config.sync.sql.appname = 'sync_'
-    config.sync.coordination.enabled = True
-    config.sync.coordination.heartbeat_interval_sec = 2
-    config.sync.coordination.heartbeat_timeout_sec = 6
-    config.sync.coordination.rebalance_check_interval_sec = 5
-    config.sync.coordination.dead_node_check_interval_sec = 3
-    config.sync.coordination.token_refresh_initial_interval_sec = 2
-    config.sync.coordination.token_refresh_steady_interval_sec = 5
-    config.sync.coordination.total_tokens = 100
-    config.sync.coordination.locks_enabled = True
-    config.sync.coordination.lock_orphan_warning_hours = 24
-    config.sync.coordination.leader_lock_timeout_sec = 10
-    config.sync.coordination.health_check_interval_sec = 5
-
-    Setting.lock()
+    config.sync = SimpleNamespace(
+        sql=SimpleNamespace(appname='sync_'),
+        coordination=SimpleNamespace(
+            enabled=True,
+            heartbeat_interval_sec=2,
+            heartbeat_timeout_sec=6,
+            rebalance_check_interval_sec=5,
+            dead_node_check_interval_sec=3,
+            token_refresh_initial_interval_sec=2,
+            token_refresh_steady_interval_sec=5,
+            total_tokens=100,
+            locks_enabled=True,
+            lock_orphan_warning_hours=24,
+            leader_lock_timeout_sec=10,
+            health_check_interval_sec=5
+        )
+    )
     return config
 
 

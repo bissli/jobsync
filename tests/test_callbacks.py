@@ -10,6 +10,7 @@ Tests verify:
 import logging
 import threading
 import time
+from types import SimpleNamespace
 
 import config as test_config
 import pytest
@@ -17,7 +18,7 @@ from asserts import assert_equal, assert_true
 
 from jobsync import schema
 from jobsync.client import Job
-from libb import Setting, delay
+from libb import delay
 
 logger = logging.getLogger(__name__)
 
@@ -25,26 +26,26 @@ logger = logging.getLogger(__name__)
 def get_callback_test_config():
     """Create a config with coordination enabled for callback tests.
     """
-    Setting.unlock()
-
-    config = Setting()
-    config.postgres = test_config.postgres
-    config.sync.sql.appname = 'sync_'
-    config.sync.coordination.enabled = True
-    config.sync.coordination.heartbeat_interval_sec = 2
-    config.sync.coordination.heartbeat_timeout_sec = 6
-    config.sync.coordination.rebalance_check_interval_sec = 5
-    config.sync.coordination.dead_node_check_interval_sec = 3
-    config.sync.coordination.token_refresh_initial_interval_sec = 2
-    config.sync.coordination.token_refresh_steady_interval_sec = 5
-    config.sync.coordination.total_tokens = 100
-    config.sync.coordination.locks_enabled = True
-    config.sync.coordination.lock_orphan_warning_hours = 24
-    config.sync.coordination.leader_lock_timeout_sec = 10
-    config.sync.coordination.health_check_interval_sec = 5
-
-    Setting.lock()
-    return config
+    coord_config = SimpleNamespace()
+    coord_config.postgres = test_config.postgres
+    coord_config.sync = SimpleNamespace(
+        sql=SimpleNamespace(appname='sync_'),
+        coordination=SimpleNamespace(
+            enabled=True,
+            heartbeat_interval_sec=2,
+            heartbeat_timeout_sec=6,
+            rebalance_check_interval_sec=5,
+            dead_node_check_interval_sec=3,
+            token_refresh_initial_interval_sec=2,
+            token_refresh_steady_interval_sec=5,
+            total_tokens=100,
+            locks_enabled=True,
+            lock_orphan_warning_hours=24,
+            leader_lock_timeout_sec=10,
+            health_check_interval_sec=5
+        )
+    )
+    return coord_config
 
 
 class CallbackTracker:
@@ -145,9 +146,7 @@ class TestBasicCallbackInvocation:
         config = get_callback_test_config()
         connection_string = postgres.url.render_as_string(hide_password=False)
 
-        Setting.unlock()
         config.sync.coordination.enabled = False
-        Setting.lock()
 
         tracker = CallbackTracker()
 
