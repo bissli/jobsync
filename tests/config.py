@@ -13,12 +13,6 @@ postgres.timeout = 30
 postgres.check_connection = True
 postgres.cleanup = True
 
-sqlite = Setting()
-sqlite.drivername = 'sqlite'
-sqlite.database = 'database.db'
-sqlite.check_connection = True
-sqlite.cleanup = True
-
 # Coordination settings (disabled for legacy tests)
 sync = Setting()
 sync.sql.appname = 'sync_'

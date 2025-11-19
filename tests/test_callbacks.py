@@ -111,8 +111,7 @@ class TestBasicCallbackInvocation:
 
         tracker = CallbackTracker()
 
-        with Job('node1', config, wait_on_enter=10, skip_db_init=True,
-                connection_string=connection_string,
+        with Job('node1', config, wait_on_enter=10, connection_string=connection_string,
                 on_tokens_added=tracker.on_tokens_added) as job:
             # Wait for startup to complete
             delay(2)
@@ -132,8 +131,7 @@ class TestBasicCallbackInvocation:
 
         tracker = CallbackTracker()
 
-        with Job('node1', config, wait_on_enter=10, skip_db_init=True,
-                connection_string=connection_string,
+        with Job('node1', config, wait_on_enter=10, connection_string=connection_string,
                 on_tokens_added=tracker.on_tokens_added,
                 on_tokens_removed=tracker.on_tokens_removed) as job:
             delay(2)
@@ -153,8 +151,7 @@ class TestBasicCallbackInvocation:
 
         tracker = CallbackTracker()
 
-        with Job('node1', config, wait_on_enter=0, skip_db_init=True,
-                connection_string=connection_string,
+        with Job('node1', config, wait_on_enter=0, connection_string=connection_string,
                 on_tokens_added=tracker.on_tokens_added,
                 on_tokens_removed=tracker.on_tokens_removed) as job:
             delay(1)
@@ -176,8 +173,7 @@ class TestCallbackTiming:
         tracker = CallbackTracker()
 
         # Start first node
-        job1 = Job('node1', config, wait_on_enter=10, skip_db_init=True,
-                  connection_string=connection_string,
+        job1 = Job('node1', config, wait_on_enter=10, connection_string=connection_string,
                   on_tokens_added=tracker.on_tokens_added,
                   on_tokens_removed=tracker.on_tokens_removed)
         job1.__enter__()
@@ -188,8 +184,7 @@ class TestCallbackTiming:
             tracker.reset()
 
             # Start second node to trigger rebalancing
-            job2 = Job('node2', config, wait_on_enter=10, skip_db_init=True,
-                      connection_string=connection_string)
+            job2 = Job('node2', config, wait_on_enter=10, connection_string=connection_string)
             job2.__enter__()
 
             try:
@@ -231,8 +226,7 @@ class TestCallbackTiming:
             callback_thread_id = threading.current_thread().ident
             logger.info(f'Callback running in thread {callback_thread_id}')
 
-        with Job('node1', config, wait_on_enter=10, skip_db_init=True,
-                connection_string=connection_string,
+        with Job('node1', config, wait_on_enter=10, connection_string=connection_string,
                 on_tokens_added=track_thread_on_added) as job:
             delay(2)
 
@@ -253,8 +247,7 @@ class TestCallbackExceptionHandling:
         def failing_callback(token_ids: set[int]):
             raise RuntimeError('Test exception in callback')
 
-        with Job('node1', config, wait_on_enter=10, skip_db_init=True,
-                connection_string=connection_string,
+        with Job('node1', config, wait_on_enter=10, connection_string=connection_string,
                 on_tokens_added=failing_callback) as job:
             delay(2)
 
@@ -273,8 +266,7 @@ class TestCallbackExceptionHandling:
 
         tracker = CallbackTracker()
 
-        job1 = Job('node1', config, wait_on_enter=10, skip_db_init=True,
-                  connection_string=connection_string,
+        job1 = Job('node1', config, wait_on_enter=10, connection_string=connection_string,
                   on_tokens_added=tracker.on_tokens_added,
                   on_tokens_removed=failing_removed_callback)
         job1.__enter__()
@@ -283,8 +275,7 @@ class TestCallbackExceptionHandling:
             delay(5)
 
             # Start second node to trigger rebalancing
-            job2 = Job('node2', config, wait_on_enter=10, skip_db_init=True,
-                      connection_string=connection_string)
+            job2 = Job('node2', config, wait_on_enter=10, connection_string=connection_string)
             job2.__enter__()
 
             try:
@@ -314,8 +305,7 @@ class TestCallbackExceptionHandling:
                     raise RuntimeError(f'Test failure for token {token_id}')
                 processed_tokens.add(token_id)
 
-        with Job('node1', config, wait_on_enter=10, skip_db_init=True,
-                connection_string=connection_string,
+        with Job('node1', config, wait_on_enter=10, connection_string=connection_string,
                 on_tokens_added=partially_failing_callback) as job:
             delay(2)
 
@@ -340,8 +330,7 @@ class TestCallbackCorrectness:
             nonlocal received_tokens
             received_tokens = token_ids.copy()
 
-        with Job('node1', config, wait_on_enter=10, skip_db_init=True,
-                connection_string=connection_string,
+        with Job('node1', config, wait_on_enter=10, connection_string=connection_string,
                 on_tokens_added=capture_tokens) as job:
             delay(2)
 
@@ -356,8 +345,7 @@ class TestCallbackCorrectness:
 
         tracker = CallbackTracker()
 
-        job1 = Job('node1', config, wait_on_enter=10, skip_db_init=True,
-                  connection_string=connection_string,
+        job1 = Job('node1', config, wait_on_enter=10, connection_string=connection_string,
                   on_tokens_added=tracker.on_tokens_added,
                   on_tokens_removed=tracker.on_tokens_removed)
         job1.__enter__()
@@ -368,8 +356,7 @@ class TestCallbackCorrectness:
             tracker.reset()
 
             # Add second node
-            job2 = Job('node2', config, wait_on_enter=10, skip_db_init=True,
-                      connection_string=connection_string)
+            job2 = Job('node2', config, wait_on_enter=10, connection_string=connection_string)
             job2.__enter__()
 
             try:
@@ -415,8 +402,7 @@ class TestCallbackCorrectness:
             with lock:
                 all_removed.append(token_ids.copy())
 
-        job1 = Job('node1', config, wait_on_enter=10, skip_db_init=True,
-                  connection_string=connection_string,
+        job1 = Job('node1', config, wait_on_enter=10, connection_string=connection_string,
                   on_tokens_added=track_added,
                   on_tokens_removed=track_removed)
         job1.__enter__()
@@ -425,8 +411,7 @@ class TestCallbackCorrectness:
             delay(5)
 
             # Trigger rebalance
-            job2 = Job('node2', config, wait_on_enter=10, skip_db_init=True,
-                      connection_string=connection_string)
+            job2 = Job('node2', config, wait_on_enter=10, connection_string=connection_string)
             job2.__enter__()
 
             try:
@@ -469,8 +454,7 @@ class TestCallbackPerformance:
             time.sleep(3)  # Simulate slow work
             logger.info('Slow callback completed')
 
-        with Job('node1', config, wait_on_enter=10, skip_db_init=True,
-                connection_string=connection_string,
+        with Job('node1', config, wait_on_enter=10, connection_string=connection_string,
                 on_tokens_added=slow_callback) as job:
             delay(2)
 
@@ -489,8 +473,7 @@ class TestCallbackPerformance:
         def tracked_callback(token_ids: set[int]):
             time.sleep(0.1)  # Small delay to ensure measurable time
 
-        with caplog.at_level(logging.INFO), Job('node1', config, wait_on_enter=10, skip_db_init=True,
-                connection_string=connection_string,
+        with caplog.at_level(logging.INFO), Job('node1', config, wait_on_enter=10, connection_string=connection_string,
                 on_tokens_added=tracked_callback) as job:
             delay(2)
 
@@ -525,8 +508,7 @@ class TestCallbackIntegrationScenarios:
                         del active_subscriptions[token_id]
                 logger.info(f'Stopped {len(token_ids)} subscriptions')
 
-        job1 = Job('node1', config, wait_on_enter=10, skip_db_init=True,
-                  connection_string=connection_string,
+        job1 = Job('node1', config, wait_on_enter=10, connection_string=connection_string,
                   on_tokens_added=start_subscriptions,
                   on_tokens_removed=stop_subscriptions)
         job1.__enter__()
@@ -538,8 +520,7 @@ class TestCallbackIntegrationScenarios:
             assert_true(initial_count > 0, 'Should have active subscriptions')
 
             # Add second node to trigger rebalancing
-            job2 = Job('node2', config, wait_on_enter=10, skip_db_init=True,
-                      connection_string=connection_string)
+            job2 = Job('node2', config, wait_on_enter=10, connection_string=connection_string)
             job2.__enter__()
 
             try:
@@ -574,8 +555,7 @@ class TestCallbackIntegrationScenarios:
             with lock:
                 resource_events.extend(('stop', token_id, time.time()) for token_id in token_ids)
 
-        job1 = Job('node1', config, wait_on_enter=10, skip_db_init=True,
-                  connection_string=connection_string,
+        job1 = Job('node1', config, wait_on_enter=10, connection_string=connection_string,
                   on_tokens_added=start_resources,
                   on_tokens_removed=stop_resources)
         job1.__enter__()
@@ -585,8 +565,7 @@ class TestCallbackIntegrationScenarios:
             initial_events = len(resource_events)
 
             # Trigger rebalance
-            job2 = Job('node2', config, wait_on_enter=10, skip_db_init=True,
-                      connection_string=connection_string)
+            job2 = Job('node2', config, wait_on_enter=10, connection_string=connection_string)
             job2.__enter__()
 
             try:

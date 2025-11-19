@@ -3,8 +3,10 @@
 Tests each coordination component in isolation.
 """
 import logging
+from datetime import timedelta
 
 import config as test_config
+import pendulum
 import pytest
 from asserts import assert_equal, assert_true
 from sqlalchemy import text
@@ -46,7 +48,7 @@ class TestTaskToToken:
     def test_consistent_hashing(self, postgres):
         """Same task ID should always map to same token."""
         config = get_unit_test_config()
-        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
+        job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
 
         task_id = 'test-task-123'
         token1 = job._task_to_token(task_id)
@@ -58,7 +60,7 @@ class TestTaskToToken:
     def test_different_tasks_different_tokens(self, postgres):
         """Different task IDs should map to different tokens (usually)."""
         config = get_unit_test_config()
-        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
+        job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
 
         tokens = set()
         for i in range(20):
@@ -71,7 +73,7 @@ class TestTaskToToken:
     def test_numeric_and_string_ids(self, postgres):
         """Test hashing works for different ID types."""
         config = get_unit_test_config()
-        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
+        job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
 
         # Numeric IDs
         token1 = job._task_to_token(123)
@@ -91,7 +93,7 @@ class TestPatternMatching:
     def test_exact_match(self, postgres):
         """Test exact node name matching."""
         config = get_unit_test_config()
-        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
+        job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
 
         assert_true(job._matches_pattern('node1', 'node1'), 'Exact match should succeed')
         assert_equal(job._matches_pattern('node1', 'node2'), False, 'Different names should not match')
@@ -99,7 +101,7 @@ class TestPatternMatching:
     def test_prefix_wildcard(self, postgres):
         """Test prefix patterns with % wildcard."""
         config = get_unit_test_config()
-        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
+        job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
 
         assert_true(job._matches_pattern('prod-alpha', 'prod-%'), 'Prefix pattern should match')
         assert_true(job._matches_pattern('prod-beta', 'prod-%'), 'Prefix pattern should match')
@@ -108,7 +110,7 @@ class TestPatternMatching:
     def test_suffix_wildcard(self, postgres):
         """Test suffix patterns with % wildcard."""
         config = get_unit_test_config()
-        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
+        job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
 
         assert_true(job._matches_pattern('alpha-gpu', '%-gpu'), 'Suffix pattern should match')
         assert_true(job._matches_pattern('beta-gpu', '%-gpu'), 'Suffix pattern should match')
@@ -117,7 +119,7 @@ class TestPatternMatching:
     def test_contains_wildcard(self, postgres):
         """Test contains patterns with % wildcards."""
         config = get_unit_test_config()
-        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
+        job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
 
         assert_true(job._matches_pattern('prod-special-001', '%special%'), 'Contains pattern should match')
         assert_true(job._matches_pattern('special', '%special%'), 'Contains pattern should match')
@@ -127,7 +129,7 @@ class TestPatternMatching:
     def test_single_char_wildcard(self, postgres):
         """Test single character _ wildcard."""
         config = get_unit_test_config()
-        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
+        job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
 
         assert_true(job._matches_pattern('node1', 'node_'), 'Single char wildcard should match')
         assert_true(job._matches_pattern('node2', 'node_'), 'Single char wildcard should match')
@@ -142,11 +144,7 @@ class TestLeaderElection:
         config = get_unit_test_config()
         tables = schema.get_table_names(config)
 
-        from datetime import timedelta
-
-        from date import now
-
-        base_time = now()
+        base_time = pendulum.now()
         with postgres.connect() as conn:
             conn.execute(text(f"""
                 INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
@@ -164,7 +162,7 @@ class TestLeaderElection:
             """), {'name': 'node3', 'created_on': base_time - timedelta(seconds=5), 'heartbeat': base_time})
             conn.commit()
 
-        job = Job('test', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
+        job = Job('test', config, connection_string=postgres.url.render_as_string(hide_password=False))
         leader = job._elect_leader()
 
         assert_equal(leader, 'node1', 'Oldest node should be elected leader')
@@ -174,9 +172,7 @@ class TestLeaderElection:
         config = get_unit_test_config()
         tables = schema.get_table_names(config)
 
-        from date import now
-
-        same_time = now()
+        same_time = pendulum.now()
         with postgres.connect() as conn:
             for name in ['node-c', 'node-a', 'node-b']:
                 conn.execute(text(f"""
@@ -185,7 +181,7 @@ class TestLeaderElection:
                 """), {'name': name, 'created_on': same_time, 'heartbeat': same_time})
             conn.commit()
 
-        job = Job('test', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
+        job = Job('test', config, connection_string=postgres.url.render_as_string(hide_password=False))
         leader = job._elect_leader()
 
         assert_equal(leader, 'node-a', 'Alphabetically first node should win tiebreaker')
@@ -195,11 +191,7 @@ class TestLeaderElection:
         config = get_unit_test_config()
         tables = schema.get_table_names(config)
 
-        from datetime import timedelta
-
-        from date import now
-
-        current_time = now()
+        current_time = pendulum.now()
         stale_time = current_time - timedelta(seconds=30)
 
         with postgres.connect() as conn:
@@ -214,7 +206,7 @@ class TestLeaderElection:
             """), {'name': 'node2', 'created_on': current_time - timedelta(seconds=20), 'heartbeat': current_time})
             conn.commit()
 
-        job = Job('test', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
+        job = Job('test', config, connection_string=postgres.url.render_as_string(hide_password=False))
         leader = job._elect_leader()
 
         assert_equal(leader, 'node2', 'Only alive nodes should be considered')
@@ -228,9 +220,7 @@ class TestTokenDistribution:
         config = get_unit_test_config()
         tables = schema.get_table_names(config)
 
-        from date import now
-
-        current = now()
+        current = pendulum.now()
         with postgres.connect() as conn:
             for i in range(1, 4):
                 conn.execute(text(f"""
@@ -240,7 +230,7 @@ class TestTokenDistribution:
             conn.commit()
 
         coord_config = CoordinationConfig(total_tokens=99)
-        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False),
+        job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False),
                  coordination_config=coord_config)
 
         job._distribute_tokens_minimal_move(99)
@@ -265,9 +255,7 @@ class TestTokenDistribution:
             conn.execute(text(f'DELETE FROM {tables["Node"]}'))
             conn.commit()
 
-        from date import now
-
-        current = now()
+        current = pendulum.now()
         with postgres.connect() as conn:
             for name in ['node1', 'node2', 'special-alpha']:
                 conn.execute(text(f"""
@@ -283,7 +271,7 @@ class TestTokenDistribution:
             conn.commit()
 
         coord_config = CoordinationConfig(total_tokens=30)
-        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False),
+        job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False),
                  coordination_config=coord_config)
 
         job._distribute_tokens_minimal_move(30)
@@ -331,7 +319,7 @@ class TestLockRegistration:
         config = get_unit_test_config()
         tables = schema.get_table_names(config)
 
-        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
+        job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
 
         task_id = 'task-123'
         job.register_task_lock(task_id, 'special-%', 'test reason')
@@ -358,7 +346,7 @@ class TestLockRegistration:
             conn.execute(text(f'DELETE FROM {tables["Lock"]}'))
             conn.commit()
 
-        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
+        job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
 
         locks = [
             ('task-1', 'pattern-1', 'reason-1'),
@@ -382,7 +370,7 @@ class TestLockRegistration:
             conn.execute(text(f'DELETE FROM {tables["Lock"]}'))
             conn.commit()
 
-        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
+        job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
 
         task_id = 'task-123'
         job.register_task_lock(task_id, 'pattern-1', 'reason-1')
@@ -411,7 +399,7 @@ class TestCanClaimTask:
             conn.execute(text(f'DELETE FROM {tables["Token"]}'))
             conn.commit()
 
-        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
+        job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
         job._coordination_enabled = True
 
         token_id = 5
@@ -441,7 +429,7 @@ class TestCanClaimTask:
         """Test that node cannot claim task if it doesn't own the token."""
         config = get_unit_test_config()
 
-        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
+        job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
         job._coordination_enabled = True
 
         # Node has no tokens
@@ -462,7 +450,7 @@ class TestThreadShutdown:
 
         config = get_unit_test_config()
 
-        node = Job('node1', config, wait_on_enter=5, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
+        node = Job('node1', config, wait_on_enter=5, connection_string=postgres.url.render_as_string(hide_password=False))
         node.__enter__()
 
         delay(2)
@@ -479,7 +467,7 @@ class TestThreadShutdown:
         """
         config = get_unit_test_config()
 
-        node = Job('node1', config, wait_on_enter=5, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
+        node = Job('node1', config, wait_on_enter=5, connection_string=postgres.url.render_as_string(hide_password=False))
         node.__enter__()
         delay(1)
 
@@ -512,10 +500,10 @@ class TestThreadShutdown:
             conn.execute(text(f"""
                 INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
                 VALUES (:name, :created_on, :heartbeat)
-            """), {'name': 'node1', 'created_on': now(), 'heartbeat': now()})
+            """), {'name': 'node1', 'created_on': pendulum.now(), 'heartbeat': pendulum.now()})
             conn.commit()
 
-        node = Job('node1', config, wait_on_enter=5, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
+        node = Job('node1', config, wait_on_enter=5, connection_string=postgres.url.render_as_string(hide_password=False))
         node.__enter__()
 
         delay(2)
@@ -544,7 +532,7 @@ class TestThreadShutdown:
         config = get_unit_test_config()
 
         with caplog.at_level(logging.WARNING):
-            node = Job('node1', config, wait_on_enter=5, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
+            node = Job('node1', config, wait_on_enter=5, connection_string=postgres.url.render_as_string(hide_password=False))
             node.__enter__()
             delay(1)
             node.__exit__(None, None, None)
@@ -563,7 +551,7 @@ class TestThreadShutdown:
         import time
 
         config = get_unit_test_config()
-        
+
         Setting.unlock()
         try:
             config.sync.coordination.heartbeat_interval_sec = 60
@@ -572,7 +560,7 @@ class TestThreadShutdown:
         finally:
             Setting.lock()
 
-        node = Job('node1', config, wait_on_enter=5, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
+        node = Job('node1', config, wait_on_enter=5, connection_string=postgres.url.render_as_string(hide_password=False))
         node.__enter__()
 
         delay(1)

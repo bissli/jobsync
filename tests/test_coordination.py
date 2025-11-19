@@ -32,7 +32,6 @@ def get_coordination_config():
 
     coord_config = Setting()
     coord_config.postgres = test_config.postgres
-    coord_config.sqlite = test_config.sqlite
 
     coord_config.sync.sql.appname = 'sync_'
     coord_config.sync.coordination.enabled = True
@@ -67,7 +66,7 @@ def node_worker(node_name: str, connection_string: str, items: list, barrier: mu
         engine = create_engine(connection_string, pool_pre_ping=True, pool_size=10, max_overflow=5)
         tables = schema.get_table_names(config)
 
-        with Job(node_name, config, wait_on_enter=10, skip_db_init=True, connection_string=connection_string) as job:
+        with Job(node_name, config, wait_on_enter=10, connection_string=connection_string) as job:
             # Wait for all nodes to be ready
             barrier.wait()
 
@@ -102,7 +101,7 @@ def test_3node_cluster_formation(postgres):
 
     nodes = []
     for i in range(1, 4):
-        node = Job(f'node{i}', config, wait_on_enter=15, skip_db_init=True, connection_string=connection_string)
+        node = Job(f'node{i}', config, wait_on_enter=15, connection_string=connection_string)
         nodes.append(node)
 
     # Start all nodes in parallel so they discover each other during wait_on_enter
@@ -170,7 +169,7 @@ def test_token_based_task_claiming(postgres):
 
     with postgres.connect() as conn:
         for i in range(30):
-            conn.execute(text(f'INSERT INTO {tables["Inst"]} (item, done) VALUES (:item, :done)'), 
+            conn.execute(text(f'INSERT INTO {tables["Inst"]} (item, done) VALUES (:item, :done)'),
                         {'item': str(i), 'done': False})
         conn.commit()
 
@@ -229,7 +228,7 @@ def test_node_death_and_rebalancing(postgres):
 
     nodes = []
     for i in range(1, 4):
-        node = Job(f'node{i}', config, wait_on_enter=15, skip_db_init=True, connection_string=connection_string)
+        node = Job(f'node{i}', config, wait_on_enter=15, connection_string=connection_string)
         node.__enter__()
         nodes.append(node)
 
@@ -295,11 +294,11 @@ def test_lock_registration_and_enforcement(postgres):
         job.register_task_locks_bulk(locks)
         print(f'{job.node_name}: Registered {len(locks)} locks')
 
-    node1 = Job('node1', config, wait_on_enter=15, skip_db_init=True, connection_string=connection_string,
+    node1 = Job('node1', config, wait_on_enter=15, connection_string=connection_string,
                 lock_provider=register_locks)
-    node2 = Job('node2', config, wait_on_enter=15, skip_db_init=True, connection_string=connection_string,
+    node2 = Job('node2', config, wait_on_enter=15, connection_string=connection_string,
                 lock_provider=register_locks)
-    special = Job('special-alpha', config, wait_on_enter=15, skip_db_init=True, connection_string=connection_string,
+    special = Job('special-alpha', config, wait_on_enter=15, connection_string=connection_string,
                   lock_provider=register_locks)
 
     node1.__enter__()
@@ -314,7 +313,7 @@ def test_lock_registration_and_enforcement(postgres):
             token_id = node1._task_to_token(task_id)
 
             with postgres.connect() as conn:
-                result = conn.execute(text(f'SELECT node FROM {tables["Token"]} WHERE token_id = :token_id'), 
+                result = conn.execute(text(f'SELECT node FROM {tables["Token"]} WHERE token_id = :token_id'),
                                      {'token_id': token_id})
                 owner = result.scalar()
             locked_token_owners[task_id] = owner
@@ -350,7 +349,7 @@ def test_health_monitoring(postgres):
     config = get_coordination_config()
     connection_string = postgres.url.render_as_string(hide_password=False)
 
-    node = Job('node1', config, wait_on_enter=15, skip_db_init=True, connection_string=connection_string)
+    node = Job('node1', config, wait_on_enter=15, connection_string=connection_string)
     node.__enter__()
 
     try:
@@ -385,7 +384,7 @@ def test_leader_failover(postgres):
 
     nodes = []
     for i in range(1, 4):
-        node = Job(f'node{i}', config, wait_on_enter=15, skip_db_init=True, connection_string=connection_string)
+        node = Job(f'node{i}', config, wait_on_enter=15, connection_string=connection_string)
         node.__enter__()
         nodes.append(node)
         delay(1)
@@ -436,7 +435,7 @@ def test_node_rejoin_restores_original_allocation(postgres):
     print('Phase 1: Starting 4 nodes...')
     nodes = []
     for name in ['nodeA', 'nodeB', 'nodeC', 'nodeD']:
-        node = Job(name, config, wait_on_enter=15, skip_db_init=True, connection_string=connection_string)
+        node = Job(name, config, wait_on_enter=15, connection_string=connection_string)
         nodes.append(node)
 
     def enter_node(node):
@@ -486,7 +485,7 @@ def test_node_rejoin_restores_original_allocation(postgres):
 
         # Phase 3: Rejoin nodeD
         print('\nPhase 3: Rejoining nodeD...')
-        nodeD_rejoined = Job('nodeD', config, wait_on_enter=15, skip_db_init=True, connection_string=connection_string)
+        nodeD_rejoined = Job('nodeD', config, wait_on_enter=15, connection_string=connection_string)
         nodeD_rejoined.__enter__()
         nodes[3] = nodeD_rejoined
 
@@ -499,16 +498,16 @@ def test_node_rejoin_restores_original_allocation(postgres):
         for node in nodes:
             current_tokens = node._get_my_tokens()
             original = original_tokens[node.node_name]
-            
+
             print(f'{node.node_name}: original={len(original)}, current={len(current_tokens)}, '
                   f'match={current_tokens == original}')
-            
+
             if current_tokens != original:
                 all_restored = False
                 missing = original - current_tokens
                 extra = current_tokens - original
-                print(f'  Missing {len(missing)} tokens: {sorted(list(missing))[:10]}...')
-                print(f'  Extra {len(extra)} tokens: {sorted(list(extra))[:10]}...')
+                print(f'  Missing {len(missing)} tokens: {sorted(missing)[:10]}...')
+                print(f'  Extra {len(extra)} tokens: {sorted(extra)[:10]}...')
 
         assert_true(all_restored, 'All nodes should have their original token allocations restored')
 

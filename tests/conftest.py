@@ -97,34 +97,27 @@ def postgres(psql_docker):
         f'@{config.postgres.hostname}:{config.postgres.port}/{config.postgres.database}'
     )
     engine = create_engine(connection_string, pool_pre_ping=True, pool_size=10, max_overflow=5)
-    
+
     create_extensions(engine)
     terminate_postgres_connections(engine)
-    schema.init_database(engine, config, is_test=True)
-    
+    engine.dispose()
+
+    engine = create_engine(connection_string, pool_pre_ping=True, pool_size=10, max_overflow=5)
+    schema.ensure_database_ready(engine, config, coordination_enabled=True)
+
+    tables = schema.get_table_names(config)
+    with engine.connect() as conn:
+        conn.execute(text(f"""
+CREATE TABLE IF NOT EXISTS {tables['Inst']} (
+    item varchar not null,
+    done boolean not null
+);
+        """))
+        conn.commit()
+
     try:
         yield engine
     finally:
         terminate_postgres_connections(engine)
         drop_tables(engine, config)
         engine.dispose()
-
-
-@pytest.fixture
-def sqlite():
-    """Provide SQLAlchemy engine for SQLite tests.
-    """
-    connection_string = f'sqlite:///{config.sqlite.database}'
-    engine = create_engine(connection_string, pool_pre_ping=True)
-    
-    schema.init_database(engine, config, is_test=True)
-    db_path = config.sqlite.database
-    
-    try:
-        yield engine
-    finally:
-        drop_tables(engine, config)
-        engine.dispose()
-        if pathlib.Path(db_path).exists():
-            pathlib.Path(db_path).unlink()
-            logger.debug(f'Removed SQLite database file: {db_path}')

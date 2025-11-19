@@ -70,7 +70,7 @@ export SYNC_TOTAL_TOKENS=10000
 python worker.py --node-name worker-01
 ```
 
-   The first node will automatically create all required tables via `init_database()`.
+   The first node will automatically create all required tables via `ensure_database_ready()`.
 
 4. **Verify tables were created**:
 ```sql

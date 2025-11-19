@@ -100,33 +100,56 @@ Each worker processes different tasks - no duplicate work.
 
 ## Configuration
 
-### Database Connection
-
-Set environment variables for PostgreSQL:
+Set environment variables for PostgreSQL connection:
 
 ```bash
 export SYNC_SQL_HOST=localhost
 export SYNC_SQL_DATABASE=jobsync
 export SYNC_SQL_USERNAME=postgres
 export SYNC_SQL_PASSWORD=postgres
-export SYNC_SQL_PORT=5432
 ```
 
-### Coordination Settings
+Basic coordination settings (defaults work for most cases):
 
 ```bash
-# Core settings
-export SYNC_COORDINATION_ENABLED=true
-export SYNC_TOTAL_TOKENS=10000
-
-# Timing controls
-export SYNC_HEARTBEAT_INTERVAL=5        # How often workers heartbeat
-export SYNC_HEARTBEAT_TIMEOUT=15        # When worker is considered dead
-export SYNC_REBALANCE_INTERVAL=30       # How often leader checks for changes
-export SYNC_TOKEN_REFRESH_STEADY=30     # How often workers refresh tokens
+export SYNC_COORDINATION_ENABLED=true   # Enable coordination
+export SYNC_TOTAL_TOKENS=10000          # Token pool size
 ```
 
-**See [Operator Guide](docs/OPERATOR_GUIDE.md#performance-tuning)** for tuning these values for different cluster sizes and environments.
+**See [Usage Guide](docs/USAGE_GUIDE.md#coordination-configuration)** for detailed configuration options and **[Operator Guide](docs/OPERATOR_GUIDE.md#performance-tuning)** for tuning parameters.
+
+## Usage Examples
+
+### Basic Task Processing
+
+```python
+from jobsync import Job, Task
+
+with Job('worker-01', 'production', config) as job:
+    for item_id in get_pending_items():
+        task = Task(item_id)
+        if job.can_claim_task(task):
+            job.add_task(task)
+            process_item(item_id)
+    job.write_audit()
+```
+
+### Task Pinning (Lock GPU tasks to GPU workers)
+
+```python
+def register_gpu_locks(job):
+    gpu_tasks = get_gpu_task_ids()
+    locks = [(task_id, '%gpu%', 'requires_gpu') for task_id in gpu_tasks]
+    job.register_task_locks_bulk(locks)
+
+with Job('worker-gpu-01', 'production', config, 
+         lock_provider=register_gpu_locks) as job:
+    for task_id in get_all_tasks():
+        if job.can_claim_task(Task(task_id)):
+            process_gpu_task(task_id)
+```
+
+**See [Usage Guide](docs/USAGE_GUIDE.md)** for complete examples including WebSocket subscriptions, Kafka consumers, ETL pipelines, and more.
 
 ## Key Features
 
@@ -170,47 +193,6 @@ kill -TERM $(pgrep -f worker_v1.py)
 
 The leader automatically rebalances tokens as workers join and leave.
 
-### Long-Running Tasks and Subscriptions
-
-Use callbacks to manage persistent resources based on token ownership:
-
-```python
-def manage_data_streams():
-    """Manage streaming data connections based on token ownership."""
-    streams = {}
-    
-    def handle_tokens_added(token_ids: set[int]):
-        for token_id in token_ids:
-            # Get tasks that hash to this token
-            my_tasks = job.get_task_ids_for_token(token_id, all_customer_ids)
-            for customer_id in my_tasks:
-                # Start streaming connection for this customer
-                stream = start_data_stream(customer_id)
-                streams[customer_id] = stream
-                logger.info(f'Started stream for customer {customer_id}')
-    
-    def handle_tokens_removed(token_ids: set[int]):
-        for token_id in token_ids:
-            my_tasks = job.get_task_ids_for_token(token_id, all_customer_ids)
-            for customer_id in my_tasks:
-                if customer_id in streams:
-                    streams[customer_id].close()
-                    del streams[customer_id]
-                    logger.info(f'Stopped stream for customer {customer_id}')
-    
-    with Job('stream-worker-01', 'production', config,
-             on_tokens_added=handle_tokens_added,
-             on_tokens_removed=handle_tokens_removed) as job:
-        # Streams are automatically managed
-        while not shutdown_requested():
-            time.sleep(1)
-```
-
-**Callback Guarantees:**
-- `on_tokens_removed` always called **before** `on_tokens_added` during rebalancing
-- Callbacks run in background thread (heartbeat or refresh thread)
-- Keep callbacks fast (<1s) or delegate work to separate threads
-- Exceptions logged but don't stop coordination
 
 ### Task Pinning
 
@@ -294,187 +276,42 @@ with Job('worker-01', 'production', base_config, coordination_config=config) as 
 
 ## Documentation
 
-### 📚 Comprehensive Guides
+### 📚 Guide Overview
 
-**[Usage Guide](docs/USAGE_GUIDE.md)** - Complete developer guide:
-- Job creation and configuration
-- Task locking patterns (GPU, memory, data locality)
-- Processing patterns (batch, idempotent, continuous)
-- Health monitoring and diagnostics
-- Best practices and common patterns
-- Full CoordinationConfig reference
+**[Usage Guide](docs/USAGE_GUIDE.md)** - For developers implementing JobSync:
+- Complete API reference with code examples
+- Long-running task patterns (WebSockets, Kafka, subscriptions)
+- Task locking and pinning strategies
+- Processing patterns and best practices
+- Configuration tuning reference
 
-**[Operator Guide](docs/OPERATOR_GUIDE.md)** - Complete operations guide:
-- Deployment procedures (initial, rolling updates, scaling)
-- Monitoring and alerting (metrics, dashboards, queries)
-- Troubleshooting common issues (with SQL queries)
-- Emergency procedures (split-brain, leader failures)
+**[Operator Guide](docs/OPERATOR_GUIDE.md)** - For operations teams running JobSync:
+- Deployment procedures and scaling strategies
+- Monitoring, alerting, and health checks
+- Troubleshooting guide with SQL diagnostics
+- Emergency procedures and failover handling
 - Database maintenance and performance tuning
-- Configuration for different environments
 
-## Real-World Examples
-
-### Example 1: WebSocket Subscription Management
-
-```python
-import threading
-from collections import defaultdict
-
-class SubscriptionManager:
-    """Manage WebSocket subscriptions based on token ownership."""
-    
-    def __init__(self):
-        self.subscriptions = {}
-        self.lock = threading.Lock()
-    
-    def on_tokens_added(self, token_ids: set[int]):
-        """Start subscriptions for assigned tokens."""
-        with self.lock:
-            for token_id in token_ids:
-                # Get all symbols that hash to this token
-                symbols = job.get_task_ids_for_token(token_id, all_symbols)
-                
-                for symbol in symbols:
-                    ws = websocket.create_connection(
-                        f'wss://api.example.com/stream/{symbol}'
-                    )
-                    self.subscriptions[symbol] = ws
-                    
-                    # Start background thread to process messages
-                    thread = threading.Thread(
-                        target=self._process_messages,
-                        args=(symbol, ws)
-                    )
-                    thread.daemon = True
-                    thread.start()
-                
-                logger.info(f'Started {len(symbols)} subscriptions for token {token_id}')
-    
-    def on_tokens_removed(self, token_ids: set[int]):
-        """Stop subscriptions for removed tokens."""
-        with self.lock:
-            for token_id in token_ids:
-                symbols = job.get_task_ids_for_token(token_id, all_symbols)
-                
-                for symbol in symbols:
-                    if symbol in self.subscriptions:
-                        self.subscriptions[symbol].close()
-                        del self.subscriptions[symbol]
-                
-                logger.info(f'Stopped {len(symbols)} subscriptions for token {token_id}')
-    
-    def _process_messages(self, symbol, ws):
-        """Process incoming WebSocket messages."""
-        while symbol in self.subscriptions:
-            try:
-                message = ws.recv()
-                process_market_data(symbol, message)
-            except Exception as e:
-                logger.error(f'Error processing {symbol}: {e}')
-                break
-
-def run_subscription_worker():
-    """Run worker with subscription management."""
-    manager = SubscriptionManager()
-    
-    with Job('subscription-worker-01', 'production', config,
-             on_tokens_added=manager.on_tokens_added,
-             on_tokens_removed=manager.on_tokens_removed) as job:
-        # Keep worker alive while subscriptions run
-        while not shutdown_requested():
-            time.sleep(1)
-```
-
-### Example 2: ETL Pipeline
-
-```python
-def run_daily_etl():
-    """Process today's data across multiple workers.
-    """
-    with Job('etl-worker-01', 'production', config, wait_on_enter=120) as job:
-        # Get all source files for today
-        files = list_s3_files(today())
-        
-        for file_path in files:
-            task = Task(file_path)
-            
-            if job.can_claim_task(task):
-                job.add_task(task)
-                data = extract_from_s3(file_path)
-                transformed = transform_data(data)
-                load_to_warehouse(transformed)
-        
-        job.write_audit()
-```
-
-### Example 3: GPU Task Processing
-
-```python
-def process_gpu_tasks():
-    """Lock GPU-intensive tasks to GPU workers.
-    """
-    def register_gpu_locks(job):
-        sql = "SELECT task_id FROM tasks WHERE requires_gpu = true"
-        gpu_tasks = db.select(job._cn, sql)
-        locks = [(row['task_id'], '%gpu%', 'gpu_required') for row in gpu_tasks.to_dict('records')]
-        if locks:
-            job.register_task_locks_bulk(locks)
-    
-    with Job('worker-gpu-01', 'production', config, lock_provider=register_gpu_locks) as job:
-        for task_id in get_pending_tasks():
-            if job.can_claim_task(Task(task_id)):
-                run_model_inference(task_id)
-```
-
-### Example 4: Continuous Processing
-
-```python
-def continuous_processor():
-    """Process tasks continuously until queue empty.
-    """
-    with Job('worker-01', 'production', config, wait_on_enter=120) as job:
-        while True:
-            pending = get_pending_tasks()
-            if not pending:
-                break
-                
-            for task_id in pending:
-                if job.can_claim_task(Task(task_id)):
-                    job.add_task(task_id)
-                    process_task(task_id)
-            
-            job.write_audit()
-            time.sleep(5)
-```
 
 ## Monitoring
 
-### Key Queries
+Check cluster health with these essential queries:
 
-**Active Workers**:
 ```sql
-SELECT name, last_heartbeat, NOW() - last_heartbeat as lag
-FROM sync_node
-WHERE last_heartbeat > NOW() - INTERVAL '15 seconds'
-ORDER BY created_on;
-```
+-- Active workers
+SELECT name, last_heartbeat FROM sync_node
+WHERE last_heartbeat > NOW() - INTERVAL '15 seconds';
 
-**Token Distribution**:
-```sql
-SELECT node, COUNT(*) as tokens,
-       ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 1) as pct
-FROM sync_token
-GROUP BY node;
-```
+-- Token distribution balance
+SELECT node, COUNT(*) as tokens FROM sync_token GROUP BY node;
 
-**Current Leader**:
-```sql
+-- Current leader
 SELECT name FROM sync_node
 WHERE last_heartbeat > NOW() - INTERVAL '15 seconds'
 ORDER BY created_on LIMIT 1;
 ```
 
-**See [Operator Guide](docs/OPERATOR_GUIDE.md#monitoring-and-alerting)** for complete monitoring setup with alerting rules and dashboards.
+**See [Operator Guide](docs/OPERATOR_GUIDE.md#monitoring-and-alerting)** for comprehensive monitoring setup, alerting rules, and diagnostic queries.
 
 ## Performance
 

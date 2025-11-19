@@ -3,8 +3,10 @@
 Tests lock creation, listing, and cleanup APIs.
 """
 import logging
+from datetime import timedelta
 
 import config as test_config
+import pendulum
 import pytest
 from asserts import assert_equal, assert_true
 from sqlalchemy import text
@@ -54,7 +56,7 @@ class TestLockClearing:
             conn.execute(text(f'DELETE FROM {tables["Lock"]}'))
             conn.commit()
 
-        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
+        job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
 
         job.register_task_lock('task-1', 'pattern-1', 'reason-1')
         job.register_task_lock('task-2', 'pattern-2', 'reason-2')
@@ -82,8 +84,8 @@ class TestLockClearing:
             conn.commit()
 
         connection_string = postgres.url.render_as_string(hide_password=False)
-        job1 = Job('node1', config, skip_db_init=True, connection_string=connection_string)
-        job2 = Job('node2', config, skip_db_init=True, connection_string=connection_string)
+        job1 = Job('node1', config, connection_string=connection_string)
+        job2 = Job('node2', config, connection_string=connection_string)
 
         job1.register_task_lock('task-1', 'pattern-1', 'from node1')
         job1.register_task_lock('task-2', 'pattern-2', 'from node1')
@@ -113,8 +115,8 @@ class TestLockClearing:
             conn.commit()
 
         connection_string = postgres.url.render_as_string(hide_password=False)
-        job1 = Job('node1', config, skip_db_init=True, connection_string=connection_string)
-        job2 = Job('node2', config, skip_db_init=True, connection_string=connection_string)
+        job1 = Job('node1', config, connection_string=connection_string)
+        job2 = Job('node2', config, connection_string=connection_string)
 
         job1.register_task_lock('task-1', 'pattern-1', 'from node1')
         job2.register_task_lock('task-2', 'pattern-2', 'from node2')
@@ -144,7 +146,7 @@ class TestLockListing:
             conn.execute(text(f'DELETE FROM {tables["Lock"]}'))
             conn.commit()
 
-        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
+        job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
         locks = job.list_locks()
 
         assert_equal(locks, [], 'Should return empty list')
@@ -159,7 +161,7 @@ class TestLockListing:
             conn.execute(text(f'DELETE FROM {tables["Lock"]}'))
             conn.commit()
 
-        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
+        job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
 
         job.register_task_lock('task-1', 'pattern-1', 'reason-1')
         job.register_task_lock('task-2', 'pattern-2', 'reason-2')
@@ -182,16 +184,12 @@ class TestLockListing:
             conn.execute(text(f'DELETE FROM {tables["Lock"]}'))
             conn.commit()
 
-        job = Job('node1', config, skip_db_init=True, connection_string=postgres.url.render_as_string(hide_password=False))
-
-        from datetime import timedelta
-
-        from date import now
+        job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
 
         job.register_task_lock('task-1', 'pattern-1', 'not expired')
         job.register_task_lock('task-2', 'pattern-2', 'expires soon', expires_in_days=1)
 
-        expired_time = now() - timedelta(days=2)
+        expired_time = pendulum.now() - timedelta(days=2)
         with postgres.connect() as conn:
             conn.execute(text(f"""
                 INSERT INTO {tables["Lock"]} (token_id, node_pattern, reason, created_at, created_by, expires_at)
@@ -200,7 +198,7 @@ class TestLockListing:
                 'token_id': 999,
                 'pattern': 'pattern-expired',
                 'reason': 'already expired',
-                'created_at': now(),
+                'created_at': pendulum.now(),
                 'created_by': 'node1',
                 'expires_at': expired_time
             })
@@ -233,7 +231,7 @@ class TestClearExistingLocks:
             job.register_task_lock('task-1', 'pattern-OLD', 'first run')
             job.register_task_lock('task-2', 'pattern-OLD', 'first run')
 
-        job1 = Job('node1', config, skip_db_init=True, connection_string=connection_string,
+        job1 = Job('node1', config, connection_string=connection_string,
                    lock_provider=first_lock_provider, clear_existing_locks=False)
         job1._register_node()
         if job1._lock_provider and job1._locks_enabled:
@@ -247,7 +245,7 @@ class TestClearExistingLocks:
         def second_lock_provider(job):
             job.register_task_lock('task-3', 'pattern-NEW', 'second run')
 
-        job2 = Job('node1', config, skip_db_init=True, connection_string=connection_string,
+        job2 = Job('node1', config, connection_string=connection_string,
                    lock_provider=second_lock_provider, clear_existing_locks=True)
         job2._register_node()
         if job2._lock_provider and job2._locks_enabled:
@@ -279,7 +277,7 @@ class TestClearExistingLocks:
         def first_lock_provider(job):
             job.register_task_lock('task-1', 'pattern-OLD', 'first run')
 
-        job1 = Job('node1', config, skip_db_init=True, connection_string=connection_string,
+        job1 = Job('node1', config, connection_string=connection_string,
                    lock_provider=first_lock_provider, clear_existing_locks=False)
         job1._register_node()
         if job1._lock_provider and job1._locks_enabled:
@@ -288,7 +286,7 @@ class TestClearExistingLocks:
         def second_lock_provider(job):
             job.register_task_lock('task-2', 'pattern-NEW', 'second run')
 
-        job2 = Job('node1', config, skip_db_init=True, connection_string=connection_string,
+        job2 = Job('node1', config, connection_string=connection_string,
                    lock_provider=second_lock_provider, clear_existing_locks=False)
         job2._register_node()
         if job2._lock_provider and job2._locks_enabled:
@@ -323,7 +321,7 @@ class TestConcurrentLockRegistration:
         connection_string = postgres.url.render_as_string(hide_password=False)
 
         for i in range(1, 11):
-            job = Job(f'node{i}', config, skip_db_init=True, connection_string=connection_string)
+            job = Job(f'node{i}', config, connection_string=connection_string)
             job.register_task_lock('task-X1', 'Node1', 'lock X1 to Node1')
 
         with postgres.connect() as conn:
@@ -353,7 +351,7 @@ class TestConcurrentLockRegistration:
         import threading
 
         def register_lock(node_name):
-            job = Job(node_name, config, skip_db_init=True, connection_string=connection_string)
+            job = Job(node_name, config, connection_string=connection_string)
             job.register_task_lock('task-X1', 'Node1', f'lock from {node_name}')
 
         threads = []
@@ -396,7 +394,7 @@ class TestConcurrentLockRegistration:
             job.register_task_lock('task-X3', 'special-node', 'lock X3')
 
         for i in range(1, 6):
-            job = Job(f'node{i}', config, skip_db_init=True, connection_string=connection_string,
+            job = Job(f'node{i}', config, connection_string=connection_string,
                      lock_provider=shared_lock_provider)
             job._register_node()
             if job._lock_provider and job._locks_enabled:
@@ -434,7 +432,7 @@ class TestConcurrentLockRegistration:
         ]
 
         for i in range(1, 8):
-            job = Job(f'node{i}', config, skip_db_init=True, connection_string=connection_string)
+            job = Job(f'node{i}', config, connection_string=connection_string)
             job.register_task_locks_bulk(locks_to_register)
 
         with postgres.connect() as conn:
@@ -454,11 +452,11 @@ class TestConcurrentLockRegistration:
 
         connection_string = postgres.url.render_as_string(hide_password=False)
 
-        job1 = Job('first-node', config, skip_db_init=True, connection_string=connection_string)
+        job1 = Job('first-node', config, connection_string=connection_string)
         job1.register_task_lock('task-99', 'pattern-test', 'registered by first')
 
         for i in range(2, 11):
-            job = Job(f'node{i}', config, skip_db_init=True, connection_string=connection_string)
+            job = Job(f'node{i}', config, connection_string=connection_string)
             job.register_task_lock('task-99', 'pattern-test', f'attempted by node{i}')
 
         with postgres.connect() as conn:

@@ -1,6 +1,7 @@
 """Job synchronization manager with hybrid coordination support.
 """
 import contextlib
+import datetime
 import enum
 import hashlib
 import logging
@@ -10,14 +11,13 @@ import time
 from collections.abc import Hashable
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import timedelta
 from functools import total_ordering
 from types import ModuleType
 
+import pendulum
 from sqlalchemy import create_engine, text
 
-from date import Date, now, today
-from jobsync.schema import get_table_names, init_database
+from jobsync.schema import ensure_database_ready, get_table_names
 from libb import attrdict, delay, isiterable
 
 logger = logging.getLogger(__name__)
@@ -54,6 +54,7 @@ class CoordinationConfig:
     locks_enabled: bool = True
     leader_lock_timeout_sec: int = 30
     health_check_interval_sec: int = 30
+    stale_leader_lock_age_sec: int = 300
 
 
 def compute_minimal_move_distribution(
@@ -230,10 +231,9 @@ class Job:
         self,
         node_name: str,
         config: ModuleType,
-        date: Date = None,
+        date: datetime.date | datetime.datetime = None,
         wait_on_enter: int = 120,
         wait_on_exit: int = 0,
-        skip_db_init: bool = False,
         lock_provider: callable = None,
         clear_existing_locks: bool = False,
         coordination_config: CoordinationConfig = None,
@@ -249,7 +249,6 @@ class Job:
             date: Processing date (defaults to today)
             wait_on_enter: Seconds to wait for cluster formation (default 120)
             wait_on_exit: Seconds to wait before cleanup (default 0)
-            skip_db_init: Skip database initialization (for tests)
             lock_provider: Callback(job) to register task locks during __enter__
             clear_existing_locks: If True, clear locks created by this node before invoking lock_provider
             coordination_config: Optional CoordinationConfig to override config module settings
@@ -263,7 +262,15 @@ class Job:
         self._wait_on_exit = int(abs(wait_on_exit))
         self._tasks = []
         self._nodes = [attrdict(node=self.node_name)]
-        self._date = date or today()
+
+        if date is None:
+            date = pendulum.today()
+        elif isinstance(date, datetime.datetime):
+            date = pendulum.instance(date)
+        elif not isinstance(date, datetime.date):
+            raise TypeError(f'date must be None, datetime.date, or datetime.datetime, got {type(date).__name__}')
+        self._date = pendulum.date(date.year, date.month, date.day)
+
         self._config = config
         self._tables = get_table_names(config)
 
@@ -313,7 +320,7 @@ class Job:
 
         self._lock_provider = lock_provider
         self._clear_existing_locks = clear_existing_locks
-        self._created_on = now()
+        self._created_on = pendulum.now()
 
         self._my_tokens = set()
         self._token_version = 0
@@ -326,14 +333,15 @@ class Job:
         self._rebalance_thread = None
         self._refresh_thread = None
 
+        self._stale_leader_lock_age = coordination_config.stale_leader_lock_age_sec if coordination_config else 300
+
         self._on_tokens_added = on_tokens_added
         self._on_tokens_removed = on_tokens_removed
 
         if not self._coordination_enabled and (on_tokens_added or on_tokens_removed):
             logger.warning('Token callbacks provided but coordination_enabled=False - callbacks will never fire')
 
-        if not skip_db_init:
-            init_database(self._engine, config)
+        ensure_database_ready(self._engine, config, coordination_enabled=self._coordination_enabled)
 
     def _build_connection_string(self, config: ModuleType) -> str:
         """Build PostgreSQL connection string from config.
@@ -494,13 +502,13 @@ class Job:
         """
         with self._engine.connect() as conn:
             if isiterable(item):
-                rows = [{'node': self.node_name, 'created_on': now(), 'item': str(i)} for i in item]
+                rows = [{'node': self.node_name, 'created_on': pendulum.now(), 'item': str(i)} for i in item]
                 for row in rows:
                     sql = f'INSERT INTO {self._tables["Claim"]} (node, item, created_on) VALUES (:node, :item, :created_on) ON CONFLICT DO NOTHING'
                     conn.execute(text(sql), row)
             else:
                 sql = f'INSERT INTO {self._tables["Claim"]} (node, item, created_on) VALUES (:node, :item, :created_on) ON CONFLICT DO NOTHING'
-                conn.execute(text(sql), {'node': self.node_name, 'item': str(item), 'created_on': now()})
+                conn.execute(text(sql), {'node': self.node_name, 'item': str(item), 'created_on': pendulum.now()})
             conn.commit()
 
     def add_task(self, task: Task):
@@ -510,7 +518,7 @@ class Job:
             logger.debug(f'Task {task.id} rejected (token not owned)')
             return
 
-        self._tasks.append((task, now()))
+        self._tasks.append((task, pendulum.now()))
         if self._coordination_enabled:
             self.set_claim(task.id)
 
@@ -519,20 +527,18 @@ class Job:
         """
         if not self._tasks:
             return
-        rows = [{
-            'date': self._date,
-            'node': self.node_name,
-            'item': str(task.id),
-            'created_on': created
-            } for task, created in self._tasks]
 
         with self._engine.connect() as conn:
-            for row in rows:
-                sql = f'INSERT INTO {self._tables["Audit"]} (date, node, item, created_on) VALUES (:date, :node, :item, :created_on)'
-                conn.execute(text(sql), row)
+            for task, _ in self._tasks:
+                sql = f'INSERT INTO {self._tables["Audit"]} (date, node, item, created_on) VALUES (:date, :node, :item, now())'
+                conn.execute(text(sql), {
+                    'date': self._date,
+                    'node': self.node_name,
+                    'item': str(task.id)
+                })
             conn.commit()
 
-        logger.debug(f'Flushed {len(rows)} task to {self._tables["Audit"]}')
+        logger.debug(f'Flushed {len(self._tasks)} task to {self._tables["Audit"]}')
         self._tasks.clear()
 
     def get_audit(self) -> list[attrdict]:
@@ -639,13 +645,13 @@ class Job:
         ORDER BY created_at DESC
         """
         with self._engine.connect() as conn:
-            result = conn.execute(text(sql), {'now': now()})
+            result = conn.execute(text(sql), {'now': pendulum.now()})
             return [dict(row._mapping) for row in result]
 
     def register_task_lock(self, task_id: Hashable, node_pattern: str, reason: str = None, expires_in_days: int = None) -> None:
         """Register a lock to pin task to specific node pattern."""
         token_id = self._task_to_token(task_id)
-        expires_at = now() + timedelta(days=expires_in_days) if expires_in_days else None
+        expires_at = pendulum.now().add(days=expires_in_days) if expires_in_days else None
 
         sql = f"""
         INSERT INTO {self._tables["Lock"]} (token_id, node_pattern, reason, created_at, created_by, expires_at)
@@ -657,7 +663,7 @@ class Job:
                 'token_id': token_id,
                 'pattern': node_pattern,
                 'reason': reason,
-                'created_at': now(),
+                'created_at': pendulum.now(),
                 'created_by': self.node_name,
                 'expires_at': expires_at
             })
@@ -677,7 +683,7 @@ class Job:
                 'token_id': self._task_to_token(task_id),
                 'node_pattern': pattern,
                 'reason': reason,
-                'created_at': now(),
+                'created_at': pendulum.now(),
                 'created_by': self.node_name,
                 'expires_at': None
             }
@@ -706,7 +712,7 @@ class Job:
         """
         try:
             if self._last_heartbeat_sent:
-                age = now() - self._last_heartbeat_sent
+                age = pendulum.now() - self._last_heartbeat_sent
                 if age.total_seconds() > self._heartbeat_timeout:
                     return False
             with self._engine.connect() as conn:
@@ -726,7 +732,7 @@ class Job:
 
     def get_active_nodes(self) -> list[attrdict]:
         """Get list of active nodes (heartbeat within timeout threshold)."""
-        cutoff = now() - timedelta(seconds=self._heartbeat_timeout)
+        cutoff = pendulum.now().subtract(seconds=self._heartbeat_timeout)
         sql = f"""
         SELECT name, created_on, last_heartbeat
         FROM {self._tables["Node"]}
@@ -739,7 +745,7 @@ class Job:
 
     def get_dead_nodes(self) -> list[str]:
         """Get list of dead nodes (heartbeat older than timeout threshold)."""
-        cutoff = now() - timedelta(seconds=self._heartbeat_timeout)
+        cutoff = pendulum.now().subtract(seconds=self._heartbeat_timeout)
         sql = f"""
         SELECT name
         FROM {self._tables["Node"]}
@@ -765,14 +771,14 @@ class Job:
             conn.execute(text(sql), {
                 'name': self.node_name,
                 'created_on': self._created_on,
-                'heartbeat': now()
+                'heartbeat': pendulum.now()
             })
             conn.commit()
         logger.info(f'Node {self.node_name} registered with heartbeat')
 
     def _start_heartbeat_thread(self) -> None:
         """Start background thread that sends heartbeat every N seconds."""
-        self._last_heartbeat_sent = now()
+        self._last_heartbeat_sent = pendulum.now()
 
         def heartbeat_loop():
             conn = self._engine.connect()
@@ -784,7 +790,7 @@ class Job:
                         SET last_heartbeat = :heartbeat
                         WHERE name = :name
                         """
-                        heartbeat_time = now()
+                        heartbeat_time = pendulum.now()
                         conn.execute(text(sql), {'heartbeat': heartbeat_time, 'name': self.node_name})
                         conn.commit()
                         self._last_heartbeat_sent = heartbeat_time
@@ -817,8 +823,8 @@ class Job:
                 while not self._shutdown:
                     try:
                         if self._last_heartbeat_sent:
-                            age = now() - self._last_heartbeat_sent
-                            if age.total_seconds() > self._heartbeat_timeout:
+                            age_seconds = (pendulum.now() - self._last_heartbeat_sent).total_seconds()
+                            if age_seconds > self._heartbeat_timeout:
                                 logger.error(f'Heartbeat thread appears dead (>{self._heartbeat_timeout}s old)')
                         try:
                             conn.execute(text('SELECT 1'))
@@ -873,7 +879,7 @@ class Job:
                     """
                     result = conn.execute(text(sql), {
                         'node': self.node_name,
-                        'acquired_at': now(),
+                        'acquired_at': pendulum.now(),
                         'operation': operation
                     })
                     conn.commit()
@@ -888,8 +894,9 @@ class Job:
                     lock_row = result.first()
 
                     if lock_row:
-                        age = now() - lock_row[1]
-                        if age.total_seconds() > 300:
+                        acquired_at = pendulum.instance(lock_row[1])
+                        age = pendulum.now() - acquired_at
+                        if age.total_seconds() > self._stale_leader_lock_age:
                             logger.warning(f'Stale leader lock detected (age: {age.total_seconds()}s), forcing release')
                             conn.execute(text(f'DELETE FROM {self._tables["LeaderLock"]} WHERE singleton = 1'))
                             conn.commit()
@@ -940,9 +947,10 @@ class Job:
             records = [dict(row._mapping) for row in result]
 
             locked_tokens = {}
-            current_time = now()
+            current_time = pendulum.now()
             for row in records:
-                if row['expires_at'] and row['expires_at'] < current_time:
+                expires_at = pendulum.instance(row['expires_at']) if row['expires_at'] else None
+                if expires_at and expires_at < current_time:
                     conn.execute(text(f'DELETE FROM {self._tables["Lock"]} WHERE token_id = :token_id'),
                                 {'token_id': row['token_id']})
                     continue
@@ -984,7 +992,7 @@ class Job:
 
             conn.execute(text(f'DELETE FROM {self._tables["Token"]}'))
 
-            assignment_time = now()
+            assignment_time = pendulum.now()
             for tid, node in new_assignments.items():
                 sql = f'INSERT INTO {self._tables["Token"]} (token_id, node, assigned_at, version) VALUES (:token_id, :node, :assigned_at, :version)'
                 conn.execute(text(sql), {
@@ -1013,7 +1021,7 @@ class Job:
                             logger.debug('No longer leader, stopping dead node monitor')
                             break
 
-                        cutoff = now() - timedelta(seconds=self._heartbeat_timeout)
+                        cutoff = pendulum.now().subtract(seconds=self._heartbeat_timeout)
                         sql = f"""
                         SELECT name
                         FROM {self._tables["Node"]}
@@ -1068,7 +1076,7 @@ class Job:
         WHERE singleton = 1 AND in_progress = FALSE
         """
         with self._engine.connect() as conn:
-            result = conn.execute(text(sql), {'started_at': now(), 'started_by': started_by})
+            result = conn.execute(text(sql), {'started_at': pendulum.now(), 'started_by': started_by})
             conn.commit()
             rows_affected = result.rowcount
 
@@ -1098,7 +1106,7 @@ class Job:
         def rebalance_loop():
             conn = self._engine.connect()
             try:
-                cutoff = now() - timedelta(seconds=self._heartbeat_timeout)
+                cutoff = pendulum.now().subtract(seconds=self._heartbeat_timeout)
                 sql = f"""
                 SELECT name, created_on, last_heartbeat
                 FROM {self._tables["Node"]}
@@ -1115,7 +1123,7 @@ class Job:
                             logger.debug('No longer leader, stopping rebalance monitor')
                             break
 
-                        cutoff = now() - timedelta(seconds=self._heartbeat_timeout)
+                        cutoff = pendulum.now().subtract(seconds=self._heartbeat_timeout)
                         result = conn.execute(text(sql), {'cutoff': cutoff})
                         current_count = len(list(result))
 
@@ -1309,7 +1317,7 @@ class Job:
         """
         with self._engine.connect() as conn:
             conn.execute(text(sql), {
-                'triggered_at': now(),
+                'triggered_at': pendulum.now(),
                 'reason': reason,
                 'leader': self.node_name,
                 'before': nodes_before,

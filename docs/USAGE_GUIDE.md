@@ -42,8 +42,7 @@ def process_daily_tasks():
         node_name='worker-01',
         site='production',
         config=config,
-        wait_on_enter=120,  # Wait for cluster formation and token distribution
-        skip_db_init=False
+        wait_on_enter=120  # Wait for cluster formation and token distribution
     ) as job:
         # Job automatically:
         # - Registers node with heartbeat
