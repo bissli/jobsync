@@ -4,6 +4,7 @@ import contextlib
 import datetime
 import enum
 import hashlib
+import json
 import logging
 import re
 import threading
@@ -39,7 +40,7 @@ def compute_minimal_move_distribution(
     total_tokens: int,
     active_nodes: list[str],
     current_assignments: dict[int, str],
-    locked_tokens: dict[int, str],
+    locked_tokens: dict[int, str | list[str]],
     pattern_matcher: callable
 ) -> tuple[dict[int, str], int]:
     """Compute token distribution using minimal-move algorithm.
@@ -53,7 +54,7 @@ def compute_minimal_move_distribution(
         total_tokens: Total number of tokens to distribute
         active_nodes: List of active node names
         current_assignments: Current token_id -> node_name mapping
-        locked_tokens: Locked token_id -> node_pattern mapping
+        locked_tokens: Locked token_id -> node_pattern(s) mapping (single pattern or list of fallback patterns)
         pattern_matcher: Function(node_name, pattern) -> bool for pattern matching
 
     Returns
@@ -65,10 +66,14 @@ def compute_minimal_move_distribution(
         return {}, 0
 
     locked_assignments = {}
-    for token_id, pattern in locked_tokens.items():
-        matching_nodes = [n for n in active_nodes if pattern_matcher(n, pattern)]
-        if matching_nodes:
-            locked_assignments[token_id] = matching_nodes[0]
+    for token_id, patterns in locked_tokens.items():
+        if isinstance(patterns, str):
+            patterns = [patterns]
+        for pattern in patterns:
+            matching_nodes = [n for n in active_nodes if pattern_matcher(n, pattern)]
+            if matching_nodes:
+                locked_assignments[token_id] = matching_nodes[0]
+                break
 
     unlocked_token_ids = [t for t in range(total_tokens) if t not in locked_tokens]
     target_per_node = len(unlocked_token_ids) // nodes_count
@@ -567,6 +572,91 @@ class Job:
     # PUBLIC API - Lock Management
     # ============================================================
 
+    def register_lock(
+            self, task_id: Hashable, node_patterns: str | list[str], reason: str = None,
+            expires_in_days: int = None) -> None:
+        """Register lock to pin task to specific node patterns.
+
+        Args:
+            task_id: Task identifier to lock
+            node_patterns: Single pattern or ordered list of fallback patterns
+            reason: Human-readable reason for lock
+            expires_in_days: Optional expiration in days
+        """
+        if isinstance(node_patterns, str):
+            node_patterns = [node_patterns]
+
+        token_id = self._task_to_token(task_id)
+        expires_at = (datetime.datetime.now(datetime.timezone.utc) +
+                      datetime.timedelta(days=expires_in_days)) if expires_in_days else None
+
+        sql = f"""
+        INSERT INTO {self._tables["Lock"]}
+        (token_id, node_patterns, reason, created_at, created_by, expires_at)
+        VALUES (:token_id, :patterns, :reason, :created_at, :created_by, :expires_at)
+        ON CONFLICT (token_id) DO UPDATE
+        SET node_patterns = EXCLUDED.node_patterns,
+            reason = EXCLUDED.reason,
+            created_at = EXCLUDED.created_at,
+            created_by = EXCLUDED.created_by,
+            expires_at = EXCLUDED.expires_at
+        """
+
+        with self._engine.connect() as conn:
+            conn.execute(text(sql), {
+                'token_id': token_id,
+                'patterns': json.dumps(node_patterns),
+                'reason': reason,
+                'created_at': datetime.datetime.now(datetime.timezone.utc),
+                'created_by': self.node_name,
+                'expires_at': expires_at
+            })
+            conn.commit()
+
+        logger.debug(f'Registered lock: task {task_id} -> token {token_id} -> patterns {node_patterns}')
+
+    def register_locks_bulk(self, locks: list[tuple[Hashable, str | list[str], str]]) -> None:
+        """Register multiple locks in batch.
+
+        Args:
+            locks: List of (task_id, node_patterns, reason) tuples
+        """
+        if not locks:
+            return
+
+        rows = []
+        for task_id, node_patterns, reason in locks:
+            if isinstance(node_patterns, str):
+                node_patterns = [node_patterns]
+
+            rows.append({
+                'token_id': self._task_to_token(task_id),
+                'patterns': json.dumps(node_patterns),
+                'reason': reason,
+                'created_at': datetime.datetime.now(datetime.timezone.utc),
+                'created_by': self.node_name,
+                'expires_at': None
+            })
+
+        sql = f"""
+        INSERT INTO {self._tables["Lock"]}
+        (token_id, node_patterns, reason, created_at, created_by, expires_at)
+        VALUES (:token_id, :patterns, :reason, :created_at, :created_by, :expires_at)
+        ON CONFLICT (token_id) DO UPDATE
+        SET node_patterns = EXCLUDED.node_patterns,
+            reason = EXCLUDED.reason,
+            created_at = EXCLUDED.created_at,
+            created_by = EXCLUDED.created_by,
+            expires_at = EXCLUDED.expires_at
+        """
+
+        with self._engine.connect() as conn:
+            for row in rows:
+                conn.execute(text(sql), row)
+            conn.commit()
+
+        logger.info(f'Registered {len(locks)} locks in bulk')
+
     def clear_locks_by_creator(self, creator: str) -> int:
         """Clear all locks created by specified node.
 
@@ -585,7 +675,7 @@ class Job:
         return rows
 
     def clear_all_locks(self) -> int:
-        """Clear all locks from the system (use with caution).
+        """Clear all locks from system.
 
         Returns
             Number of locks removed
@@ -599,13 +689,13 @@ class Job:
         return rows
 
     def list_locks(self) -> list[dict]:
-        """List all active (non-expired) locks.
+        """List all active locks.
 
         Returns
-            List of lock records with token_id, node_pattern, reason, created_by, etc.
+            List of lock records with token_id, node_patterns, reason, created_by, etc.
         """
         sql = f"""
-        SELECT token_id, node_pattern, reason, created_at, created_by, expires_at
+        SELECT token_id, node_patterns, reason, created_at, created_by, expires_at
         FROM {self._tables["Lock"]}
         WHERE expires_at IS NULL OR expires_at > :now
         ORDER BY created_at DESC
@@ -613,61 +703,6 @@ class Job:
         with self._engine.connect() as conn:
             result = conn.execute(text(sql), {'now': datetime.datetime.now(datetime.timezone.utc)})
             return [dict(row._mapping) for row in result]
-
-    def register_task_lock(self, task_id: Hashable, node_pattern: str, reason: str = None, expires_in_days: int = None) -> None:
-        """Register a lock to pin task to specific node pattern."""
-        token_id = self._task_to_token(task_id)
-        expires_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=expires_in_days) if expires_in_days else None
-
-        sql = f"""
-        INSERT INTO {self._tables["Lock"]} (token_id, node_pattern, reason, created_at, created_by, expires_at)
-        VALUES (:token_id, :pattern, :reason, :created_at, :created_by, :expires_at)
-        ON CONFLICT (token_id) DO NOTHING
-        """
-        with self._engine.connect() as conn:
-            conn.execute(text(sql), {
-                'token_id': token_id,
-                'pattern': node_pattern,
-                'reason': reason,
-                'created_at': datetime.datetime.now(datetime.timezone.utc),
-                'created_by': self.node_name,
-                'expires_at': expires_at
-            })
-            conn.commit()
-        logger.debug(f'Registered lock: task {task_id} -> token {token_id} -> pattern "{node_pattern}"')
-
-    def register_task_locks_bulk(self, locks: list[tuple[Hashable, str, str]]):
-        """Register multiple locks in batch.
-
-        Args:
-            locks: List of (task_id, node_pattern, reason) tuples
-        """
-        if not locks:
-            return
-        rows = [
-            {
-                'token_id': self._task_to_token(task_id),
-                'node_pattern': pattern,
-                'reason': reason,
-                'created_at': datetime.datetime.now(datetime.timezone.utc),
-                'created_by': self.node_name,
-                'expires_at': None
-            }
-            for task_id, pattern, reason in locks
-        ]
-
-        sql = f"""
-        INSERT INTO {self._tables["Lock"]} (token_id, node_pattern, reason, created_at, created_by, expires_at)
-        VALUES (:token_id, :node_pattern, :reason, :created_at, :created_by, :expires_at)
-        ON CONFLICT (token_id) DO NOTHING
-        """
-
-        with self._engine.connect() as conn:
-            for row in rows:
-                conn.execute(text(sql), row)
-            conn.commit()
-
-        logger.info(f'Registered {len(locks)} locks in bulk')
 
     # ============================================================
     # PUBLIC API - Health & Status
@@ -901,14 +936,14 @@ class Job:
         finally:
             self._release_leader_lock()
 
-    def _get_active_locks(self) -> dict[int, str]:
-        """Get active (non-expired) locks as token_id -> node_pattern mapping.
+    def _get_active_locks(self) -> dict[int, list[str]]:
+        """Get active locks as token_id -> ordered patterns mapping.
 
-        Returns dictionary mapping token IDs to node patterns. Expired locks
-        are removed as a side effect.
+        Returns dictionary mapping token IDs to ordered list of node patterns.
+        Expired locks are removed as a side effect.
         """
         with self._engine.connect() as conn:
-            sql = f'SELECT token_id, node_pattern, expires_at FROM {self._tables["Lock"]}'
+            sql = f'SELECT token_id, node_patterns, expires_at FROM {self._tables["Lock"]}'
             result = conn.execute(text(sql))
             records = [dict(row._mapping) for row in result]
 
@@ -920,7 +955,8 @@ class Job:
                     conn.execute(text(f'DELETE FROM {self._tables["Lock"]} WHERE token_id = :token_id'),
                                 {'token_id': row['token_id']})
                     continue
-                locked_tokens[row['token_id']] = row['node_pattern']
+                patterns = row['node_patterns']
+                locked_tokens[row['token_id']] = patterns
 
             conn.commit()
             return locked_tokens
@@ -929,7 +965,7 @@ class Job:
         """Distribute tokens using minimal-move algorithm."""
         start_time = time.time()
         active_nodes = self.get_active_nodes()
-        active_node_names = [n["name"] for n in active_nodes]
+        active_node_names = [n['name'] for n in active_nodes]
         nodes_count = len(active_node_names)
 
         if nodes_count == 0:
@@ -943,10 +979,17 @@ class Job:
 
         locked_tokens = self._get_active_locks()
 
-        for token_id, pattern in locked_tokens.items():
-            matching_nodes = [n for n in active_node_names if self._matches_pattern(n, pattern)]
-            if not matching_nodes:
-                logger.warning(f'Token {token_id} locked to pattern "{pattern}" but no matching nodes found')
+        for token_id, patterns in locked_tokens.items():
+            matching_found = False
+            for pattern in patterns:
+                matching_nodes = [n for n in active_node_names if self._matches_pattern(n, pattern)]
+                if matching_nodes:
+                    matching_found = True
+                    logger.debug(f'Token {token_id} will be locked to pattern "{pattern}" (matches {len(matching_nodes)} nodes)')
+                    break
+
+            if not matching_found:
+                logger.warning(f'Token {token_id} lock failed: patterns {patterns} matched no active nodes {active_node_names}')
 
         new_assignments, tokens_moved = compute_minimal_move_distribution(
             total_tokens, active_node_names, current_assignments, locked_tokens, self._matches_pattern)

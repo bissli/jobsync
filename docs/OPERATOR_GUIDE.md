@@ -295,14 +295,14 @@ LIMIT 1;
 
 **Query**:
 ```sql
-SELECT l.node_pattern, COUNT(*) as locked_tokens,
+SELECT l.node_patterns, COUNT(*) as locked_tokens,
        STRING_AGG(DISTINCT t.node, ', ') as assigned_to
 FROM sync_lock l
 JOIN sync_token t ON l.token_id = t.token_id
-GROUP BY l.node_pattern;
+GROUP BY l.node_patterns;
 ```
 
-**Alert**: Locked tokens assigned to wrong node pattern
+**Alert**: Locked tokens assigned to node not matching any pattern
 
 **Action**: Manual intervention required - rebalance or fix lock patterns
 
@@ -509,9 +509,9 @@ GROUP BY node
 ORDER BY tokens DESC;
 
 -- Check locked tokens
-SELECT node_pattern, COUNT(*) as locked_count
+SELECT node_patterns, COUNT(*) as locked_count
 FROM sync_lock
-GROUP BY node_pattern;
+GROUP BY node_patterns;
 ```
 
 **Possible causes**:
@@ -644,7 +644,7 @@ def fixed_lock_provider(job):
     # Don't register same task multiple times
     tasks = set(get_tasks_needing_locks())  # Use set to deduplicate
     locks = [(task_id, pattern, reason) for task_id in tasks]
-    job.register_task_locks_bulk(locks)
+    job.register_locks_bulk(locks)
 ```
 
 **Emergency cleanup**:

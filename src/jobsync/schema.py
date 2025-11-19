@@ -154,7 +154,7 @@ CREATE TABLE IF NOT EXISTS {Token} (
         conn.execute(text(f"""
 CREATE TABLE IF NOT EXISTS {Lock} (
     token_id integer not null,
-    node_pattern varchar not null,
+    node_patterns jsonb not null,
     reason varchar,
     created_at timestamp with time zone not null,
     created_by varchar not null,
@@ -163,7 +163,6 @@ CREATE TABLE IF NOT EXISTS {Lock} (
 );
         """))
 
-        conn.execute(text(f'CREATE INDEX IF NOT EXISTS idx_{Lock}_pattern ON {Lock}(node_pattern)'))
         conn.execute(text(f'CREATE INDEX IF NOT EXISTS idx_{Lock}_created_by ON {Lock}(created_by)'))
         conn.execute(text(f'CREATE INDEX IF NOT EXISTS idx_{Lock}_expires ON {Lock}(expires_at) WHERE expires_at IS NOT NULL'))
 

@@ -9,6 +9,7 @@ Tests verify:
 - Rebalance timing with mixed timezone nodes
 """
 import datetime
+import json
 import logging
 import time
 from datetime import timezone
@@ -193,11 +194,11 @@ class TestLockExpirationTimezones:
 
             # Expired lock with UTC timestamp
             conn.execute(text(f"""
-                INSERT INTO {tables["Lock"]} (token_id, node_pattern, reason, created_at, created_by, expires_at)
-                VALUES (:token_id, :pattern, :reason, :created_at, :created_by, :expires_at)
+                INSERT INTO {tables["Lock"]} (token_id, node_patterns, reason, created_at, created_by, expires_at)
+                VALUES (:token_id, :patterns, :reason, :created_at, :created_by, :expires_at)
             """), {
                 'token_id': 1,
-                'pattern': 'pattern-utc',
+                'patterns': json.dumps(['pattern-utc']),
                 'reason': 'expired UTC',
                 'created_at': utc_now,
                 'created_by': 'test',
@@ -206,11 +207,11 @@ class TestLockExpirationTimezones:
 
             # Expired lock with NY timezone
             conn.execute(text(f"""
-                INSERT INTO {tables["Lock"]} (token_id, node_pattern, reason, created_at, created_by, expires_at)
-                VALUES (:token_id, :pattern, :reason, :created_at, :created_by, :expires_at)
+                INSERT INTO {tables["Lock"]} (token_id, node_patterns, reason, created_at, created_by, expires_at)
+                VALUES (:token_id, :patterns, :reason, :created_at, :created_by, :expires_at)
             """), {
                 'token_id': 2,
-                'pattern': 'pattern-ny',
+                'patterns': json.dumps(['pattern-ny']),
                 'reason': 'expired NY',
                 'created_at': ny_now,
                 'created_by': 'test',
@@ -219,11 +220,11 @@ class TestLockExpirationTimezones:
 
             # Valid lock
             conn.execute(text(f"""
-                INSERT INTO {tables["Lock"]} (token_id, node_pattern, reason, created_at, created_by, expires_at)
-                VALUES (:token_id, :pattern, :reason, :created_at, :created_by, :expires_at)
+                INSERT INTO {tables["Lock"]} (token_id, node_patterns, reason, created_at, created_by, expires_at)
+                VALUES (:token_id, :patterns, :reason, :created_at, :created_by, :expires_at)
             """), {
                 'token_id': 3,
-                'pattern': 'pattern-valid',
+                'patterns': json.dumps(['pattern-valid']),
                 'reason': 'valid lock',
                 'created_at': utc_now,
                 'created_by': 'test',
@@ -258,11 +259,11 @@ class TestLockExpirationTimezones:
         with postgres.connect() as conn:
             conn.execute(text(f'DELETE FROM {tables["Lock"]}'))
             conn.execute(text(f"""
-                INSERT INTO {tables["Lock"]} (token_id, node_pattern, reason, created_at, created_by, expires_at)
-                VALUES (:token_id, :pattern, :reason, :created_at, :created_by, :expires_at)
+                INSERT INTO {tables["Lock"]} (token_id, node_patterns, reason, created_at, created_by, expires_at)
+                VALUES (:token_id, :patterns, :reason, :created_at, :created_by, :expires_at)
             """), {
                 'token_id': 100,
-                'pattern': 'midnight-test',
+                'patterns': json.dumps(['midnight-test']),
                 'reason': 'expires at midnight',
                 'created_at': utc_midnight - datetime.timedelta(days=2),
                 'created_by': 'test',

@@ -266,9 +266,9 @@ class TestTokenDistribution:
 
             for token_id in range(10):
                 conn.execute(text(f"""
-                    INSERT INTO {tables["Lock"]} (token_id, node_pattern, reason, created_at, created_by)
-                    VALUES (:token_id, :pattern, :reason, :created_at, :created_by)
-                """), {'token_id': token_id, 'pattern': 'special-%', 'reason': 'test', 'created_at': current, 'created_by': 'test'})
+                    INSERT INTO {tables["Lock"]} (token_id, node_patterns, reason, created_at, created_by)
+                    VALUES (:token_id, :patterns, :reason, :created_at, :created_by)
+                """), {'token_id': token_id, 'patterns': '["special-%"]', 'reason': 'test', 'created_at': current, 'created_by': 'test'})
             conn.commit()
 
         coord_config = CoordinationConfig(total_tokens=30)
@@ -317,24 +317,26 @@ class TestLockRegistration:
 
     def test_register_single_lock(self, postgres):
         """Test registering a single lock."""
+
         config = get_unit_test_config()
         tables = schema.get_table_names(config)
 
         job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
 
         task_id = 'task-123'
-        job.register_task_lock(task_id, 'special-%', 'test reason')
+        job.register_lock(task_id, 'special-%', 'test reason')
 
         with postgres.connect() as conn:
             result = conn.execute(text(f"""
-                SELECT node_pattern, reason, created_by
+                SELECT node_patterns, reason, created_by
                 FROM {tables["Lock"]}
                 WHERE token_id = :token_id
             """), {'token_id': job._task_to_token(task_id)})
             lock = [dict(row._mapping) for row in result]
 
         assert_equal(len(lock), 1, 'Lock should be created')
-        assert_equal(lock[0]['node_pattern'], 'special-%')
+        patterns = lock[0]['node_patterns']
+        assert_equal(patterns, ['special-%'])
         assert_equal(lock[0]['reason'], 'test reason')
         assert_equal(lock[0]['created_by'], 'node1')
 
@@ -355,7 +357,7 @@ class TestLockRegistration:
             ('task-3', 'pattern-3', 'reason-3'),
         ]
 
-        job.register_task_locks_bulk(locks)
+        job.register_locks_bulk(locks)
 
         with postgres.connect() as conn:
             result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Lock"]}'))
@@ -363,7 +365,8 @@ class TestLockRegistration:
         assert_equal(lock_count, 3, 'All 3 locks should be created')
 
     def test_lock_idempotency(self, postgres):
-        """Test that registering same lock twice is idempotent."""
+        """Test that registering same lock twice updates to latest patterns."""
+
         config = get_unit_test_config()
         tables = schema.get_table_names(config)
 
@@ -374,18 +377,19 @@ class TestLockRegistration:
         job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
 
         task_id = 'task-123'
-        job.register_task_lock(task_id, 'pattern-1', 'reason-1')
-        job.register_task_lock(task_id, 'pattern-2', 'reason-2')  # Different pattern, same token
+        job.register_lock(task_id, 'pattern-1', 'reason-1')
+        job.register_lock(task_id, 'pattern-2', 'reason-2')  # Different pattern, same token
 
         with postgres.connect() as conn:
             result = conn.execute(text(f"""
-                SELECT node_pattern FROM {tables["Lock"]}
+                SELECT node_patterns FROM {tables["Lock"]}
                 WHERE token_id = :token_id
             """), {'token_id': job._task_to_token(task_id)})
             locks = [dict(row._mapping) for row in result]
 
-        assert_equal(len(locks), 1, 'Should only have 1 lock (ON CONFLICT DO NOTHING)')
-        assert_equal(locks[0]['node_pattern'], 'pattern-1', 'First pattern should be kept')
+        assert_equal(len(locks), 1, 'Should only have 1 lock (ON CONFLICT DO UPDATE)')
+        patterns = locks[0]['node_patterns']
+        assert_equal(patterns, ['pattern-2'], 'Second pattern should replace first (DO UPDATE)')
 
 
 class TestCanClaimTask:

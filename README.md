@@ -200,42 +200,21 @@ Lock specific tasks to specific workers using patterns:
 
 ```python
 def register_locks(job):
-    # Pin GPU tasks to GPU workers
     gpu_tasks = get_gpu_task_ids()
-    locks = [(task_id, '%gpu%', 'requires_gpu') for task_id in gpu_tasks]
-    job.register_task_locks_bulk(locks)
+    locks = [
+        (task_id, ['gpu-01', '%-gpu'], 'requires_gpu')  # Fallback support
+        for task_id in gpu_tasks
+    ]
+    job.register_locks_bulk(locks)
 
-# Static locks (persist across runs)
 with Job('worker-gpu-01', 'production', config, 
-         lock_provider=register_locks, 
-         clear_existing_locks=False) as job:
+         lock_provider=register_locks) as job:
     for task_id in get_all_tasks():
         if job.can_claim_task(Task(task_id)):
             process_gpu_task(task_id)
-
-# Dynamic locks (changes each run)
-with Job('worker-01', 'production', config,
-         lock_provider=register_locks,
-         clear_existing_locks=True) as job:  # Clean slate each run
-    for task_id in get_all_tasks():
-        if job.can_claim_task(Task(task_id)):
-            process_task(task_id)
 ```
 
-**Lock Management APIs**:
-
-```python
-# List current locks
-locks = job.list_locks()
-for lock in locks:
-    print(f"Token {lock['token_id']} -> {lock['node_pattern']}")
-
-# Clear locks from specific node
-job.clear_locks_by_creator('old-worker-01')
-
-# Clear all locks (nuclear option)
-job.clear_all_locks()
-```
+**See [Usage Guide](docs/USAGE_GUIDE.md#task-locking-and-pinning)** for complete lock API reference including bulk registration, pattern matching, fallback patterns, and lifecycle management.
 
 ### Health Monitoring
 
@@ -276,21 +255,23 @@ with Job('worker-01', 'production', base_config, coordination_config=config) as 
 
 ## Documentation
 
-### 📚 Guide Overview
+### 📚 Documentation Overview
 
-**[Usage Guide](docs/USAGE_GUIDE.md)** - For developers implementing JobSync:
-- Complete API reference with code examples
-- Long-running task patterns (WebSockets, Kafka, subscriptions)
-- Task locking and pinning strategies
-- Processing patterns and best practices
-- Configuration tuning reference
+This README provides a high-level overview and quick start. For detailed information:
 
-**[Operator Guide](docs/OPERATOR_GUIDE.md)** - For operations teams running JobSync:
-- Deployment procedures and scaling strategies
-- Monitoring, alerting, and health checks
-- Troubleshooting guide with SQL diagnostics
-- Emergency procedures and failover handling
-- Database maintenance and performance tuning
+**[Usage Guide](docs/USAGE_GUIDE.md)** - Complete developer reference:
+- API documentation with code examples
+- Long-running task patterns (WebSockets, Kafka, subscriptions)  
+- Task locking with fallback patterns
+- Configuration options and tuning
+- Best practices and common patterns
+
+**[Operator Guide](docs/OPERATOR_GUIDE.md)** - Operations reference:
+- Deployment and scaling procedures
+- Monitoring, alerting, and dashboards
+- Troubleshooting guide with diagnostics
+- Emergency procedures and recovery
+- Database maintenance and tuning
 
 
 ## Monitoring

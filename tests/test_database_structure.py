@@ -205,7 +205,7 @@ class TestCoordinationTableCreation:
 
         expected_indexes = {
             tables['Token']: [f'idx_{tables["Token"]}_node', f'idx_{tables["Token"]}_assigned', f'idx_{tables["Token"]}_version'],
-            tables['Lock']: [f'idx_{tables["Lock"]}_pattern', f'idx_{tables["Lock"]}_created_by', f'idx_{tables["Lock"]}_expires'],
+            tables['Lock']: [f'idx_{tables["Lock"]}_created_by', f'idx_{tables["Lock"]}_expires'],
         }
 
         with postgres.connect() as conn:

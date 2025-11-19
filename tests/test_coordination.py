@@ -292,7 +292,7 @@ def test_lock_registration_and_enforcement(postgres):
     def register_locks(job):
         # Lock tasks 0-9 to 'special-%' pattern
         locks = [(i, 'special-%', 'test lock') for i in range(10)]
-        job.register_task_locks_bulk(locks)
+        job.register_locks_bulk(locks)
         print(f'{job.node_name}: Registered {len(locks)} locks')
 
     node1 = Job('node1', config, wait_on_enter=15, connection_string=connection_string,

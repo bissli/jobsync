@@ -909,9 +909,9 @@ def process_with_lock():
     """
     def register_locks(job):
         # Pin task 12345 to node 'worker-01'
-        job.register_task_lock(
+        job.register_lock(
             task_id=12345,
-            node_pattern='worker-01',
+            node_patterns='worker-01',  # Single pattern
             reason='high_memory_required',
             expires_in_days=7  # Optional expiration
         )
@@ -936,7 +936,7 @@ def process_with_lock():
 
 ```python
 def process_with_bulk_locks():
-    """Register multiple locks efficiently.
+    """Register multiple locks efficiently with fallback support.
     """
     def register_locks(job):
         # Get tasks requiring special resources from database
@@ -947,21 +947,14 @@ def process_with_bulk_locks():
         """
         tasks = db.select(job._cn, sql, job.date)
         
-        # Build lock list
         locks = []
         for task in tasks.to_dict('records'):
             if task['required_node']:
-                # required_node could be: 'worker-01,worker-02'
-                for node in task['required_node'].split(','):
-                    locks.append((
-                        task['task_id'],
-                        node.strip(),
-                        'resource_requirement'
-                    ))
+                nodes = [n.strip() for n in task['required_node'].split(',')]
+                locks.append((task['task_id'], nodes, 'resource_requirement'))
         
-        # Register all locks in one batch
         if locks:
-            job.register_task_locks_bulk(locks)
+            job.register_locks_bulk(locks)
     
     with Job(
         node_name='worker-01',
@@ -976,34 +969,48 @@ def process_with_bulk_locks():
 
 ```python
 def register_pattern_locks(job):
-    """Use SQL LIKE patterns for flexible node matching.
+    """Use SQL LIKE patterns for flexible node matching with fallback.
     """
     # Exact match
-    job.register_task_lock(
+    job.register_lock(
         task_id=100,
-        node_pattern='prod-node-01',
+        node_patterns='prod-node-01',
         reason='exact_node'
     )
     
     # Prefix pattern (SQL LIKE 'prod-%')
-    job.register_task_lock(
+    job.register_lock(
         task_id=200,
-        node_pattern='prod-%',
+        node_patterns='prod-%',
         reason='any_prod_node'
     )
     
     # Suffix pattern (SQL LIKE '%-gpu')
-    job.register_task_lock(
+    job.register_lock(
         task_id=300,
-        node_pattern='%-gpu',
+        node_patterns='%-gpu',
         reason='gpu_required'
     )
     
     # Contains pattern (SQL LIKE '%special%')
-    job.register_task_lock(
+    job.register_lock(
         task_id=400,
-        node_pattern='%special%',
+        node_patterns='%special%',
         reason='special_nodes_only'
+    )
+    
+    # Multiple patterns with ordered fallback
+    job.register_lock(
+        task_id=500,
+        node_patterns=['prod-gpu-01', 'prod-gpu-%', '%-gpu'],
+        reason='prefer_primary_gpu_with_fallback'
+    )
+    
+    # Regional fallback pattern
+    job.register_lock(
+        task_id=600,
+        node_patterns=['us-east-1-%', 'us-east-%', 'us-%'],
+        reason='regional_data_locality'
     )
 ```
 
@@ -1073,7 +1080,9 @@ def manage_locks_manually():
         # List all current locks
         locks = job.list_locks()
         for lock in locks:
-            print(f"Token {lock['token_id']}: {lock['node_pattern']} "
+            patterns = lock['node_patterns']  # List of patterns
+            patterns_str = ' -> '.join(patterns)  # Show fallback chain
+            print(f"Token {lock['token_id']}: {patterns_str} "
                   f"(created by {lock['created_by']})")
         
         # Clear locks from decommissioned node
@@ -1093,24 +1102,24 @@ def manage_locks_manually():
 
 **When to Use clear_existing_locks**:
 
-| Scenario | Setting | Reason |
-| -------- | ------- | ------ |
-| Lock logic changes daily | `True` | Prevent accumulation of stale locks |
-| GPU availability changes | `True` | Locks reflect current GPU node availability |
-| Customer assignment changes | `True` | Update customer-to-region mappings |
-| Permanent resource constraints | `False` | Keep consistent lock patterns |
-| Development/testing | `True` | Clean state for each test run |
+| Scenario                       | Setting | Reason                                    |
+| ---------                      | ------- | ------                                    |
+| Lock logic changes daily       | `True`  | Prevent accumulation of stale locks       |
+| GPU availability changes       | `True`  | Locks reflect current GPU availability    |
+| Customer assignment changes    | `True`  | Update customer-to-region mappings        |
+| Permanent resource constraints | `False` | Keep consistent lock patterns             |
+| Development/testing            | `True`  | Clean state for each test run             |
 
 **Lock Management Best Practices**:
 
 ```python
 def production_lock_pattern():
-    """Best practices for production lock management.
+    """Best practices for production lock management with fallback.
     """
     def register_locks(job):
         # Query current state from database
         sql = """
-        SELECT task_id, required_resource 
+        SELECT task_id, required_resource, priority 
         FROM task_metadata 
         WHERE date = %s AND required_resource IS NOT NULL
         """
@@ -1118,14 +1127,17 @@ def production_lock_pattern():
         
         locks = []
         for row in requirements.to_dict('records'):
-            # Map requirements to node patterns
+            # Map requirements to node patterns with fallback
             if row['required_resource'] == 'gpu':
-                locks.append((row['task_id'], '%-gpu', 'gpu_required'))
+                if row['priority'] == 'high':
+                    locks.append((row['task_id'], ['gpu-primary', '%-gpu'], 'high_priority_gpu'))
+                else:
+                    locks.append((row['task_id'], '%-gpu', 'gpu_required'))
             elif row['required_resource'] == 'high_memory':
-                locks.append((row['task_id'], 'high-mem-%', 'memory_required'))
+                locks.append((row['task_id'], ['high-mem-01', 'high-mem-%'], 'memory_required'))
         
         if locks:
-            job.register_task_locks_bulk(locks)
+            job.register_locks_bulk(locks)
             logger.info(f'Registered {len(locks)} locks for {job.date}')
     
     with Job(
@@ -1142,31 +1154,106 @@ def production_lock_pattern():
         process_tasks(job)
 ```
 
+### Fallback Pattern Support
+
+The lock system supports ordered fallback patterns for high availability:
+
+```python
+def register_locks_with_fallback(job):
+    """Register locks with ordered fallback patterns.
+    
+    During token distribution, the system tries patterns in order:
+    1. Try first pattern - if any active node matches, lock to it
+    2. If no match, try second pattern
+    3. Continue until a match is found
+    4. If no patterns match, issue warning and treat as unlocked
+    """
+    # Example 1: Prefer primary, fall back to pool
+    job.register_lock(
+        task_id=100,
+        node_patterns=['gpu-primary-01', 'gpu-pool-%'],
+        reason='prefer_primary'
+    )
+    # Distribution: Tries 'gpu-primary-01' first
+    #              If not active, tries any node matching 'gpu-pool-%'
+    
+    # Example 2: Regional fallback with widening scope
+    job.register_lock(
+        task_id=200,
+        node_patterns=['us-east-1a-%', 'us-east-1-%', 'us-east-%', 'us-%'],
+        reason='data_locality'
+    )
+    # Distribution: Tries specific AZ -> region -> coast -> country
+    
+    # Example 3: Resource tier fallback
+    job.register_lock(
+        task_id=300,
+        node_patterns=['xlarge-mem-%', 'large-mem-%', 'medium-mem-%'],
+        reason='memory_tiering'
+    )
+    # Distribution: Tries largest available memory tier
+    
+    # Example 4: Single pattern (no fallback)
+    job.register_lock(
+        task_id=400,
+        node_patterns='special-node-only',  # String converts to single-element list
+        reason='exact_match_required'
+    )
+    # Distribution: Only matches 'special-node-only' exactly
+```
+
+**Fallback Behavior:**
+- Patterns are tried in the order provided
+- First matching pattern wins
+- If no patterns match any active nodes, a warning is logged and the token is treated as unlocked
+- JSONB storage preserves pattern order
+- Pattern matching uses SQL LIKE semantics (`%` = wildcard)
+
+**When to Use Fallback Patterns:**
+- **High availability**: Prefer primary node but allow failover to replicas
+- **Resource tiers**: Try optimal resources first, degrade gracefully
+- **Geographic locality**: Prefer local resources, expand scope as needed
+- **Load shedding**: Route to specific nodes when available, else general pool
+
+**Best Practices:**
+- Order patterns from most specific to least specific
+- Keep fallback lists short (2-4 patterns typical)
+- Document why each pattern is in the list
+- Monitor fallback usage (check which patterns actually match)
+
 ### Resource-Based Lock Example
 
 ```python
 def process_gpu_tasks():
-    """Lock GPU-intensive tasks to GPU-enabled nodes.
+    """Lock GPU-intensive tasks to GPU-enabled nodes with fallback.
     """
     def register_gpu_locks(job):
         # Get tasks requiring GPU
         sql = """
-        SELECT task_id FROM tasks 
+        SELECT task_id, priority FROM tasks 
         WHERE requires_gpu = true AND date = %s
         """
         gpu_tasks = db.select(job._cn, sql, job.date)
         
         locks = []
         for row in gpu_tasks.to_dict('records'):
-            # Lock to any node with 'gpu' in its name
-            locks.append((
-                row['task_id'],
-                '%gpu%',
-                'gpu_required'
-            ))
+            if row['priority'] == 'high':
+                # High priority: prefer primary GPU node, fall back to any GPU node
+                locks.append((
+                    row['task_id'],
+                    ['gpu-primary', '%-gpu'],
+                    'high_priority_gpu'
+                ))
+            else:
+                # Normal priority: any GPU node
+                locks.append((
+                    row['task_id'],
+                    '%-gpu',
+                    'gpu_required'
+                ))
         
         if locks:
-            job.register_task_locks_bulk(locks)
+            job.register_locks_bulk(locks)
     
     with Job(
         node_name='worker-gpu-01',  # GPU-enabled node
@@ -1549,7 +1636,7 @@ LIMIT 1;
 **View All Locks:**
 ```sql
 SELECT 
-    node_pattern,
+    node_patterns,
     COUNT(*) as locked_token_count,
     reason,
     expires_at,
@@ -1560,7 +1647,7 @@ SELECT
     END as status,
     STRING_AGG(DISTINCT created_by, ',') as registered_by
 FROM sync_lock
-GROUP BY node_pattern, reason, expires_at
+GROUP BY node_patterns, reason, expires_at
 ORDER BY locked_token_count DESC;
 ```
 
@@ -1582,17 +1669,18 @@ ORDER BY l.created_at;
 
 **Incorrectly Assigned Locks**:
 ```sql
--- Locks assigned to nodes that don't match the pattern
+-- Locks assigned to nodes that don't match any pattern
+-- Note: Checking JSONB array requires custom function or application logic
 SELECT 
     l.token_id,
-    l.node_pattern,
+    l.node_patterns,
     t.node as actual_node,
     l.reason,
     l.created_by
 FROM sync_lock l
 JOIN sync_token t ON l.token_id = t.token_id
-WHERE NOT (t.node LIKE l.node_pattern)
 ORDER BY l.token_id;
+-- Verify in application code that t.node matches at least one pattern
 ```
 
 ### Rebalance History
@@ -1778,12 +1866,12 @@ def process_task_safely(task_id: int, cn):
 # GOOD: Bulk registration
 def register_locks(job):
     locks = [(task_id, node, reason) for task_id in get_special_tasks()]
-    job.register_task_locks_bulk(locks)
+    job.register_locks_bulk(locks)
 
 # BAD: Individual registration in loop
 def register_locks(job):
     for task_id in get_special_tasks():
-        job.register_task_lock(task_id, node, reason)  # Slow!
+        job.register_lock(task_id, node, reason)  # Slow!
 ```
 
 ### 5. Monitor Rebalance Frequency
@@ -1818,26 +1906,26 @@ node_name = 'worker-1'
 
 ```python
 def register_locks(job):
-    """Register locks with clear reasons.
+    """Register locks with clear reasons and fallback patterns.
     """
-    # GPU requirement
-    job.register_task_lock(
+    # GPU requirement with fallback
+    job.register_lock(
         task_id=100,
-        node_pattern='%-gpu',
-        reason='requires_nvidia_v100'
+        node_patterns=['gpu-v100-%', '%-gpu'],
+        reason='requires_nvidia_v100_preferred'
     )
     
-    # Memory requirement
-    job.register_task_lock(
+    # Memory requirement with fallback
+    job.register_lock(
         task_id=200,
-        node_pattern='high-mem-%',
+        node_patterns=['high-mem-01', 'high-mem-%'],
         reason='requires_64gb_ram'
     )
     
-    # Data locality
-    job.register_task_lock(
+    # Data locality with regional fallback
+    job.register_lock(
         task_id=300,
-        node_pattern='us-east-%',
+        node_patterns=['us-east-1-%', 'us-east-%', 'us-%'],
         reason='data_in_us_east_s3'
     )
 ```
@@ -1852,7 +1940,7 @@ def manage_lock_lifecycle():
         # Lock logic that changes based on current conditions
         heavy_tasks = get_current_heavy_tasks()
         locks = [(t, 'high-mem-%', 'heavy') for t in heavy_tasks]
-        job.register_task_locks_bulk(locks)
+        job.register_locks_bulk(locks)
     
     # Clear old locks before registering new ones
     with Job('worker-01', 'production', config,
@@ -1867,6 +1955,8 @@ def cleanup_orphaned_locks():
         # List all locks to review
         locks = job.list_locks()
         for lock in locks:
+            patterns = lock['node_patterns']  # List of patterns
+            print(f"Token {lock['token_id']}: {patterns} by {lock['created_by']}")
             if lock['created_by'].startswith('old-'):
                 job.clear_locks_by_creator(lock['created_by'])
 ```
@@ -1940,7 +2030,7 @@ def process_with_dynamic_locks():
         # This logic changes each run based on current state
         tasks_needing_gpu = query_gpu_requirements(job.date)
         locks = [(t, '%-gpu', 'gpu') for t in tasks_needing_gpu]
-        job.register_task_locks_bulk(locks)
+        job.register_locks_bulk(locks)
     
     with Job(
         node_name='worker-01',

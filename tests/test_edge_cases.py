@@ -9,6 +9,7 @@ Tests verify:
 - Database connection failures
 """
 import datetime
+import json
 import logging
 import time
 from datetime import timezone
@@ -303,13 +304,13 @@ class TestLockExpirationSideEffects:
         with postgres.connect() as conn:
             conn.execute(text(f'DELETE FROM {tables["Lock"]}'))
             conn.execute(text(f"""
-                INSERT INTO {tables["Lock"]} (token_id, node_pattern, reason, created_at, created_by, expires_at)
-                VALUES (1, 'pattern-1', 'expired lock', :created_at, 'node1', :expires_at)
-            """), {'created_at': datetime.datetime.now(timezone.utc), 'expires_at': expired_time})
+                INSERT INTO {tables["Lock"]} (token_id, node_patterns, reason, created_at, created_by, expires_at)
+                VALUES (1, :patterns1, 'expired lock', :created_at, 'node1', :expires_at)
+            """), {'created_at': datetime.datetime.now(timezone.utc), 'expires_at': expired_time, 'patterns1': json.dumps(['pattern-1'])})
             conn.execute(text(f"""
-                INSERT INTO {tables["Lock"]} (token_id, node_pattern, reason, created_at, created_by, expires_at)
-                VALUES (2, 'pattern-2', 'valid lock', :created_at, 'node1', NULL)
-            """), {'created_at': datetime.datetime.now(timezone.utc)})
+                INSERT INTO {tables["Lock"]} (token_id, node_patterns, reason, created_at, created_by, expires_at)
+                VALUES (2, :patterns2, 'valid lock', :created_at, 'node1', NULL)
+            """), {'created_at': datetime.datetime.now(timezone.utc), 'patterns2': json.dumps(['pattern-2'])})
             conn.commit()
 
         job = Job('node1', config, wait_on_enter=0, connection_string=connection_string)
@@ -355,9 +356,9 @@ class TestLockExpirationSideEffects:
             """), {'name': 'node2', 'created_on': now + datetime.timedelta(seconds=1), 'heartbeat': now})
 
             conn.execute(text(f"""
-                INSERT INTO {tables["Lock"]} (token_id, node_pattern, reason, created_at, created_by, expires_at)
-                VALUES (5, 'node1', 'about to expire', :created_at, 'test', :expires_at)
-            """), {'created_at': datetime.datetime.now(timezone.utc), 'expires_at': soon_to_expire})
+                INSERT INTO {tables["Lock"]} (token_id, node_patterns, reason, created_at, created_by, expires_at)
+                VALUES (5, :patterns, 'about to expire', :created_at, 'test', :expires_at)
+            """), {'created_at': datetime.datetime.now(timezone.utc), 'expires_at': soon_to_expire, 'patterns': json.dumps(['node1'])})
             conn.commit()
 
         coord_config = CoordinationConfig(total_tokens=50)
@@ -443,9 +444,9 @@ class TestTokenDistributionUnderContention:
 
             for token_id in range(20):
                 conn.execute(text(f"""
-                    INSERT INTO {tables["Lock"]} (token_id, node_pattern, reason, created_at, created_by, expires_at)
-                    VALUES (:token_id, 'nonexistent-%', 'test', :created_at, 'test', NULL)
-                """), {'token_id': token_id, 'created_at': datetime.datetime.now(timezone.utc)})
+                    INSERT INTO {tables["Lock"]} (token_id, node_patterns, reason, created_at, created_by, expires_at)
+                    VALUES (:token_id, :patterns, 'test', :created_at, 'test', NULL)
+                """), {'token_id': token_id, 'created_at': datetime.datetime.now(timezone.utc), 'patterns': json.dumps(['nonexistent-%'])})
             conn.commit()
 
         coord_config = CoordinationConfig(total_tokens=20)
@@ -490,15 +491,15 @@ class TestTokenDistributionUnderContention:
 
             for token_id in range(10):
                 conn.execute(text(f"""
-                    INSERT INTO {tables["Lock"]} (token_id, node_pattern, reason, created_at, created_by, expires_at)
-                    VALUES (:token_id, 'special-%', 'valid pattern', :created_at, 'test', NULL)
-                """), {'token_id': token_id, 'created_at': datetime.datetime.now(timezone.utc)})
+                    INSERT INTO {tables["Lock"]} (token_id, node_patterns, reason, created_at, created_by, expires_at)
+                    VALUES (:token_id, :patterns, 'valid pattern', :created_at, 'test', NULL)
+                """), {'token_id': token_id, 'created_at': datetime.datetime.now(timezone.utc), 'patterns': json.dumps(['special-%'])})
 
             for token_id in range(10, 20):
                 conn.execute(text(f"""
-                    INSERT INTO {tables["Lock"]} (token_id, node_pattern, reason, created_at, created_by, expires_at)
-                    VALUES (:token_id, 'missing-%', 'invalid pattern', :created_at, 'test', NULL)
-                """), {'token_id': token_id, 'created_at': datetime.datetime.now(timezone.utc)})
+                    INSERT INTO {tables["Lock"]} (token_id, node_patterns, reason, created_at, created_by, expires_at)
+                    VALUES (:token_id, :patterns, 'invalid pattern', :created_at, 'test', NULL)
+                """), {'token_id': token_id, 'created_at': datetime.datetime.now(timezone.utc), 'patterns': json.dumps(['missing-%'])})
             conn.commit()
 
         coord_config = CoordinationConfig(total_tokens=50)

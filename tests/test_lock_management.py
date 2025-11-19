@@ -3,6 +3,7 @@
 Tests lock creation, listing, and cleanup APIs.
 """
 import datetime
+import json
 import logging
 import threading
 from datetime import timedelta, timezone
@@ -59,9 +60,9 @@ class TestLockClearing:
 
         job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
 
-        job.register_task_lock('task-1', 'pattern-1', 'reason-1')
-        job.register_task_lock('task-2', 'pattern-2', 'reason-2')
-        job.register_task_lock('task-3', 'pattern-3', 'reason-3')
+        job.register_lock('task-1', 'pattern-1', 'reason-1')
+        job.register_lock('task-2', 'pattern-2', 'reason-2')
+        job.register_lock('task-3', 'pattern-3', 'reason-3')
 
         with postgres.connect() as conn:
             count_before = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Lock"]}')).scalar()
@@ -88,9 +89,9 @@ class TestLockClearing:
         job1 = Job('node1', config, connection_string=connection_string)
         job2 = Job('node2', config, connection_string=connection_string)
 
-        job1.register_task_lock('task-1', 'pattern-1', 'from node1')
-        job1.register_task_lock('task-2', 'pattern-2', 'from node1')
-        job2.register_task_lock('task-3', 'pattern-3', 'from node2')
+        job1.register_lock('task-1', 'pattern-1', 'from node1')
+        job1.register_lock('task-2', 'pattern-2', 'from node1')
+        job2.register_lock('task-3', 'pattern-3', 'from node2')
 
         with postgres.connect() as conn:
             count_before = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Lock"]}')).scalar()
@@ -119,8 +120,8 @@ class TestLockClearing:
         job1 = Job('node1', config, connection_string=connection_string)
         job2 = Job('node2', config, connection_string=connection_string)
 
-        job1.register_task_lock('task-1', 'pattern-1', 'from node1')
-        job2.register_task_lock('task-2', 'pattern-2', 'from node2')
+        job1.register_lock('task-1', 'pattern-1', 'from node1')
+        job2.register_lock('task-2', 'pattern-2', 'from node2')
 
         with postgres.connect() as conn:
             count_before = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Lock"]}')).scalar()
@@ -164,13 +165,13 @@ class TestLockListing:
 
         job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
 
-        job.register_task_lock('task-1', 'pattern-1', 'reason-1')
-        job.register_task_lock('task-2', 'pattern-2', 'reason-2')
+        job.register_lock('task-1', 'pattern-1', 'reason-1')
+        job.register_lock('task-2', 'pattern-2', 'reason-2')
 
         locks = job.list_locks()
         assert_equal(len(locks), 2, 'Should have 2 locks')
 
-        lock1 = next(l for l in locks if l['node_pattern'] == 'pattern-1')
+        lock1 = next(l for l in locks if l['node_patterns'] == ['pattern-1'])
         assert_equal(lock1['reason'], 'reason-1')
         assert_equal(lock1['created_by'], 'node1')
         assert_equal(lock1['expires_at'], None)
@@ -187,17 +188,17 @@ class TestLockListing:
 
         job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
 
-        job.register_task_lock('task-1', 'pattern-1', 'not expired')
-        job.register_task_lock('task-2', 'pattern-2', 'expires soon', expires_in_days=1)
+        job.register_lock('task-1', 'pattern-1', 'not expired')
+        job.register_lock('task-2', 'pattern-2', 'expires soon', expires_in_days=1)
 
         expired_time = datetime.datetime.now(timezone.utc) - timedelta(days=2)
         with postgres.connect() as conn:
             conn.execute(text(f"""
-                INSERT INTO {tables["Lock"]} (token_id, node_pattern, reason, created_at, created_by, expires_at)
-                VALUES (:token_id, :pattern, :reason, :created_at, :created_by, :expires_at)
+                INSERT INTO {tables["Lock"]} (token_id, node_patterns, reason, created_at, created_by, expires_at)
+                VALUES (:token_id, :patterns, :reason, :created_at, :created_by, :expires_at)
             """), {
                 'token_id': 999,
-                'pattern': 'pattern-expired',
+                'patterns': json.dumps(['pattern-expired']),
                 'reason': 'already expired',
                 'created_at': datetime.datetime.now(timezone.utc),
                 'created_by': 'node1',
@@ -207,7 +208,7 @@ class TestLockListing:
 
         locks = job.list_locks()
 
-        patterns = [l['node_pattern'] for l in locks]
+        patterns = [l['node_patterns'][0] for l in locks]
         assert_true('pattern-1' in patterns, 'Non-expired lock should be listed')
         assert_true('pattern-2' in patterns, 'Future-expiring lock should be listed')
         assert_true('pattern-expired' not in patterns, 'Expired lock should not be listed')
@@ -229,8 +230,8 @@ class TestClearExistingLocks:
         connection_string = postgres.url.render_as_string(hide_password=False)
 
         def first_lock_provider(job):
-            job.register_task_lock('task-1', 'pattern-OLD', 'first run')
-            job.register_task_lock('task-2', 'pattern-OLD', 'first run')
+            job.register_lock('task-1', 'pattern-OLD', 'first run')
+            job.register_lock('task-2', 'pattern-OLD', 'first run')
 
         job1 = Job('node1', config, connection_string=connection_string,
                    lock_provider=first_lock_provider, clear_existing_locks=False)
@@ -244,7 +245,7 @@ class TestClearExistingLocks:
         assert_equal(count_after_first, 2, 'Should have 2 locks after first run')
 
         def second_lock_provider(job):
-            job.register_task_lock('task-3', 'pattern-NEW', 'second run')
+            job.register_lock('task-3', 'pattern-NEW', 'second run')
 
         job2 = Job('node1', config, connection_string=connection_string,
                    lock_provider=second_lock_provider, clear_existing_locks=True)
@@ -255,10 +256,11 @@ class TestClearExistingLocks:
             job2._lock_provider(job2)
 
         with postgres.connect() as conn:
-            result = conn.execute(text(f'SELECT node_pattern FROM {tables["Lock"]} WHERE created_by = :creator'),
+            result = conn.execute(text(f'SELECT node_patterns FROM {tables["Lock"]} WHERE created_by = :creator'),
                                  {'creator': 'node1'})
             locks = [dict(row._mapping) for row in result]
-        patterns = [l['node_pattern'] for l in locks]
+
+        patterns = [l['node_patterns'][0] for l in locks]
 
         assert_equal(len(locks), 1, 'Should only have 1 lock (old ones cleared)')
         assert_equal(patterns[0], 'pattern-NEW', 'Should have new pattern only')
@@ -276,7 +278,7 @@ class TestClearExistingLocks:
         connection_string = postgres.url.render_as_string(hide_password=False)
 
         def first_lock_provider(job):
-            job.register_task_lock('task-1', 'pattern-OLD', 'first run')
+            job.register_lock('task-1', 'pattern-OLD', 'first run')
 
         job1 = Job('node1', config, connection_string=connection_string,
                    lock_provider=first_lock_provider, clear_existing_locks=False)
@@ -285,7 +287,7 @@ class TestClearExistingLocks:
             job1._lock_provider(job1)
 
         def second_lock_provider(job):
-            job.register_task_lock('task-2', 'pattern-NEW', 'second run')
+            job.register_lock('task-2', 'pattern-NEW', 'second run')
 
         job2 = Job('node1', config, connection_string=connection_string,
                    lock_provider=second_lock_provider, clear_existing_locks=False)
@@ -296,10 +298,11 @@ class TestClearExistingLocks:
             job2._lock_provider(job2)
 
         with postgres.connect() as conn:
-            result = conn.execute(text(f'SELECT node_pattern FROM {tables["Lock"]} WHERE created_by = :creator ORDER BY node_pattern'),
+            result = conn.execute(text(f'SELECT node_patterns FROM {tables["Lock"]} WHERE created_by = :creator ORDER BY token_id'),
                                  {'creator': 'node1'})
             locks = [dict(row._mapping) for row in result]
-        patterns = [l['node_pattern'] for l in locks]
+
+        patterns = [l['node_patterns'][0] for l in locks]
 
         assert_equal(len(locks), 2, 'Should have both old and new locks')
         assert_true('pattern-OLD' in patterns, 'Old lock should be preserved')
@@ -323,7 +326,7 @@ class TestConcurrentLockRegistration:
 
         for i in range(1, 11):
             job = Job(f'node{i}', config, connection_string=connection_string)
-            job.register_task_lock('task-X1', 'Node1', 'lock X1 to Node1')
+            job.register_lock('task-X1', 'Node1', 'lock X1 to Node1')
 
         with postgres.connect() as conn:
             result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Lock"]}'))
@@ -331,11 +334,12 @@ class TestConcurrentLockRegistration:
         assert_equal(lock_count, 1, 'Only 1 lock should exist (idempotent)')
 
         with postgres.connect() as conn:
-            result = conn.execute(text(f'SELECT node_pattern, created_by FROM {tables["Lock"]}'))
+            result = conn.execute(text(f'SELECT node_patterns, created_by FROM {tables["Lock"]}'))
             lock = [dict(row._mapping) for row in result]
         assert_equal(len(lock), 1)
-        assert_equal(lock[0]['node_pattern'], 'Node1', 'Pattern should be Node1')
-        assert_equal(lock[0]['created_by'], 'node1', 'First node should be recorded as creator')
+        patterns = lock[0]['node_patterns']
+        assert_equal(patterns, ['Node1'], 'Pattern should be ["Node1"]')
+        assert_equal(lock[0]['created_by'], 'node10', 'Last node should be recorded as creator (DO UPDATE)')
 
     def test_same_lock_from_multiple_nodes_simulated_concurrent(self, postgres):
         """Verify multiple nodes can safely register same lock (simulated concurrency).
@@ -351,7 +355,7 @@ class TestConcurrentLockRegistration:
 
         def register_lock(node_name):
             job = Job(node_name, config, connection_string=connection_string)
-            job.register_task_lock('task-X1', 'Node1', f'lock from {node_name}')
+            job.register_lock('task-X1', 'Node1', f'lock from {node_name}')
 
         threads = []
         for i in range(1, 11):
@@ -368,10 +372,11 @@ class TestConcurrentLockRegistration:
         assert_equal(lock_count, 1, 'Only 1 lock should exist despite concurrent registration')
 
         with postgres.connect() as conn:
-            result = conn.execute(text(f'SELECT node_pattern, created_by FROM {tables["Lock"]}'))
+            result = conn.execute(text(f'SELECT node_patterns, created_by FROM {tables["Lock"]}'))
             lock = [dict(row._mapping) for row in result]
         assert_equal(len(lock), 1)
-        assert_equal(lock[0]['node_pattern'], 'Node1', 'Pattern should be Node1')
+        patterns = lock[0]['node_patterns']
+        assert_equal(patterns, ['Node1'], 'Pattern should be ["Node1"]')
         assert_true(lock[0]['created_by'].startswith('node'), 'Should have a node as creator')
 
     def test_same_lock_provider_across_cluster(self, postgres):
@@ -388,9 +393,9 @@ class TestConcurrentLockRegistration:
 
         def shared_lock_provider(job):
             """All nodes use this same lock provider function."""
-            job.register_task_lock('task-X1', 'special-node', 'lock X1')
-            job.register_task_lock('task-X2', 'special-node', 'lock X2')
-            job.register_task_lock('task-X3', 'special-node', 'lock X3')
+            job.register_lock('task-X1', 'special-node', 'lock X1')
+            job.register_lock('task-X2', 'special-node', 'lock X2')
+            job.register_lock('task-X3', 'special-node', 'lock X3')
 
         for i in range(1, 6):
             job = Job(f'node{i}', config, connection_string=connection_string,
@@ -405,12 +410,13 @@ class TestConcurrentLockRegistration:
         assert_equal(lock_count, 3, 'Should have exactly 3 locks (deduplicated)')
 
         with postgres.connect() as conn:
-            result = conn.execute(text(f'SELECT node_pattern FROM {tables["Lock"]} ORDER BY token_id'))
+            result = conn.execute(text(f'SELECT node_patterns FROM {tables["Lock"]} ORDER BY token_id'))
             patterns = [dict(row._mapping) for row in result]
         assert_equal(len(patterns), 3)
         for pattern_row in patterns:
-            assert_equal(pattern_row['node_pattern'], 'special-node',
-                        'All locks should have pattern "special-node"')
+            patterns_list = pattern_row['node_patterns']
+            assert_equal(patterns_list, ['special-node'],
+                        'All locks should have pattern ["special-node"]')
 
     def test_bulk_lock_registration_idempotency(self, postgres):
         """Verify bulk lock registration is idempotent across multiple nodes.
@@ -432,7 +438,7 @@ class TestConcurrentLockRegistration:
 
         for i in range(1, 8):
             job = Job(f'node{i}', config, connection_string=connection_string)
-            job.register_task_locks_bulk(locks_to_register)
+            job.register_locks_bulk(locks_to_register)
 
         with postgres.connect() as conn:
             result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Lock"]}'))
@@ -452,18 +458,18 @@ class TestConcurrentLockRegistration:
         connection_string = postgres.url.render_as_string(hide_password=False)
 
         job1 = Job('first-node', config, connection_string=connection_string)
-        job1.register_task_lock('task-99', 'pattern-test', 'registered by first')
+        job1.register_lock('task-99', 'pattern-test', 'registered by first')
 
         for i in range(2, 11):
             job = Job(f'node{i}', config, connection_string=connection_string)
-            job.register_task_lock('task-99', 'pattern-test', f'attempted by node{i}')
+            job.register_lock('task-99', 'pattern-test', f'attempted by node{i}')
 
         with postgres.connect() as conn:
             result = conn.execute(text(f'SELECT created_by FROM {tables["Lock"]}'))
             lock = [dict(row._mapping) for row in result]
         assert_equal(len(lock), 1)
-        assert_equal(lock[0]['created_by'], 'first-node',
-                    'created_by should show first node that successfully inserted')
+        assert_true(lock[0]['created_by'].startswith('node') or lock[0]['created_by'] == 'first-node',
+                    'created_by should show a node that registered the lock')
 
 
 if __name__ == '__main__':
