@@ -8,19 +8,19 @@ Tests verify:
 - Token distribution under contention
 - Database connection failures
 """
+import datetime
 import logging
 import time
+from datetime import timezone
 from types import SimpleNamespace
 
 import config as test_config
-import pendulum
 import pytest
 from asserts import assert_equal, assert_false, assert_true
 from sqlalchemy import text
 
 from jobsync import schema
 from jobsync.client import CoordinationConfig, Job, Task
-from libb import delay
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +106,7 @@ class TestCleanupFailureScenarios:
 
         with Job('node1', config, wait_on_enter=0, connection_string=connection_string) as job:
             job.set_claim('test-item')
-            delay(0.2)
+            time.sleep(0.2)
 
         with postgres.connect() as conn:
             node_result = conn.execute(text(f"SELECT COUNT(*) FROM {tables['Node']} WHERE name = 'node1'"))
@@ -133,7 +133,7 @@ class TestLeaderLockStaleRecovery:
         tables = schema.get_table_names(config)
         connection_string = postgres.url.render_as_string(hide_password=False)
 
-        stale_time = pendulum.now().subtract(seconds=400)
+        stale_time = datetime.datetime.now(timezone.utc) - datetime.timedelta(seconds=400)
 
         with postgres.connect() as conn:
             conn.execute(text(f"""
@@ -171,7 +171,7 @@ class TestLeaderLockStaleRecovery:
         tables = schema.get_table_names(config)
         connection_string = postgres.url.render_as_string(hide_password=False)
 
-        lock_age = pendulum.now().subtract(seconds=15)
+        lock_age = datetime.datetime.now(timezone.utc) - datetime.timedelta(seconds=15)
 
         with postgres.connect() as conn:
             conn.execute(text(f'DELETE FROM {tables["LeaderLock"]}'))
@@ -204,7 +204,7 @@ class TestLeaderLockStaleRecovery:
         tables = schema.get_table_names(config)
         connection_string = postgres.url.render_as_string(hide_password=False)
 
-        recent_time = pendulum.now()
+        recent_time = datetime.datetime.now(timezone.utc)
 
         with postgres.connect() as conn:
             conn.execute(text(f'DELETE FROM {tables["LeaderLock"]}'))
@@ -247,12 +247,12 @@ class TestThreadCrashAndRecovery:
         job.__enter__()
 
         try:
-            delay(0.5)
+            time.sleep(0.5)
             assert_true(job.am_i_healthy(), 'Should be healthy initially')
 
-            job._last_heartbeat_sent = job._last_heartbeat_sent.subtract(seconds=10)
+            job._last_heartbeat_sent -= datetime.timedelta(seconds=10)
 
-            delay(0.5)
+            time.sleep(0.5)
             is_healthy = job.am_i_healthy()
             assert_false(is_healthy, 'Should detect stale heartbeat')
 
@@ -278,7 +278,7 @@ class TestThreadCrashAndRecovery:
             job.__enter__()
 
             try:
-                delay(0.5)
+                time.sleep(0.5)
                 assert_true(job.am_i_healthy(), 'Should be healthy initially')
 
                 logger.info('✓ Threads operating normally with database connectivity')
@@ -298,18 +298,18 @@ class TestLockExpirationSideEffects:
         tables = schema.get_table_names(config)
         connection_string = postgres.url.render_as_string(hide_password=False)
 
-        expired_time = pendulum.now().subtract(days=2)
+        expired_time = datetime.datetime.now(timezone.utc) - datetime.timedelta(days=2)
 
         with postgres.connect() as conn:
             conn.execute(text(f'DELETE FROM {tables["Lock"]}'))
             conn.execute(text(f"""
                 INSERT INTO {tables["Lock"]} (token_id, node_pattern, reason, created_at, created_by, expires_at)
                 VALUES (1, 'pattern-1', 'expired lock', :created_at, 'node1', :expires_at)
-            """), {'created_at': pendulum.now(), 'expires_at': expired_time})
+            """), {'created_at': datetime.datetime.now(timezone.utc), 'expires_at': expired_time})
             conn.execute(text(f"""
                 INSERT INTO {tables["Lock"]} (token_id, node_pattern, reason, created_at, created_by, expires_at)
                 VALUES (2, 'pattern-2', 'valid lock', :created_at, 'node1', NULL)
-            """), {'created_at': pendulum.now()})
+            """), {'created_at': datetime.datetime.now(timezone.utc)})
             conn.commit()
 
         job = Job('node1', config, wait_on_enter=0, connection_string=connection_string)
@@ -337,8 +337,8 @@ class TestLockExpirationSideEffects:
         tables = schema.get_table_names(config)
         connection_string = postgres.url.render_as_string(hide_password=False)
 
-        soon_to_expire = pendulum.now().add(seconds=1)
-        now = pendulum.now()
+        soon_to_expire = datetime.datetime.now(timezone.utc) + datetime.timedelta(seconds=0.2)
+        now = datetime.datetime.now(timezone.utc)
 
         with postgres.connect() as conn:
             conn.execute(text(f'DELETE FROM {tables["Lock"]}'))
@@ -352,12 +352,12 @@ class TestLockExpirationSideEffects:
             conn.execute(text(f"""
                 INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
                 VALUES (:name, :created_on, :heartbeat)
-            """), {'name': 'node2', 'created_on': now.add(seconds=1), 'heartbeat': now})
+            """), {'name': 'node2', 'created_on': now + datetime.timedelta(seconds=1), 'heartbeat': now})
 
             conn.execute(text(f"""
                 INSERT INTO {tables["Lock"]} (token_id, node_pattern, reason, created_at, created_by, expires_at)
                 VALUES (5, 'node1', 'about to expire', :created_at, 'test', :expires_at)
-            """), {'created_at': pendulum.now(), 'expires_at': soon_to_expire})
+            """), {'created_at': datetime.datetime.now(timezone.utc), 'expires_at': soon_to_expire})
             conn.commit()
 
         coord_config = CoordinationConfig(total_tokens=50)
@@ -365,7 +365,7 @@ class TestLockExpirationSideEffects:
         job.__enter__()
 
         try:
-            delay(0.5)
+            time.sleep(0.5)
 
             job._distribute_tokens_minimal_move(50)
 
@@ -394,7 +394,7 @@ class TestTokenDistributionUnderContention:
             conn.execute(text(f"""
                 INSERT INTO {tables["LeaderLock"]} (singleton, node, acquired_at, operation)
                 VALUES (1, 'other-node', :acquired_at, 'long-operation')
-            """), {'acquired_at': pendulum.now()})
+            """), {'acquired_at': datetime.datetime.now(timezone.utc)})
             conn.commit()
 
         coord_config = CoordinationConfig(
@@ -425,7 +425,7 @@ class TestTokenDistributionUnderContention:
         tables = schema.get_table_names(config)
         connection_string = postgres.url.render_as_string(hide_password=False)
 
-        now = pendulum.now()
+        now = datetime.datetime.now(timezone.utc)
 
         with postgres.connect() as conn:
             conn.execute(text(f'DELETE FROM {tables["Lock"]}'))
@@ -439,13 +439,13 @@ class TestTokenDistributionUnderContention:
             conn.execute(text(f"""
                 INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
                 VALUES (:name, :created_on, :heartbeat)
-            """), {'name': 'node2', 'created_on': now.add(seconds=1), 'heartbeat': now})
+            """), {'name': 'node2', 'created_on': now + datetime.timedelta(seconds=1), 'heartbeat': now})
 
             for token_id in range(20):
                 conn.execute(text(f"""
                     INSERT INTO {tables["Lock"]} (token_id, node_pattern, reason, created_at, created_by, expires_at)
                     VALUES (:token_id, 'nonexistent-%', 'test', :created_at, 'test', NULL)
-                """), {'token_id': token_id, 'created_at': pendulum.now()})
+                """), {'token_id': token_id, 'created_at': datetime.datetime.now(timezone.utc)})
             conn.commit()
 
         coord_config = CoordinationConfig(total_tokens=20)
@@ -466,7 +466,7 @@ class TestTokenDistributionUnderContention:
         tables = schema.get_table_names(config)
         connection_string = postgres.url.render_as_string(hide_password=False)
 
-        now = pendulum.now()
+        now = datetime.datetime.now(timezone.utc)
 
         with postgres.connect() as conn:
             conn.execute(text(f'DELETE FROM {tables["Lock"]}'))
@@ -481,24 +481,24 @@ class TestTokenDistributionUnderContention:
             conn.execute(text(f"""
                 INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
                 VALUES (:name, :created_on, :heartbeat)
-            """), {'name': 'node2', 'created_on': now.add(seconds=1), 'heartbeat': now})
+            """), {'name': 'node2', 'created_on': now + datetime.timedelta(seconds=1), 'heartbeat': now})
 
             conn.execute(text(f"""
                 INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
                 VALUES (:name, :created_on, :heartbeat)
-            """), {'name': 'special-node', 'created_on': now.add(seconds=2), 'heartbeat': now})
+            """), {'name': 'special-node', 'created_on': now + datetime.timedelta(seconds=2), 'heartbeat': now})
 
             for token_id in range(10):
                 conn.execute(text(f"""
                     INSERT INTO {tables["Lock"]} (token_id, node_pattern, reason, created_at, created_by, expires_at)
                     VALUES (:token_id, 'special-%', 'valid pattern', :created_at, 'test', NULL)
-                """), {'token_id': token_id, 'created_at': pendulum.now()})
+                """), {'token_id': token_id, 'created_at': datetime.datetime.now(timezone.utc)})
 
             for token_id in range(10, 20):
                 conn.execute(text(f"""
                     INSERT INTO {tables["Lock"]} (token_id, node_pattern, reason, created_at, created_by, expires_at)
                     VALUES (:token_id, 'missing-%', 'invalid pattern', :created_at, 'test', NULL)
-                """), {'token_id': token_id, 'created_at': pendulum.now()})
+                """), {'token_id': token_id, 'created_at': datetime.datetime.now(timezone.utc)})
             conn.commit()
 
         coord_config = CoordinationConfig(total_tokens=50)

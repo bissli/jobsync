@@ -2,20 +2,19 @@
 
 Tests each coordination component in isolation.
 """
+import datetime
 import logging
 import time
-from datetime import timedelta
+from datetime import timedelta, timezone
 from types import SimpleNamespace
 
 import config as test_config
-import pendulum
 import pytest
 from asserts import assert_equal, assert_true
 from sqlalchemy import text
 
 from jobsync import schema
 from jobsync.client import CoordinationConfig, Job, Task
-from libb import delay
 
 logger = logging.getLogger(__name__)
 
@@ -146,7 +145,7 @@ class TestLeaderElection:
         config = get_unit_test_config()
         tables = schema.get_table_names(config)
 
-        base_time = pendulum.now()
+        base_time = datetime.datetime.now(timezone.utc)
         with postgres.connect() as conn:
             conn.execute(text(f"""
                 INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
@@ -174,7 +173,7 @@ class TestLeaderElection:
         config = get_unit_test_config()
         tables = schema.get_table_names(config)
 
-        same_time = pendulum.now()
+        same_time = datetime.datetime.now(timezone.utc)
         with postgres.connect() as conn:
             for name in ['node-c', 'node-a', 'node-b']:
                 conn.execute(text(f"""
@@ -193,7 +192,7 @@ class TestLeaderElection:
         config = get_unit_test_config()
         tables = schema.get_table_names(config)
 
-        current_time = pendulum.now()
+        current_time = datetime.datetime.now(timezone.utc)
         stale_time = current_time - timedelta(seconds=30)
 
         with postgres.connect() as conn:
@@ -222,7 +221,7 @@ class TestTokenDistribution:
         config = get_unit_test_config()
         tables = schema.get_table_names(config)
 
-        current = pendulum.now()
+        current = datetime.datetime.now(timezone.utc)
         with postgres.connect() as conn:
             for i in range(1, 4):
                 conn.execute(text(f"""
@@ -257,7 +256,7 @@ class TestTokenDistribution:
             conn.execute(text(f'DELETE FROM {tables["Node"]}'))
             conn.commit()
 
-        current = pendulum.now()
+        current = datetime.datetime.now(timezone.utc)
         with postgres.connect() as conn:
             for name in ['node1', 'node2', 'special-alpha']:
                 conn.execute(text(f"""
@@ -305,9 +304,9 @@ class TestTokenDistribution:
             print(f'  {row["node"]}: {row["cnt"]} tokens')
 
         node_counts = {row['node']: row['cnt'] for row in all_tokens}
-        for node in ['node1', 'node2', 'special-alpha']:
-            assert_true(node in node_counts and node_counts[node] > 0,
-                       f'{node} should have some tokens')
+        for node_name in ['node1', 'node2', 'special-alpha']:
+            assert_true(node_name in node_counts and node_counts[node_name] > 0,
+                       f'{node_name} should have some tokens')
 
         assert_true(node_counts['special-alpha'] >= 10,
                    'special-alpha should have at least the 10 locked tokens')
@@ -453,7 +452,7 @@ class TestThreadShutdown:
         node = Job('node1', config, wait_on_enter=5, connection_string=postgres.url.render_as_string(hide_password=False))
         node.__enter__()
 
-        delay(2)
+        time.sleep(2)
 
         start = time.time()
         node.__exit__(None, None, None)
@@ -469,7 +468,7 @@ class TestThreadShutdown:
 
         node = Job('node1', config, wait_on_enter=5, connection_string=postgres.url.render_as_string(hide_password=False))
         node.__enter__()
-        delay(1)
+        time.sleep(1)
 
         assert_true(node._heartbeat_thread.is_alive(), 'Heartbeat thread should be running')
         assert_true(node._health_thread.is_alive(), 'Health thread should be running')
@@ -498,13 +497,13 @@ class TestThreadShutdown:
             conn.execute(text(f"""
                 INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
                 VALUES (:name, :created_on, :heartbeat)
-            """), {'name': 'node1', 'created_on': pendulum.now(), 'heartbeat': pendulum.now()})
+            """), {'name': 'node1', 'created_on': datetime.datetime.now(timezone.utc), 'heartbeat': datetime.datetime.now(timezone.utc)})
             conn.commit()
 
         node = Job('node1', config, wait_on_enter=5, connection_string=postgres.url.render_as_string(hide_password=False))
         node.__enter__()
 
-        delay(2)
+        time.sleep(2)
 
         assert_true(node._monitor_thread is not None, 'Leader should have monitor thread')
         assert_true(node._rebalance_thread is not None, 'Leader should have rebalance thread')
@@ -530,7 +529,7 @@ class TestThreadShutdown:
         with caplog.at_level(logging.WARNING):
             node = Job('node1', config, wait_on_enter=5, connection_string=postgres.url.render_as_string(hide_password=False))
             node.__enter__()
-            delay(1)
+            time.sleep(1)
             node.__exit__(None, None, None)
 
         warning_messages = [record.message for record in caplog.records if record.levelname == 'WARNING']
@@ -553,7 +552,7 @@ class TestThreadShutdown:
         node = Job('node1', config, wait_on_enter=5, connection_string=postgres.url.render_as_string(hide_password=False))
         node.__enter__()
 
-        delay(1)
+        time.sleep(1)
 
         start = time.time()
         node.__exit__(None, None, None)

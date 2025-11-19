@@ -202,17 +202,17 @@ coord_config = CoordinationConfig(
 # Alternative: Configure via config module
 # In your config.py:
 import os
-from libb import Setting
+from types import SimpleNamespace
 
-Setting.unlock()
-
-sync = Setting()
-sync.coordination.enabled = True
-sync.coordination.total_tokens = 5000
-sync.coordination.heartbeat_interval_sec = 10
-sync.coordination.heartbeat_timeout_sec = 30
-
-Setting.lock()
+sync = SimpleNamespace(
+    coordination=SimpleNamespace(
+        enabled=True,
+        total_tokens=5000,
+        heartbeat_interval_sec=10,
+        heartbeat_timeout_sec=30,
+        # ... other settings
+    )
+)
 
 # Then use without coordination_config parameter:
 with Job(

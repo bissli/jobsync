@@ -18,7 +18,6 @@ from asserts import assert_equal, assert_true
 
 from jobsync import schema
 from jobsync.client import Job
-from libb import delay
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +114,7 @@ class TestBasicCallbackInvocation:
         with Job('node1', config, wait_on_enter=10, connection_string=connection_string,
                 on_tokens_added=tracker.on_tokens_added) as job:
             # Wait for startup to complete
-            delay(2)
+            time.sleep(2)
 
             assert_true(len(tracker.added_calls) > 0, 'on_tokens_added should be called')
             assert_true(len(tracker.get_total_added()) > 0, 'Should have received tokens')
@@ -135,7 +134,7 @@ class TestBasicCallbackInvocation:
         with Job('node1', config, wait_on_enter=10, connection_string=connection_string,
                 on_tokens_added=tracker.on_tokens_added,
                 on_tokens_removed=tracker.on_tokens_removed) as job:
-            delay(2)
+            time.sleep(2)
 
             assert_true(len(tracker.added_calls) > 0, 'on_tokens_added should be called')
             # on_tokens_removed not called yet (no rebalancing)
@@ -153,7 +152,7 @@ class TestBasicCallbackInvocation:
         with Job('node1', config, wait_on_enter=0, connection_string=connection_string,
                 on_tokens_added=tracker.on_tokens_added,
                 on_tokens_removed=tracker.on_tokens_removed) as job:
-            delay(1)
+            time.sleep(1)
 
             assert_equal(len(tracker.added_calls), 0, 'Callbacks should not fire when coordination disabled')
             assert_equal(len(tracker.removed_calls), 0, 'Callbacks should not fire when coordination disabled')
@@ -178,7 +177,7 @@ class TestCallbackTiming:
         job1.__enter__()
 
         try:
-            delay(5)
+            time.sleep(5)
             initial_tokens = job1.my_tokens.copy()
             tracker.reset()
 
@@ -188,7 +187,7 @@ class TestCallbackTiming:
 
             try:
                 # Wait for rebalancing to complete
-                delay(15)
+                time.sleep(15)
 
                 if len(tracker.call_order) > 0:
                     # If callbacks were invoked, verify order
@@ -227,7 +226,7 @@ class TestCallbackTiming:
 
         with Job('node1', config, wait_on_enter=10, connection_string=connection_string,
                 on_tokens_added=track_thread_on_added) as job:
-            delay(2)
+            time.sleep(2)
 
             assert_true(callback_thread_id is not None, 'Callback should have been invoked')
             assert_true(callback_thread_id != main_thread_id,
@@ -248,7 +247,7 @@ class TestCallbackExceptionHandling:
 
         with Job('node1', config, wait_on_enter=10, connection_string=connection_string,
                 on_tokens_added=failing_callback) as job:
-            delay(2)
+            time.sleep(2)
 
             # Job should still function despite callback failure
             assert_true(job.am_i_healthy(), 'Node should be healthy despite callback exception')
@@ -271,14 +270,14 @@ class TestCallbackExceptionHandling:
         job1.__enter__()
 
         try:
-            delay(5)
+            time.sleep(5)
 
             # Start second node to trigger rebalancing
             job2 = Job('node2', config, wait_on_enter=10, connection_string=connection_string)
             job2.__enter__()
 
             try:
-                delay(15)
+                time.sleep(15)
 
                 # Despite on_tokens_removed failing, coordination should continue
                 assert_true(job1.am_i_healthy(), 'Node1 should be healthy')
@@ -306,7 +305,7 @@ class TestCallbackExceptionHandling:
 
         with Job('node1', config, wait_on_enter=10, connection_string=connection_string,
                 on_tokens_added=partially_failing_callback) as job:
-            delay(2)
+            time.sleep(2)
 
             # Note: Our current implementation calls callback once with all tokens,
             # so if exception is raised, no tokens get processed
@@ -331,7 +330,7 @@ class TestCallbackCorrectness:
 
         with Job('node1', config, wait_on_enter=10, connection_string=connection_string,
                 on_tokens_added=capture_tokens) as job:
-            delay(2)
+            time.sleep(2)
 
             assert_true(received_tokens is not None, 'Callback should have been called')
             assert_equal(received_tokens, job.my_tokens, 'Callback tokens should match job ownership')
@@ -350,7 +349,7 @@ class TestCallbackCorrectness:
         job1.__enter__()
 
         try:
-            delay(5)
+            time.sleep(5)
             initial_tokens = job1.my_tokens.copy()
             tracker.reset()
 
@@ -359,7 +358,7 @@ class TestCallbackCorrectness:
             job2.__enter__()
 
             try:
-                delay(15)
+                time.sleep(15)
 
                 final_tokens = job1.my_tokens
 
@@ -407,14 +406,14 @@ class TestCallbackCorrectness:
         job1.__enter__()
 
         try:
-            delay(5)
+            time.sleep(5)
 
             # Trigger rebalance
             job2 = Job('node2', config, wait_on_enter=10, connection_string=connection_string)
             job2.__enter__()
 
             try:
-                delay(15)
+                time.sleep(15)
 
                 # Check that no token appears in both added and removed in same cycle
                 with lock:
@@ -455,10 +454,10 @@ class TestCallbackPerformance:
 
         with Job('node1', config, wait_on_enter=10, connection_string=connection_string,
                 on_tokens_added=slow_callback) as job:
-            delay(2)
+            time.sleep(2)
 
             # Despite slow callback, heartbeat should continue
-            delay(5)
+            time.sleep(5)
             assert_true(job.am_i_healthy(), 'Node should remain healthy with slow callback')
 
     def test_callback_timing_logged(self, postgres, caplog):
@@ -474,7 +473,7 @@ class TestCallbackPerformance:
 
         with caplog.at_level(logging.INFO), Job('node1', config, wait_on_enter=10, connection_string=connection_string,
                 on_tokens_added=tracked_callback) as job:
-            delay(2)
+            time.sleep(2)
 
         timing_messages = [record.message for record in caplog.records
                           if 'completed in' in record.message and 'ms' in record.message]
@@ -513,7 +512,7 @@ class TestCallbackIntegrationScenarios:
         job1.__enter__()
 
         try:
-            delay(5)
+            time.sleep(5)
 
             initial_count = len(active_subscriptions)
             assert_true(initial_count > 0, 'Should have active subscriptions')
@@ -523,7 +522,7 @@ class TestCallbackIntegrationScenarios:
             job2.__enter__()
 
             try:
-                delay(15)
+                time.sleep(15)
 
                 # Active subscriptions should match current token ownership
                 with lock:
@@ -560,7 +559,7 @@ class TestCallbackIntegrationScenarios:
         job1.__enter__()
 
         try:
-            delay(5)
+            time.sleep(5)
             initial_events = len(resource_events)
 
             # Trigger rebalance
@@ -568,7 +567,7 @@ class TestCallbackIntegrationScenarios:
             job2.__enter__()
 
             try:
-                delay(15)
+                time.sleep(15)
 
                 # Verify stop events precede start events for same rebalance
                 with lock:

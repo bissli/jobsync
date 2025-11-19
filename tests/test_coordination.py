@@ -12,6 +12,8 @@ These tests verify:
 import logging
 import multiprocessing
 import threading
+import time
+from datetime import timedelta
 from types import SimpleNamespace
 
 import config as test_config
@@ -21,7 +23,6 @@ from sqlalchemy import create_engine, text
 
 from jobsync import schema
 from jobsync.client import Job, Task
-from libb import delay
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +114,7 @@ def test_3node_cluster_formation(postgres):
         t = threading.Thread(target=enter_node, args=(node,))
         t.start()
         threads.append(t)
-        delay(0.1)  # Stagger slightly to ensure predictable registration order
+        time.sleep(0.1)  # Stagger slightly to ensure predictable registration order
 
     # Wait for all nodes to complete their __enter__() blocking period
     for t in threads:
@@ -121,11 +122,11 @@ def test_3node_cluster_formation(postgres):
 
     try:
         # Wait for final coordination to complete
-        delay(5)
+        time.sleep(5)
 
         # Verify all nodes registered
         active_nodes = nodes[0].get_active_nodes()
-        print(f'Active nodes: {[n.name for n in active_nodes]}')
+        print(f'Active nodes: {[n["name"] for n in active_nodes]}')
         assert_equal(len(active_nodes), 3, 'All 3 nodes should be active')
 
         # Verify leader elected (should be node1 - oldest)
@@ -233,7 +234,7 @@ def test_node_death_and_rebalancing(postgres):
         nodes.append(node)
 
     try:
-        delay(5)
+        time.sleep(5)
 
         # Record initial token distribution
         initial_tokens = {node.node_name: len(node._my_tokens) for node in nodes}
@@ -245,7 +246,7 @@ def test_node_death_and_rebalancing(postgres):
         nodes[1].__exit__(None, None, None)
 
         # Wait for dead node detection (timeout + check interval)
-        delay(12)
+        time.sleep(12)
 
         # Remaining nodes should detect node2 as dead
         dead_nodes = nodes[0].get_dead_nodes()
@@ -253,7 +254,7 @@ def test_node_death_and_rebalancing(postgres):
         # Note: node2 might still be in the table if leader hasn't cleaned up yet
 
         # Wait a bit more for rebalancing
-        delay(10)
+        time.sleep(10)
 
         # Check that node1 and node3 have more tokens now
         for node in [nodes[0], nodes[2]]:
@@ -306,7 +307,7 @@ def test_lock_registration_and_enforcement(postgres):
     special.__enter__()
 
     try:
-        delay(5)
+        time.sleep(5)
 
         locked_token_owners = {}
         for task_id in range(10):
@@ -354,12 +355,11 @@ def test_health_monitoring(postgres):
 
     try:
         # Initially should be healthy
-        delay(3)
+        time.sleep(3)
         assert_true(node.am_i_healthy(), 'Node should be healthy initially')
         print(f'✓ Node is healthy (heartbeat age: {(node._last_heartbeat_sent)})')
 
         # Simulate heartbeat thread failure by stopping it
-        from datetime import timedelta
         node._heartbeat_thread = None
         node._last_heartbeat_sent -= timedelta(seconds=20)
 
@@ -387,10 +387,10 @@ def test_leader_failover(postgres):
         node = Job(f'node{i}', config, wait_on_enter=15, connection_string=connection_string)
         node.__enter__()
         nodes.append(node)
-        delay(1)
+        time.sleep(1)
 
     try:
-        delay(5)
+        time.sleep(5)
 
         # Verify node1 is leader
         leader = nodes[0]._elect_leader()
@@ -403,7 +403,7 @@ def test_leader_failover(postgres):
         nodes[0].__exit__(None, None, None)
 
         # Wait for timeout + detection
-        delay(12)
+        time.sleep(12)
 
         # New leader should be elected (node2 - now oldest)
         new_leader = nodes[1]._elect_leader()
@@ -446,13 +446,13 @@ def test_node_rejoin_restores_original_allocation(postgres):
         t = threading.Thread(target=enter_node, args=(node,))
         t.start()
         threads.append(t)
-        delay(0.1)
+        time.sleep(0.1)
 
     for t in threads:
         t.join()
 
     try:
-        delay(5)
+        time.sleep(5)
 
         # Record initial token allocations
         original_tokens = {}
@@ -472,7 +472,7 @@ def test_node_rejoin_restores_original_allocation(postgres):
         nodeD.__exit__(None, None, None)
 
         # Wait for dead node detection and rebalancing
-        delay(15)
+        time.sleep(15)
 
         # Verify nodeD's tokens were redistributed to A, B, C
         print('Verifying redistribution after nodeD death:')
@@ -490,7 +490,7 @@ def test_node_rejoin_restores_original_allocation(postgres):
         nodes[3] = nodeD_rejoined
 
         # Wait for rebalancing to complete
-        delay(15)
+        time.sleep(15)
 
         # Phase 4: Verify original allocations are restored
         print('\nPhase 4: Verifying original allocations restored:')

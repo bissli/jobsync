@@ -8,12 +8,9 @@ authors = ["bissli <bissli@xyz.com>"]
 python = "^3.10"
 
 more-itertools = "*"
-pendulum = "*"
 
 psycopg = { extras = ["binary"], version = "3.2.10" }
 sqlalchemy = "^2.0.0"
-
-libb-util = { git = "https://github.com/bissli/libb-util" }
 
 # == test
 asserts = { version = "*", optional = true }
