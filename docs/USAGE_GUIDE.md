@@ -40,7 +40,6 @@ def process_daily_tasks():
     """
     with Job(
         node_name='worker-01',
-        site='production',
         config=config,
         wait_on_enter=120  # Wait for cluster formation and token distribution
     ) as job:
@@ -75,7 +74,6 @@ def process_historical_date(date: datetime):
     """
     with Job(
         node_name='worker-01',
-        site='production',
         config=config,
         date=date,  # Process specific date
         wait_on_enter=120
@@ -130,7 +128,6 @@ def process_with_custom_config():
     
     with Job(
         node_name='worker-01',
-        site='production',
         config=config,
         wait_on_enter=180,
         coordination_config=coord_config
@@ -143,15 +140,15 @@ def process_with_custom_config():
 
 ```python
 def process_without_coordination():
-    """Run without coordination (legacy mode).
+    """Run without coordination.
     
-    All tasks are processed by this node.
+    All tasks are processed by this node without token-based filtering.
+    Useful for single-node deployments or during troubleshooting.
     """
     coord_config = CoordinationConfig(enabled=False)
     
     with Job(
         node_name='worker-01',
-        site='production',
         config=config,
         coordination_config=coord_config
     ) as job:
@@ -217,7 +214,6 @@ sync = SimpleNamespace(
 # Then use without coordination_config parameter:
 with Job(
     node_name='worker-01',
-    site='production',
     config=config  # Reads from config.sync.coordination
 ) as job:
     process_tasks(job)
@@ -310,7 +306,6 @@ def simple_callback_example():
     
     with Job(
         node_name='worker-01',
-        site='production',
         config=config,
         on_tokens_added=handle_tokens_added,
         on_tokens_removed=handle_tokens_removed
@@ -440,7 +435,6 @@ def run_websocket_worker():
         
         with Job(
             node_name='ws-worker-01',
-            site='production',
             config=config,
             on_tokens_added=manager.on_tokens_added,
             on_tokens_removed=manager.on_tokens_removed
@@ -561,7 +555,6 @@ def run_kafka_worker():
         
         with Job(
             node_name='kafka-worker-01',
-            site='production',
             config=config,
             on_tokens_added=manager.on_tokens_added,
             on_tokens_removed=manager.on_tokens_removed
@@ -668,7 +661,6 @@ def run_background_processor():
         
         with Job(
             node_name='processor-01',
-            site='production',
             config=config,
             on_tokens_added=processor.on_tokens_added,
             on_tokens_removed=processor.on_tokens_removed
@@ -740,7 +732,6 @@ def run_cached_processor():
         
         with Job(
             node_name='cached-worker-01',
-            site='production',
             config=config,
             on_tokens_added=cache.on_tokens_added,
             on_tokens_removed=cache.on_tokens_removed
@@ -760,7 +751,7 @@ def run_cached_processor():
 def token_ownership_helpers():
     """Demonstrate helper methods for working with token ownership.
     """
-    with Job('worker-01', 'production', config) as job:
+    with Job('worker-01', config) as job:
         # Get all task IDs currently owned by this node
         all_task_ids = ['task-1', 'task-2', 'task-3', ...]
         my_tasks = job.get_my_task_ids(all_task_ids)
@@ -918,7 +909,6 @@ def process_with_lock():
     
     with Job(
         node_name='worker-01',
-        site='production',
         config=config,
         lock_provider=register_locks  # Callback for lock registration
     ) as job:
@@ -958,7 +948,6 @@ def process_with_bulk_locks():
     
     with Job(
         node_name='worker-01',
-        site='production',
         config=config,
         lock_provider=register_locks
     ) as job:
@@ -1035,7 +1024,6 @@ def process_with_dynamic_locks():
     
     with Job(
         node_name='worker-01',
-        site='production',
         config=config,
         lock_provider=register_current_locks,
         clear_existing_locks=True  # Clear old locks before registering new ones
@@ -1060,7 +1048,6 @@ def process_with_static_locks():
     
     with Job(
         node_name='worker-east-01',
-        site='production',
         config=config,
         lock_provider=register_permanent_locks,
         clear_existing_locks=False  # Preserve existing locks (default)
@@ -1076,7 +1063,7 @@ def process_with_static_locks():
 def manage_locks_manually():
     """Use lock management APIs for operational control.
     """
-    with Job('worker-01', 'production', config) as job:
+    with Job('worker-01', config) as job:
         # List all current locks
         locks = job.list_locks()
         for lock in locks:
@@ -1142,7 +1129,6 @@ def production_lock_pattern():
     
     with Job(
         node_name='worker-01',
-        site='production',
         config=config,
         lock_provider=register_locks,
         clear_existing_locks=True  # Dynamic logic - clear on each run
@@ -1257,7 +1243,6 @@ def process_gpu_tasks():
     
     with Job(
         node_name='worker-gpu-01',  # GPU-enabled node
-        site='production',
         config=config,
         lock_provider=register_gpu_locks
     ) as job:
@@ -1279,7 +1264,6 @@ def simple_task_processing():
     """
     with Job(
         node_name='worker-01',
-        site='production',
         config=config,
         wait_on_enter=120
     ) as job:
@@ -1329,7 +1313,6 @@ def process_with_recovery():
     """
     with Job(
         node_name='worker-01',
-        site='production',
         config=config,
         wait_on_enter=120
     ) as job:
@@ -1384,7 +1367,6 @@ def process_idempotent_tasks():
     """
     with Job(
         node_name='worker-01',
-        site='production',
         config=config,
         wait_on_enter=120
     ) as job:
@@ -1402,7 +1384,6 @@ def process_in_batches():
     """
     with Job(
         node_name='worker-01',
-        site='production',
         config=config,
         wait_on_enter=120
     ) as job:
@@ -1437,7 +1418,6 @@ def continuous_processing():
     """
     with Job(
         node_name='worker-01',
-        site='production',
         config=config,
         wait_on_enter=120
     ) as job:
@@ -1513,7 +1493,6 @@ def main():
     
     with Job(
         node_name='worker-01',
-        site='production',
         config=config,
         wait_on_enter=120
     ) as job:
@@ -1553,7 +1532,6 @@ def process_with_health_logging():
     """
     with Job(
         node_name='worker-01',
-        site='production',
         config=config,
         wait_on_enter=120
     ) as job:
@@ -1569,37 +1547,30 @@ def process_with_health_logging():
         logger.info(f'Final health: {health}')
 ```
 
+
 ## Database Queries
 
-### Cluster State Queries
+### Overview
+
+This section provides SQL queries useful for debugging and development. For production monitoring and operations, see the [Operator Guide](OPERATOR_GUIDE.md#appendix-quick-reference-sql).
+
+**💡 TIP**: For a quick reference of the most common monitoring queries, see [Cheatsheet.sql](Cheatsheet.sql).
 
 **Note:** Replace `sync_` with your custom prefix if using `config.sync.sql.appname`.
 
-**Active Nodes:**
-```sql
-SELECT 
-    name,
-    created_on,
-    last_heartbeat,
-    NOW() - last_heartbeat as time_since_heartbeat,
-    CASE 
-        WHEN last_heartbeat > NOW() - INTERVAL '15 seconds' THEN 'ACTIVE'
-        ELSE 'DEAD'
-    END as status
-FROM sync_node
-ORDER BY created_on;
-```
+### Development Queries
 
-**Token Distribution:**
+**Token Distribution with Details:**
 ```sql
 SELECT 
     node,
     COUNT(*) as token_count,
     ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 1) as pct,
     MIN(token_id) as min_token,
-    MAX(token_id) as max_token
+    MAX(token_id) as max_token,
+    version
 FROM sync_token
-GROUP BY node
+GROUP BY node, version
 ORDER BY token_count DESC;
 ```
 
@@ -1619,21 +1590,9 @@ SELECT
 FROM stats;
 ```
 
-**Current Leader:**
-```sql
-SELECT 
-    name as leader_node,
-    created_on,
-    last_heartbeat
-FROM sync_node
-WHERE last_heartbeat > NOW() - INTERVAL '15 seconds'
-ORDER BY created_on
-LIMIT 1;
-```
+### Lock Queries (Development)
 
-### Lock Queries
-
-**View All Locks:**
+**View All Locks with Details:**
 ```sql
 SELECT 
     node_patterns,
@@ -1651,69 +1610,26 @@ GROUP BY node_patterns, reason, expires_at
 ORDER BY locked_token_count DESC;
 ```
 
-**Orphaned Locks (by dead creator node)**:
+**Locks with Token Assignments:**
 ```sql
-SELECT 
-    l.token_id,
-    l.node_pattern,
-    l.created_by,
-    l.reason,
-    l.created_at,
-    NOW() - l.created_at as orphaned_duration
-FROM sync_lock l
-LEFT JOIN sync_node n ON l.created_by = n.name
-WHERE n.name IS NULL  -- Creator node no longer exists
-   OR n.last_heartbeat < NOW() - INTERVAL '1 hour'  -- Creator dead
-ORDER BY l.created_at;
-```
-
-**Incorrectly Assigned Locks**:
-```sql
--- Locks assigned to nodes that don't match any pattern
--- Note: Checking JSONB array requires custom function or application logic
+-- Show locks and which nodes actually own the tokens
 SELECT 
     l.token_id,
     l.node_patterns,
     t.node as actual_node,
     l.reason,
-    l.created_by
+    l.created_by,
+    l.created_at
 FROM sync_lock l
 JOIN sync_token t ON l.token_id = t.token_id
 ORDER BY l.token_id;
--- Verify in application code that t.node matches at least one pattern
 ```
 
-### Rebalance History
+**Note:** For production monitoring and cleanup of orphaned locks, see [Operator Guide - Troubleshooting](OPERATOR_GUIDE.md#problem-orphaned-locks-from-decommissioned-nodes).
 
-**Recent Rebalances:**
-```sql
-SELECT 
-    triggered_at,
-    trigger_reason,
-    leader_node,
-    nodes_before,
-    nodes_after,
-    tokens_moved,
-    duration_ms
-FROM sync_rebalance
-ORDER BY triggered_at DESC
-LIMIT 10;
-```
+### Task Processing Queries (Development)
 
-**Rebalance Frequency:**
-```sql
-SELECT 
-    DATE_TRUNC('hour', triggered_at) as hour,
-    COUNT(*) as rebalance_count
-FROM sync_rebalance
-WHERE triggered_at > NOW() - INTERVAL '24 hours'
-GROUP BY hour
-ORDER BY hour DESC;
-```
-
-### Task Processing Queries
-
-**Tasks by Node:**
+**Tasks Claimed by Node:**
 ```sql
 SELECT 
     node,
@@ -1726,21 +1642,7 @@ GROUP BY node
 ORDER BY task_count DESC;
 ```
 
-**Incomplete Tasks:**
-```sql
-SELECT 
-    c.item,
-    c.node,
-    c.created_on,
-    NOW() - c.created_on as age
-FROM sync_claim c
-LEFT JOIN sync_audit a ON c.item = a.item AND a.date = CURRENT_DATE
-WHERE c.created_on::date = CURRENT_DATE
-AND a.item IS NULL
-ORDER BY c.created_on;
-```
-
-**Task Completion Rate:**
+**Task Completion Rate by Node:**
 ```sql
 WITH claimed AS (
     SELECT COUNT(DISTINCT item) as claimed_count
@@ -1762,44 +1664,13 @@ FROM claimed c, audited a;
 
 ### Maintenance Queries
 
-**Remove Stale Nodes:**
-```sql
--- Remove nodes with heartbeats older than 1 hour
-DELETE FROM sync_node 
-WHERE last_heartbeat < NOW() - INTERVAL '1 hour';
-```
+**Note:** For production database maintenance procedures, see [Operator Guide - Database Maintenance](OPERATOR_GUIDE.md#database-maintenance).
 
-**Clean Orphaned Tokens:**
+**Quick cleanup during development:**
 ```sql
--- Remove tokens assigned to non-existent nodes
-DELETE FROM sync_token 
-WHERE node NOT IN (SELECT name FROM sync_node);
-```
-
-**Clean Old Rebalance Records:**
-```sql
--- Keep last 30 days
-DELETE FROM sync_rebalance
-WHERE triggered_at < NOW() - INTERVAL '30 days';
-```
-
-**Clean Orphaned Locks:**
-```sql
--- Remove locks created by nodes that no longer exist
-DELETE FROM sync_lock
-WHERE created_by IN (
-    SELECT l.created_by
-    FROM sync_lock l
-    LEFT JOIN sync_node n ON l.created_by = n.name
-    WHERE n.name IS NULL
-);
-```
-
-**Clean Expired Locks:**
-```sql
--- Remove expired locks (normally done automatically)
-DELETE FROM sync_lock
-WHERE expires_at < NOW();
+-- Clean test data
+DELETE FROM sync_node WHERE name LIKE 'test-%';
+DELETE FROM sync_claim WHERE created_on < NOW() - INTERVAL '7 days';
 ```
 
 ## Best Practices
@@ -2015,7 +1886,7 @@ def process_with_fast_callbacks():
         # GOOD: Delegate to background thread
         threading.Thread(target=lambda: heavy_work(token_ids)).start()
     
-    with Job('worker-01', 'production', config,
+    with Job('worker-01', config,
              on_tokens_added=on_tokens_added) as job:
         process_tasks(job)
 ```
@@ -2034,7 +1905,6 @@ def process_with_dynamic_locks():
     
     with Job(
         node_name='worker-01',
-        site='production',
         config=config,
         lock_provider=register_locks,
         clear_existing_locks=True  # IMPORTANT: prevents stale lock accumulation
@@ -2064,7 +1934,7 @@ def monitor_callbacks():
         except Exception as e:
             logger.error(f'Callback failed: {e}')
     
-    with Job('worker-01', 'production', config,
+    with Job('worker-01', config,
              on_tokens_added=on_tokens_added) as job:
         process_tasks(job)
 ```
@@ -2084,7 +1954,6 @@ def test_coordination(config):
     
     with Job(
         node_name='staging-worker-01',
-        site='staging',
         config=config,
         coordination_config=coord_config
     ) as job:

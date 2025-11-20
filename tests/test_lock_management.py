@@ -6,7 +6,6 @@ import datetime
 import json
 import logging
 import threading
-from datetime import timedelta, timezone
 from types import SimpleNamespace
 
 import config as test_config
@@ -191,7 +190,7 @@ class TestLockListing:
         job.register_lock('task-1', 'pattern-1', 'not expired')
         job.register_lock('task-2', 'pattern-2', 'expires soon', expires_in_days=1)
 
-        expired_time = datetime.datetime.now(timezone.utc) - timedelta(days=2)
+        expired_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=2)
         with postgres.connect() as conn:
             conn.execute(text(f"""
                 INSERT INTO {tables["Lock"]} (token_id, node_patterns, reason, created_at, created_by, expires_at)
@@ -200,7 +199,7 @@ class TestLockListing:
                 'token_id': 999,
                 'patterns': json.dumps(['pattern-expired']),
                 'reason': 'already expired',
-                'created_at': datetime.datetime.now(timezone.utc),
+                'created_at': datetime.datetime.now(datetime.timezone.utc),
                 'created_by': 'node1',
                 'expires_at': expired_time
             })

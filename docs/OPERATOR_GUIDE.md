@@ -51,42 +51,20 @@
 
 **Steps**:
 
-1. **Verify database connectivity**:
+1. **Start first node** (tables will be created automatically):
 ```bash
-psql -U postgres -d jobsync -c "SELECT version();"
-```
-
-2. **Verify tables created** (tables are created automatically on first node startup):
-```sql
-SELECT tablename FROM pg_tables WHERE tablename LIKE 'sync_%';
--- Should see: sync_node, sync_token, sync_lock, sync_leader_lock,
---              sync_rebalance_lock, sync_rebalance
-```
-
-3. **Start first node** (tables will be created automatically):
-```bash
-export SYNC_COORDINATION_ENABLED=true
-export SYNC_TOTAL_TOKENS=10000
 python worker.py --node-name worker-01
 ```
 
    The first node will automatically create all required tables via `ensure_database_ready()`.
 
-4. **Verify tables were created**:
-```sql
-SELECT tablename FROM pg_tables WHERE tablename LIKE 'sync_%';
--- Should see: sync_node, sync_token, sync_lock, sync_leader_lock,
---              sync_rebalance_lock, sync_rebalance, sync_audit,
---              sync_claim, sync_checkpoint
-```
-
-5. **Verify first node registered**:
+2. **Verify first node registered**:
 ```sql
 SELECT * FROM sync_node;
 -- Should see worker-01 with recent last_heartbeat
 ```
 
-6. **Start additional nodes**:
+3. **Start additional nodes**:
 ```bash
 # Terminal 2
 python worker.py --node-name worker-02
@@ -95,7 +73,7 @@ python worker.py --node-name worker-02
 python worker.py --node-name worker-03
 ```
 
-7. **Verify token distribution**:
+4. **Verify token distribution**:
 ```sql
 SELECT node, COUNT(*) as token_count
 FROM sync_token
@@ -103,7 +81,7 @@ GROUP BY node;
 -- Should see balanced distribution
 ```
 
-8. **Monitor logs** for coordination activity:
+5. **Monitor logs** for coordination activity:
 ```
 INFO: worker-01 elected as leader
 INFO: Distributed 10000 tokens across 3 nodes
@@ -125,11 +103,7 @@ python worker_v2.py --node-name worker-v2-01 &
 python worker_v2.py --node-name worker-v2-02 &
 ```
 
-2. **Wait for new nodes to join cluster** (check logs or database):
-```sql
-SELECT name, last_heartbeat FROM sync_node
-WHERE name LIKE 'worker-v2%';
-```
+2. **Wait for new nodes to join cluster** (check logs or query `sync_node` table)
 
 3. **Verify token distribution updated**:
 ```sql
@@ -222,110 +196,79 @@ DELETE FROM sync_node WHERE name IN ('worker-04', 'worker-05');
 
 #### 1. Active Node Count
 
-**Query**:
-```sql
-SELECT COUNT(*) as active_nodes
-FROM sync_node
-WHERE last_heartbeat > NOW() - INTERVAL '15 seconds';
-```
-
 **Alert**: Active node count != expected cluster size
 
 **Action**: Investigate missing nodes (crashed, network issue, resource starvation)
 
-#### 2. Heartbeat Lag
+**Query**: See [Appendix: Quick Reference SQL](#appendix-quick-reference-sql)
 
-**Query**:
-```sql
-SELECT name,
-       EXTRACT(EPOCH FROM (NOW() - last_heartbeat)) as seconds_since_heartbeat
-FROM sync_node
-WHERE last_heartbeat > NOW() - INTERVAL '1 minute'
-ORDER BY last_heartbeat;
-```
+#### 2. Heartbeat Lag
 
 **Alert**: Any node with >10 seconds lag
 
 **Action**: Check node health, CPU, network connectivity
 
-#### 3. Token Distribution Balance
+**Query**: See [Appendix: Quick Reference SQL](#appendix-quick-reference-sql)
 
-**Query**:
-```sql
-SELECT node, COUNT(*) as tokens,
-       ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 2) as pct
-FROM sync_token
-GROUP BY node
-ORDER BY tokens DESC;
-```
+#### 3. Token Distribution Balance
 
 **Alert**: Any node with <10% or >50% of tokens (for >3 node cluster)
 
 **Action**: Check for locked tokens, verify rebalancing is working
 
-#### 4. Rebalance Frequency
+**Query**: See [Appendix: Quick Reference SQL](#appendix-quick-reference-sql)
 
-**Query**:
-```sql
-SELECT COUNT(*) as rebalances_last_hour
-FROM sync_rebalance
-WHERE triggered_at > NOW() - INTERVAL '1 hour';
-```
+#### 4. Rebalance Frequency
 
 **Alert**: >5 rebalances in 1 hour
 
 **Action**: Indicates cluster instability - check node crashes, network issues
 
-#### 5. Leader Stability
+**Query**: See [Appendix: Quick Reference SQL](#appendix-quick-reference-sql)
 
-**Query**:
-```sql
-SELECT name as current_leader
-FROM sync_node
-WHERE last_heartbeat > NOW() - INTERVAL '15 seconds'
-ORDER BY created_on, name
-LIMIT 1;
-```
+#### 5. Leader Stability
 
 **Alert**: Leader changed in last 5 minutes (check previous value)
 
 **Action**: Investigate why previous leader died
 
-#### 6. Locked Token Assignment
+**Query**: See [Appendix: Quick Reference SQL](#appendix-quick-reference-sql)
 
-**Query**:
-```sql
-SELECT l.node_patterns, COUNT(*) as locked_tokens,
-       STRING_AGG(DISTINCT t.node, ', ') as assigned_to
-FROM sync_lock l
-JOIN sync_token t ON l.token_id = t.token_id
-GROUP BY l.node_patterns;
-```
+#### 6. Locked Token Assignment
 
 **Alert**: Locked tokens assigned to node not matching any pattern
 
 **Action**: Manual intervention required - rebalance or fix lock patterns
 
+**Query**: See [Appendix: Quick Reference SQL](#appendix-quick-reference-sql)
+
 ### Recommended Dashboards
 
-#### Dashboard 1: Cluster Overview
+For production monitoring with alerting and historical analysis, integrate with your monitoring system:
+
+**Dashboard 1: Cluster Overview** (Grafana/Datadog/etc)
 
 - Active node count (gauge)
 - Token distribution (bar chart per node)
 - Current leader (text)
 - Rebalances in last 24h (line chart)
 
-#### Dashboard 2: Node Health
+**Dashboard 2: Node Health**
 
 - Per-node heartbeat age (gauge per node)
 - Per-node token count (gauge per node)
 - Per-node task claiming rate (line chart)
 
-#### Dashboard 3: Performance
+**Dashboard 3: Performance**
 
 - Token distribution time (histogram)
 - Rebalance trigger lag (time from death to rebalance)
 - Task claiming latency (can_claim_task duration)
+
+**Implementation Strategy:**
+
+1. Export metrics to Prometheus/Datadog for alerting and history
+2. Query database directly for custom reports and analysis
 
 ### Sample Prometheus Metrics
 
@@ -376,8 +319,8 @@ SELECT * FROM sync_lock;
 3. **Token version mismatch**: Node has stale token cache
 
 **Solutions**:
-1. Wait 30-60 seconds for rebalance
-2. Check lock patterns - may need to adjust or remove locks
+1. Wait 30-60 seconds for rebalance (watch status server or check SQL)
+2. Check lock patterns in status server or via `job.list_locks()`
 3. Restart node to refresh token cache
 4. Manually trigger rebalance by stopping/starting another node
 
@@ -523,10 +466,12 @@ GROUP BY node_patterns;
 
 **If due to locks** (intentional):
 - No action needed - locks are working as designed
+- Use SQL queries to review locks
 - Adjust lock patterns if imbalance is too severe
 
 **If due to recent changes**:
 - Wait for next rebalance cycle (30-60 seconds)
+- Monitor progress using SQL queries
 
 **If due to dead node**:
 ```sql
@@ -830,7 +775,7 @@ WHERE name = 'worker-01';
 
 ## Emergency Procedures
 
-### Emergency: All nodes claiming all tasks (coordination failure)
+### Emergency: Coordination system not working
 
 **Impact**: HIGH - Duplicate processing, data corruption
 
@@ -928,18 +873,25 @@ WHERE name = 'worker-01';
 
 ### Emergency: Disable coordination system
 
-**Impact**: LOW - Coordination disabled, all nodes claim all tasks (legacy behavior)
+**Impact**: LOW - Coordination disabled, all nodes claim all tasks
 
 **Steps**:
 
 1. **Stop all nodes**
 
 2. **Option A: Keep tables, just disable coordination**:
-   ```bash
-   export SYNC_COORDINATION_ENABLED=false
-   python worker.py --node-name worker-01
+   ```python
+   # In your worker code
+   from jobsync import CoordinationConfig
+   
+   coord_config = CoordinationConfig(enabled=False)
+   
+   with Job('worker-01', 'production', config, 
+            coordination_config=coord_config) as job:
+       # Node operates independently without coordination
+       process_tasks(job)
    ```
-   Tables remain but are not used. Nodes operate independently (legacy behavior).
+   Tables remain but are not used. Nodes operate independently without coordination.
 
 3. **Option B: Remove coordination tables** (if reverting permanently):
    ```sql
@@ -993,33 +945,6 @@ WHERE NOT EXISTS (
 DELETE FROM sync_lock
 WHERE token_id IN (...);
 -- Then trigger rebalance
-```
-
-### Backup and Restore
-
-**Backup coordination state**:
-```bash
-pg_dump -U postgres -d jobsync \
-  -t sync_node -t sync_token -t sync_lock \
-  -t sync_leader_lock -t sync_rebalance_lock -t sync_rebalance \
-  > coordination_backup.sql
-```
-
-**Restore** (stops cluster - only do during maintenance window):
-```bash
-# 1. Stop all nodes
-pkill -TERM -f worker.py
-
-# 2. Restore tables
-psql -U postgres -d jobsync < coordination_backup.sql
-
-# 3. Clear locks
-psql -U postgres -d jobsync <<EOF
-DELETE FROM sync_leader_lock;
-DELETE FROM sync_rebalance_lock;
-EOF
-
-# 4. Restart nodes
 ```
 
 ### Vacuum and Analyze
@@ -1126,29 +1051,102 @@ For issues not covered in this guide:
    - Relevant log excerpts
    - Steps already attempted
 
-## Appendix: Quick Reference Commands
+## Appendix: Quick Reference SQL
 
+**💡 TIP**: For a printable cheatsheet with all these queries, see [Cheatsheet.sql](Cheatsheet.sql).
+
+**Note:** Replace `sync_` with your custom prefix if using `config.sync.sql.appname`.
+
+### Check Cluster Health
+```sql
+-- Active nodes
+SELECT name, last_heartbeat,
+       NOW() - last_heartbeat as time_since_heartbeat
+FROM sync_node 
+WHERE last_heartbeat > NOW() - INTERVAL '15 seconds'
+ORDER BY created_on;
+
+-- Active node count
+SELECT COUNT(*) as active_nodes
+FROM sync_node
+WHERE last_heartbeat > NOW() - INTERVAL '15 seconds';
+```
+
+### Check Token Distribution
+```sql
+-- Token count per node
+SELECT node, COUNT(*) as tokens 
+FROM sync_token 
+GROUP BY node
+ORDER BY tokens DESC;
+
+-- Token distribution balance
+SELECT node, COUNT(*) as tokens,
+       ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 2) as pct
+FROM sync_token
+GROUP BY node
+ORDER BY tokens DESC;
+```
+
+### Check Leader Status
+```sql
+-- Current leader
+SELECT name as current_leader
+FROM sync_node 
+WHERE last_heartbeat > NOW() - INTERVAL '15 seconds' 
+ORDER BY created_on, name 
+LIMIT 1;
+```
+
+### Check Rebalancing
+```sql
+-- Recent rebalances
+SELECT * FROM sync_rebalance 
+ORDER BY triggered_at DESC 
+LIMIT 5;
+
+-- Rebalances in last hour
+SELECT COUNT(*) as rebalances_last_hour
+FROM sync_rebalance
+WHERE triggered_at > NOW() - INTERVAL '1 hour';
+```
+
+### Check Heartbeat Lag
+```sql
+SELECT name,
+       EXTRACT(EPOCH FROM (NOW() - last_heartbeat)) as seconds_since_heartbeat
+FROM sync_node
+WHERE last_heartbeat > NOW() - INTERVAL '1 minute'
+ORDER BY last_heartbeat;
+```
+
+### Check Locked Tokens
+```sql
+SELECT l.node_patterns, COUNT(*) as locked_tokens,
+       STRING_AGG(DISTINCT t.node, ', ') as assigned_to
+FROM sync_lock l
+JOIN sync_token t ON l.token_id = t.token_id
+GROUP BY l.node_patterns;
+```
+
+### Emergency Actions
+
+**Clear stale leader lock** (when certain no leader is active):
+```sql
+DELETE FROM sync_leader_lock 
+WHERE acquired_at < NOW() - INTERVAL '5 minutes';
+```
+
+**Stop all workers**:
 ```bash
-# Check cluster health
-psql -U postgres -d jobsync -c "SELECT name, last_heartbeat FROM sync_node WHERE last_heartbeat > NOW() - INTERVAL '15 seconds';"
-
-# Check token distribution
-psql -U postgres -d jobsync -c "SELECT node, COUNT(*) FROM sync_token GROUP BY node;"
-
-# Check current leader
-psql -U postgres -d jobsync -c "SELECT name FROM sync_node WHERE last_heartbeat > NOW() - INTERVAL '15 seconds' ORDER BY created_on, name LIMIT 1;"
-
-# Check recent rebalances
-psql -U postgres -d jobsync -c "SELECT * FROM sync_rebalance ORDER BY triggered_at DESC LIMIT 5;"
-
-# Clear stale leader lock (DANGEROUS)
-psql -U postgres -d jobsync -c "DELETE FROM sync_leader_lock WHERE acquired_at < NOW() - INTERVAL '5 minutes';"
-
-# Stop all workers
 pkill -TERM -f worker.py
+```
 
-# Disable coordination (stop nodes first)
-export SYNC_COORDINATION_ENABLED=false
-# Or drop coordination tables:
-# psql -U postgres -d jobsync -c "DROP TABLE IF EXISTS sync_rebalance, sync_rebalance_lock, sync_leader_lock, sync_lock, sync_token;"
+**Disable coordination** (via CoordinationConfig):
+```python
+from jobsync import CoordinationConfig
+
+coord_config = CoordinationConfig(enabled=False)
+with Job('worker-01', config, coordination_config=coord_config) as job:
+    process_tasks(job)
 ```

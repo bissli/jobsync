@@ -1,4 +1,5 @@
 """Unit tests for minimal-move token distribution algorithm."""
+import pytest
 
 from jobsync.client import compute_minimal_move_distribution
 
@@ -26,74 +27,33 @@ def wildcard_match(node: str, pattern: str) -> bool:
 class TestBasicDistribution:
     """Test basic token distribution scenarios."""
 
-    def test_empty_nodes(self):
-        """Verify distribution with no nodes returns empty assignment.
+    @pytest.mark.parametrize(('total_tokens', 'nodes', 'expected_counts'), [
+        (100, [], {}),
+        (100, ['node1'], {'node1': 100}),
+        (100, ['node1', 'node2'], {'node1': 50, 'node2': 50}),
+        (100, ['node1', 'node2', 'node3'], {'node1': 34, 'node2': 33, 'node3': 33}),
+    ])
+    def test_basic_token_distribution(self, total_tokens, nodes, expected_counts):
+        """Verify token distribution across varying numbers of nodes.
         """
         assignments, moved = compute_minimal_move_distribution(
-            total_tokens=100,
-            active_nodes=[],
+            total_tokens=total_tokens,
+            active_nodes=nodes,
             current_assignments={},
             locked_tokens={},
             pattern_matcher=exact_match
         )
 
-        assert assignments == {}
-        assert moved == 0
-
-    def test_single_node(self):
-        """Verify all tokens assigned to single node.
-        """
-        assignments, moved = compute_minimal_move_distribution(
-            total_tokens=100,
-            active_nodes=['node1'],
-            current_assignments={},
-            locked_tokens={},
-            pattern_matcher=exact_match
-        )
-
-        assert len(assignments) == 100
-        assert all(node == 'node1' for node in assignments.values())
-        assert moved == 100
-
-    def test_two_nodes_even_split(self):
-        """Verify even distribution between two nodes.
-        """
-        assignments, moved = compute_minimal_move_distribution(
-            total_tokens=100,
-            active_nodes=['node1', 'node2'],
-            current_assignments={},
-            locked_tokens={},
-            pattern_matcher=exact_match
-        )
-
-        assert len(assignments) == 100
-        node1_count = sum(1 for node in assignments.values() if node == 'node1')
-        node2_count = sum(1 for node in assignments.values() if node == 'node2')
-
-        assert node1_count == 50
-        assert node2_count == 50
-        assert moved == 100
-
-    def test_three_nodes_uneven_split(self):
-        """Verify distribution with remainder tokens.
-        """
-        assignments, moved = compute_minimal_move_distribution(
-            total_tokens=100,
-            active_nodes=['node1', 'node2', 'node3'],
-            current_assignments={},
-            locked_tokens={},
-            pattern_matcher=exact_match
-        )
-
-        assert len(assignments) == 100
-        counts = {}
-        for node in assignments.values():
-            counts[node] = counts.get(node, 0) + 1
-
-        assert counts['node1'] == 34
-        assert counts['node2'] == 33
-        assert counts['node3'] == 33
-        assert moved == 100
+        if not nodes:
+            assert assignments == {}
+            assert moved == 0
+        else:
+            assert len(assignments) == total_tokens
+            actual_counts = {}
+            for node in assignments.values():
+                actual_counts[node] = actual_counts.get(node, 0) + 1
+            assert actual_counts == expected_counts
+            assert moved == total_tokens
 
 
 class TestMinimalMovement:

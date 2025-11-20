@@ -26,7 +26,7 @@ pip install jobsync
 from jobsync import Job, Task, config
 
 # Each worker runs this code
-with Job('worker-01', 'production', config) as job:
+with Job('worker-01', config) as job:
     for item_id in get_pending_items():
         task = Task(item_id)
         
@@ -59,7 +59,7 @@ def on_tokens_removed(token_ids: set[int]):
                 active_subscriptions[task_id].close()
                 del active_subscriptions[task_id]
 
-with Job('worker-01', 'production', config,
+with Job('worker-01', config,
          on_tokens_added=on_tokens_added,
          on_tokens_removed=on_tokens_removed) as job:
     # Callbacks handle starting/stopping subscriptions
@@ -109,11 +109,10 @@ export SYNC_SQL_USERNAME=postgres
 export SYNC_SQL_PASSWORD=postgres
 ```
 
-Basic coordination settings (defaults work for most cases):
+Optional coordination settings (defaults work for most cases):
 
 ```bash
-export SYNC_COORDINATION_ENABLED=true   # Enable coordination
-export SYNC_TOTAL_TOKENS=10000          # Token pool size
+export SYNC_TOTAL_TOKENS=10000          # Token pool size (default: 10000)
 ```
 
 **See [Usage Guide](docs/USAGE_GUIDE.md#coordination-configuration)** for detailed configuration options and **[Operator Guide](docs/OPERATOR_GUIDE.md#performance-tuning)** for tuning parameters.
@@ -125,7 +124,7 @@ export SYNC_TOTAL_TOKENS=10000          # Token pool size
 ```python
 from jobsync import Job, Task
 
-with Job('worker-01', 'production', config) as job:
+with Job('worker-01', config) as job:
     for item_id in get_pending_items():
         task = Task(item_id)
         if job.can_claim_task(task):
@@ -140,9 +139,9 @@ with Job('worker-01', 'production', config) as job:
 def register_gpu_locks(job):
     gpu_tasks = get_gpu_task_ids()
     locks = [(task_id, '%gpu%', 'requires_gpu') for task_id in gpu_tasks]
-    job.register_task_locks_bulk(locks)
+    job.register_locks_bulk(locks)
 
-with Job('worker-gpu-01', 'production', config, 
+with Job('worker-gpu-01', config, 
          lock_provider=register_gpu_locks) as job:
     for task_id in get_all_tasks():
         if job.can_claim_task(Task(task_id)):
@@ -170,7 +169,7 @@ with Job('worker', 'prod', config,
     process_tasks(job)
 
 # Manual lock management
-with Job('admin', 'prod', config) as job:
+with Job('admin', config) as job:
     locks = job.list_locks()  # Review all locks
     job.clear_locks_by_creator('old-node')  # Clean up specific node
     job.clear_all_locks()  # Nuclear option
@@ -207,7 +206,7 @@ def register_locks(job):
     ]
     job.register_locks_bulk(locks)
 
-with Job('worker-gpu-01', 'production', config, 
+with Job('worker-gpu-01', config, 
          lock_provider=register_locks) as job:
     for task_id in get_all_tasks():
         if job.can_claim_task(Task(task_id)):
@@ -231,7 +230,7 @@ def health():
         return jsonify({'status': 'ready'}), 200
     return jsonify({'status': 'not_ready'}), 503
 
-with Job('worker-01', 'production', config) as job:
+with Job('worker-01', config) as job:
     app.run(host='0.0.0.0', port=8080)
 ```
 
@@ -249,7 +248,7 @@ config = CoordinationConfig(
     rebalance_check_interval_sec=15       # More responsive rebalancing
 )
 
-with Job('worker-01', 'production', base_config, coordination_config=config) as job:
+with Job('worker-01', base_config, coordination_config=config) as job:
     process_tasks(job)
 ```
 
@@ -276,23 +275,21 @@ This README provides a high-level overview and quick start. For detailed informa
 
 ## Monitoring
 
-Check cluster health with these essential queries:
+Check cluster health:
 
 ```sql
--- Active workers
-SELECT name, last_heartbeat FROM sync_node
+-- Quick health check
+SELECT COUNT(*) as active_nodes FROM sync_node
 WHERE last_heartbeat > NOW() - INTERVAL '15 seconds';
-
--- Token distribution balance
-SELECT node, COUNT(*) as tokens FROM sync_token GROUP BY node;
-
--- Current leader
-SELECT name FROM sync_node
-WHERE last_heartbeat > NOW() - INTERVAL '15 seconds'
-ORDER BY created_on LIMIT 1;
 ```
 
-**See [Operator Guide](docs/OPERATOR_GUIDE.md#monitoring-and-alerting)** for comprehensive monitoring setup, alerting rules, and diagnostic queries.
+**Quick Reference**: See [Cheatsheet.sql](docs/Cheatsheet.sql) for a printable collection of common monitoring queries.
+
+**See [Operator Guide](docs/OPERATOR_GUIDE.md#monitoring-and-alerting)** for:
+- Complete monitoring setup with alerting rules
+- Prometheus/Grafana integration examples
+- Diagnostic SQL queries
+- Troubleshooting procedures
 
 ## Performance
 

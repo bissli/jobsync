@@ -247,12 +247,12 @@ class Job:
         self._nodes = [{'node': self.node_name}]
 
         if date is None:
-            date = datetime.date.today()
+            date = datetime.datetime.now().date()
         elif isinstance(date, datetime.datetime):
             date = date.date()
         elif not isinstance(date, datetime.date):
             raise TypeError(f'date must be None, datetime.date, or datetime.datetime, got {type(date).__name__}')
-        self._date = datetime.date(date.year, date.month, date.day)
+        self._date = date
 
         self._config = config
         self._tables = get_table_names(config)
@@ -303,6 +303,7 @@ class Job:
         self._refresh_thread = None
 
         self._stale_leader_lock_age = coordination_config.stale_leader_lock_age_sec if coordination_config else 300
+        self._stale_rebalance_lock_age = coordination_config.stale_rebalance_lock_age_sec if coordination_config else 300
 
         self._on_tokens_added = on_tokens_added
         self._on_tokens_removed = on_tokens_removed
@@ -423,6 +424,7 @@ class Job:
 
         if exc_ty:
             logger.error(exc_val)
+
         if self._coordination_enabled:
             self._shutdown = True
             self._shutdown_event.set()
@@ -587,8 +589,8 @@ class Job:
             node_patterns = [node_patterns]
 
         token_id = self._task_to_token(task_id)
-        expires_at = (datetime.datetime.now(datetime.timezone.utc) +
-                      datetime.timedelta(days=expires_in_days)) if expires_in_days else None
+        expires_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+            days=expires_in_days) if expires_in_days else None
 
         sql = f"""
         INSERT INTO {self._tables["Lock"]}
@@ -697,11 +699,11 @@ class Job:
         sql = f"""
         SELECT token_id, node_patterns, reason, created_at, created_by, expires_at
         FROM {self._tables["Lock"]}
-        WHERE expires_at IS NULL OR expires_at > :now
+        WHERE expires_at IS NULL OR expires_at > NOW()
         ORDER BY created_at DESC
         """
         with self._engine.connect() as conn:
-            result = conn.execute(text(sql), {'now': datetime.datetime.now(datetime.timezone.utc)})
+            result = conn.execute(text(sql))
             return [dict(row._mapping) for row in result]
 
     # ============================================================
@@ -713,8 +715,8 @@ class Job:
         """
         try:
             if self._last_heartbeat_sent:
-                age = datetime.datetime.now(datetime.timezone.utc) - self._last_heartbeat_sent
-                if age.total_seconds() > self._heartbeat_timeout:
+                age_seconds = (datetime.datetime.now(datetime.timezone.utc) - self._last_heartbeat_sent).total_seconds()
+                if age_seconds > self._heartbeat_timeout:
                     return False
             with self._engine.connect() as conn:
                 conn.execute(text('SELECT 1'))
@@ -733,27 +735,25 @@ class Job:
 
     def get_active_nodes(self) -> list[dict]:
         """Get list of active nodes (heartbeat within timeout threshold)."""
-        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=self._heartbeat_timeout)
         sql = f"""
         SELECT name, created_on, last_heartbeat
         FROM {self._tables["Node"]}
-        WHERE last_heartbeat > :cutoff
+        WHERE last_heartbeat > NOW() - INTERVAL '{self._heartbeat_timeout} seconds'
         ORDER BY created_on ASC, name ASC
         """
         with self._engine.connect() as conn:
-            result = conn.execute(text(sql), {'cutoff': cutoff})
+            result = conn.execute(text(sql))
             return [{'name': row[0], 'created_on': row[1], 'last_heartbeat': row[2]} for row in result]
 
     def get_dead_nodes(self) -> list[str]:
         """Get list of dead nodes (heartbeat older than timeout threshold)."""
-        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=self._heartbeat_timeout)
         sql = f"""
         SELECT name
         FROM {self._tables["Node"]}
-        WHERE last_heartbeat <= :cutoff OR last_heartbeat IS NULL
+        WHERE last_heartbeat <= NOW() - INTERVAL '{self._heartbeat_timeout} seconds' OR last_heartbeat IS NULL
         """
         with self._engine.connect() as conn:
-            result = conn.execute(text(sql), {'cutoff': cutoff})
+            result = conn.execute(text(sql))
             return [row[0] for row in result]
 
     # ============================================================
@@ -890,15 +890,19 @@ class Job:
                         logger.info(f'Leader lock acquired by {self.node_name} for {operation}')
                         return True
 
-                    sql = f'SELECT node, acquired_at FROM {self._tables["LeaderLock"]} WHERE singleton = 1'
+                    sql = f"""
+                    SELECT node,
+                           EXTRACT(EPOCH FROM (NOW() - acquired_at)) as age_seconds
+                    FROM {self._tables["LeaderLock"]}
+                    WHERE singleton = 1
+                    """
                     result = conn.execute(text(sql))
                     lock_row = result.first()
 
                     if lock_row:
-                        acquired_at = lock_row[1]
-                        age = datetime.datetime.now(datetime.timezone.utc) - acquired_at
-                        if age.total_seconds() > self._stale_leader_lock_age:
-                            logger.warning(f'Stale leader lock detected (age: {age.total_seconds()}s), forcing release')
+                        age_seconds = lock_row[1]
+                        if age_seconds > self._stale_leader_lock_age:
+                            logger.warning(f'Stale leader lock detected (age: {age_seconds}s), forcing release')
                             conn.execute(text(f'DELETE FROM {self._tables["LeaderLock"]} WHERE singleton = 1'))
                             conn.commit()
                             continue
@@ -943,18 +947,18 @@ class Job:
         Expired locks are removed as a side effect.
         """
         with self._engine.connect() as conn:
-            sql = f'SELECT token_id, node_patterns, expires_at FROM {self._tables["Lock"]}'
+            sql = f"""
+            DELETE FROM {self._tables["Lock"]}
+            WHERE expires_at IS NOT NULL AND expires_at < NOW()
+            """
+            conn.execute(text(sql))
+
+            sql = f'SELECT token_id, node_patterns FROM {self._tables["Lock"]}'
             result = conn.execute(text(sql))
             records = [dict(row._mapping) for row in result]
 
             locked_tokens = {}
-            current_time = datetime.datetime.now(datetime.timezone.utc)
             for row in records:
-                expires_at = row['expires_at']
-                if expires_at and expires_at < current_time:
-                    conn.execute(text(f'DELETE FROM {self._tables["Lock"]} WHERE token_id = :token_id'),
-                                {'token_id': row['token_id']})
-                    continue
                 patterns = row['node_patterns']
                 locked_tokens[row['token_id']] = patterns
 
@@ -1030,14 +1034,13 @@ class Job:
                             logger.debug('No longer leader, stopping dead node monitor')
                             break
 
-                        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=self._heartbeat_timeout)
                         sql = f"""
                         SELECT name
                         FROM {self._tables["Node"]}
-                        WHERE last_heartbeat <= :cutoff OR last_heartbeat IS NULL
+                        WHERE last_heartbeat <= NOW() - INTERVAL '{self._heartbeat_timeout} seconds' OR last_heartbeat IS NULL
                         """
 
-                        result = conn.execute(text(sql), {'cutoff': cutoff})
+                        result = conn.execute(text(sql))
                         dead_nodes = [row[0] for row in result]
 
                         if dead_nodes:
@@ -1049,7 +1052,9 @@ class Job:
                                                     {'name': node})
                                         conn.execute(text(f'DELETE FROM {self._tables["Claim"]} WHERE node = :node'),
                                                     {'node': node})
-                                        logger.info(f'Removed dead node: {node}')
+                                        conn.execute(text(f'DELETE FROM {self._tables["Lock"]} WHERE created_by = :node'),
+                                                    {'node': node})
+                                        logger.info(f'Removed dead node and cleaned up locks: {node}')
                                     conn.commit()
                                     self._distribute_tokens_safe()
                                 finally:
@@ -1078,13 +1083,36 @@ class Job:
         logger.info('Dead node monitor started')
 
     def _acquire_rebalance_lock(self, started_by: str) -> bool:
-        """Acquire rebalance lock."""
-        sql = f"""
-        UPDATE {self._tables["RebalanceLock"]}
-        SET in_progress = TRUE, started_at = :started_at, started_by = :started_by
-        WHERE singleton = 1 AND in_progress = FALSE
+        """Acquire rebalance lock with stale lock detection.
         """
         with self._engine.connect() as conn:
+            sql = f"""
+            SELECT in_progress,
+                   EXTRACT(EPOCH FROM (NOW() - started_at)) as age_seconds,
+                   started_by
+            FROM {self._tables["RebalanceLock"]}
+            WHERE singleton = 1
+            """
+            result = conn.execute(text(sql))
+            lock_row = result.first()
+
+            if lock_row and lock_row[0]:
+                age_seconds = lock_row[1]
+                holder = lock_row[2]
+                if age_seconds is not None and age_seconds > self._stale_rebalance_lock_age:
+                    logger.warning(f'Stale rebalance lock detected (age: {age_seconds}s, holder: {holder}), forcing release')
+                    conn.execute(text(f"""
+                        UPDATE {self._tables["RebalanceLock"]}
+                        SET in_progress = FALSE, started_at = NULL, started_by = NULL
+                        WHERE singleton = 1
+                    """))
+                    conn.commit()
+
+            sql = f"""
+            UPDATE {self._tables["RebalanceLock"]}
+            SET in_progress = TRUE, started_at = :started_at, started_by = :started_by
+            WHERE singleton = 1 AND in_progress = FALSE
+            """
             result = conn.execute(text(sql), {'started_at': datetime.datetime.now(datetime.timezone.utc), 'started_by': started_by})
             conn.commit()
             rows_affected = result.rowcount
@@ -1115,15 +1143,14 @@ class Job:
         def rebalance_loop():
             conn = self._engine.connect()
             try:
-                cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=self._heartbeat_timeout)
                 sql = f"""
                 SELECT name, created_on, last_heartbeat
                 FROM {self._tables["Node"]}
-                WHERE last_heartbeat > :cutoff
+                WHERE last_heartbeat > NOW() - INTERVAL '{self._heartbeat_timeout} seconds'
                 ORDER BY created_on ASC, name ASC
                 """
 
-                result = conn.execute(text(sql), {'cutoff': cutoff})
+                result = conn.execute(text(sql))
                 last_node_count = len(list(result))
 
                 while not self._shutdown:
@@ -1132,8 +1159,7 @@ class Job:
                             logger.debug('No longer leader, stopping rebalance monitor')
                             break
 
-                        cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=self._heartbeat_timeout)
-                        result = conn.execute(text(sql), {'cutoff': cutoff})
+                        result = conn.execute(text(sql))
                         current_count = len(list(result))
 
                         if current_count != last_node_count:

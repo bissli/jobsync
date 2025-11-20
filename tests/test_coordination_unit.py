@@ -5,7 +5,6 @@ Tests each coordination component in isolation.
 import datetime
 import logging
 import time
-from datetime import timedelta, timezone
 from types import SimpleNamespace
 
 import config as test_config
@@ -47,7 +46,7 @@ class TestTaskToToken:
     """Test consistent hashing of tasks to tokens."""
 
     def test_consistent_hashing(self, postgres):
-        """Same task ID should always map to same token."""
+        """Verify task IDs consistently map to same token and handle various ID types."""
         config = get_unit_test_config()
         job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
 
@@ -58,83 +57,44 @@ class TestTaskToToken:
         assert_equal(token1, token2, 'Same task should map to same token')
         assert_true(0 <= token1 < 100, 'Token should be in valid range')
 
-    def test_different_tasks_different_tokens(self, postgres):
-        """Different task IDs should map to different tokens (usually)."""
-        config = get_unit_test_config()
-        job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
-
-        tokens = set()
-        for i in range(20):
-            token = job._task_to_token(f'task-{i}')
-            tokens.add(token)
-
-        # With 20 tasks and 100 tokens, expect most to be unique
+        tokens = {job._task_to_token(f'task-{i}') for i in range(20)}
         assert_true(len(tokens) >= 15, 'Most tasks should map to different tokens')
 
-    def test_numeric_and_string_ids(self, postgres):
-        """Test hashing works for different ID types."""
-        config = get_unit_test_config()
-        job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
-
-        # Numeric IDs
-        token1 = job._task_to_token(123)
-        assert_true(0 <= token1 < 100, 'Numeric ID should produce valid token')
-
-        # String IDs
-        token2 = job._task_to_token('abc-def-ghi')
-        assert_true(0 <= token2 < 100, 'String ID should produce valid token')
-
-        # Different types, different tokens
-        assert_true(token1 != token2, 'Different ID types should produce different tokens (usually)')
+        numeric_token = job._task_to_token(123)
+        string_token = job._task_to_token('abc-def-ghi')
+        assert_true(0 <= numeric_token < 100, 'Numeric ID should produce valid token')
+        assert_true(0 <= string_token < 100, 'String ID should produce valid token')
 
 
 class TestPatternMatching:
     """Test SQL LIKE pattern matching."""
 
-    def test_exact_match(self, postgres):
-        """Test exact node name matching."""
+    @pytest.mark.parametrize(('node_name', 'pattern', 'should_match'), [
+        ('node1', 'node1', True),
+        ('node1', 'node2', False),
+        ('prod-alpha', 'prod-%', True),
+        ('prod-beta', 'prod-%', True),
+        ('test-alpha', 'prod-%', False),
+        ('alpha-gpu', '%-gpu', True),
+        ('beta-gpu', '%-gpu', True),
+        ('alpha-cpu', '%-gpu', False),
+        ('prod-special-001', '%special%', True),
+        ('special', '%special%', True),
+        ('prod-regular-001', '%special%', False),
+        ('node1', 'node_', True),
+        ('node2', 'node_', True),
+        ('node10', 'node_', False),
+    ])
+    def test_pattern_matching(self, postgres, node_name, pattern, should_match):
+        """Test SQL LIKE pattern matching with various patterns."""
         config = get_unit_test_config()
         job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
 
-        assert_true(job._matches_pattern('node1', 'node1'), 'Exact match should succeed')
-        assert_equal(job._matches_pattern('node1', 'node2'), False, 'Different names should not match')
-
-    def test_prefix_wildcard(self, postgres):
-        """Test prefix patterns with % wildcard."""
-        config = get_unit_test_config()
-        job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
-
-        assert_true(job._matches_pattern('prod-alpha', 'prod-%'), 'Prefix pattern should match')
-        assert_true(job._matches_pattern('prod-beta', 'prod-%'), 'Prefix pattern should match')
-        assert_equal(job._matches_pattern('test-alpha', 'prod-%'), False, 'Wrong prefix should not match')
-
-    def test_suffix_wildcard(self, postgres):
-        """Test suffix patterns with % wildcard."""
-        config = get_unit_test_config()
-        job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
-
-        assert_true(job._matches_pattern('alpha-gpu', '%-gpu'), 'Suffix pattern should match')
-        assert_true(job._matches_pattern('beta-gpu', '%-gpu'), 'Suffix pattern should match')
-        assert_equal(job._matches_pattern('alpha-cpu', '%-gpu'), False, 'Wrong suffix should not match')
-
-    def test_contains_wildcard(self, postgres):
-        """Test contains patterns with % wildcards."""
-        config = get_unit_test_config()
-        job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
-
-        assert_true(job._matches_pattern('prod-special-001', '%special%'), 'Contains pattern should match')
-        assert_true(job._matches_pattern('special', '%special%'), 'Contains pattern should match')
-        assert_equal(job._matches_pattern('prod-regular-001', '%special%'), False,
-                    'Missing substring should not match')
-
-    def test_single_char_wildcard(self, postgres):
-        """Test single character _ wildcard."""
-        config = get_unit_test_config()
-        job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
-
-        assert_true(job._matches_pattern('node1', 'node_'), 'Single char wildcard should match')
-        assert_true(job._matches_pattern('node2', 'node_'), 'Single char wildcard should match')
-        assert_equal(job._matches_pattern('node10', 'node_'), False, 'Extra chars should not match')
+        result = job._matches_pattern(node_name, pattern)
+        if should_match:
+            assert_true(result, f'{node_name} should match pattern {pattern}')
+        else:
+            assert_equal(result, False, f'{node_name} should not match pattern {pattern}')
 
 
 class TestLeaderElection:
@@ -145,22 +105,22 @@ class TestLeaderElection:
         config = get_unit_test_config()
         tables = schema.get_table_names(config)
 
-        base_time = datetime.datetime.now(timezone.utc)
+        base_time = datetime.datetime.now(datetime.timezone.utc)
         with postgres.connect() as conn:
             conn.execute(text(f"""
                 INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
                 VALUES (:name, :created_on, :heartbeat)
-            """), {'name': 'node2', 'created_on': base_time - timedelta(seconds=10), 'heartbeat': base_time})
+            """), {'name': 'node2', 'created_on': base_time - datetime.timedelta(seconds=10), 'heartbeat': base_time})
 
             conn.execute(text(f"""
                 INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
                 VALUES (:name, :created_on, :heartbeat)
-            """), {'name': 'node1', 'created_on': base_time - timedelta(seconds=20), 'heartbeat': base_time})
+            """), {'name': 'node1', 'created_on': base_time - datetime.timedelta(seconds=20), 'heartbeat': base_time})
 
             conn.execute(text(f"""
                 INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
                 VALUES (:name, :created_on, :heartbeat)
-            """), {'name': 'node3', 'created_on': base_time - timedelta(seconds=5), 'heartbeat': base_time})
+            """), {'name': 'node3', 'created_on': base_time - datetime.timedelta(seconds=5), 'heartbeat': base_time})
             conn.commit()
 
         job = Job('test', config, connection_string=postgres.url.render_as_string(hide_password=False))
@@ -173,7 +133,7 @@ class TestLeaderElection:
         config = get_unit_test_config()
         tables = schema.get_table_names(config)
 
-        same_time = datetime.datetime.now(timezone.utc)
+        same_time = datetime.datetime.now(datetime.timezone.utc)
         with postgres.connect() as conn:
             for name in ['node-c', 'node-a', 'node-b']:
                 conn.execute(text(f"""
@@ -192,19 +152,19 @@ class TestLeaderElection:
         config = get_unit_test_config()
         tables = schema.get_table_names(config)
 
-        current_time = datetime.datetime.now(timezone.utc)
-        stale_time = current_time - timedelta(seconds=30)
+        current_time = datetime.datetime.now(datetime.timezone.utc)
+        stale_time = current_time - datetime.timedelta(seconds=30)
 
         with postgres.connect() as conn:
             conn.execute(text(f"""
                 INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
                 VALUES (:name, :created_on, :heartbeat)
-            """), {'name': 'node1', 'created_on': current_time - timedelta(seconds=30), 'heartbeat': stale_time})
+            """), {'name': 'node1', 'created_on': current_time - datetime.timedelta(seconds=30), 'heartbeat': stale_time})
 
             conn.execute(text(f"""
                 INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
                 VALUES (:name, :created_on, :heartbeat)
-            """), {'name': 'node2', 'created_on': current_time - timedelta(seconds=20), 'heartbeat': current_time})
+            """), {'name': 'node2', 'created_on': current_time - datetime.timedelta(seconds=20), 'heartbeat': current_time})
             conn.commit()
 
         job = Job('test', config, connection_string=postgres.url.render_as_string(hide_password=False))
@@ -221,7 +181,7 @@ class TestTokenDistribution:
         config = get_unit_test_config()
         tables = schema.get_table_names(config)
 
-        current = datetime.datetime.now(timezone.utc)
+        current = datetime.datetime.now(datetime.timezone.utc)
         with postgres.connect() as conn:
             for i in range(1, 4):
                 conn.execute(text(f"""
@@ -256,7 +216,7 @@ class TestTokenDistribution:
             conn.execute(text(f'DELETE FROM {tables["Node"]}'))
             conn.commit()
 
-        current = datetime.datetime.now(timezone.utc)
+        current = datetime.datetime.now(datetime.timezone.utc)
         with postgres.connect() as conn:
             for name in ['node1', 'node2', 'special-alpha']:
                 conn.execute(text(f"""
@@ -409,8 +369,7 @@ class TestCanClaimTask:
 
         token_id = 5
         with postgres.connect() as conn:
-            result = conn.execute(text('SELECT NOW()'))
-            assigned_at = result.scalar()
+            assigned_at = datetime.datetime.now(datetime.timezone.utc)
             conn.execute(text(f"""
                 INSERT INTO {tables["Token"]} (token_id, node, assigned_at, version)
                 VALUES (:token_id, :node, :assigned_at, :version)
@@ -497,11 +456,12 @@ class TestThreadShutdown:
         config = get_unit_test_config()
         tables = schema.get_table_names(config)
 
+        now = datetime.datetime.now(datetime.timezone.utc)
         with postgres.connect() as conn:
             conn.execute(text(f"""
                 INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
                 VALUES (:name, :created_on, :heartbeat)
-            """), {'name': 'node1', 'created_on': datetime.datetime.now(timezone.utc), 'heartbeat': datetime.datetime.now(timezone.utc)})
+            """), {'name': 'node1', 'created_on': now, 'heartbeat': now})
             conn.commit()
 
         node = Job('node1', config, wait_on_enter=5, connection_string=postgres.url.render_as_string(hide_password=False))

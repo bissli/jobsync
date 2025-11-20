@@ -361,7 +361,7 @@ def test_health_monitoring(postgres):
 
         # Simulate heartbeat thread failure by stopping it
         node._heartbeat_thread = None
-        node._last_heartbeat_sent -= timedelta(seconds=20)
+        node._last_heartbeat_sent = node._last_heartbeat_sent - timedelta(seconds=20)
 
         # Should now be unhealthy (heartbeat too old)
         is_healthy = node.am_i_healthy()

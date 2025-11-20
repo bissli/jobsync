@@ -12,7 +12,6 @@ import datetime
 import json
 import logging
 import time
-from datetime import timezone
 from types import SimpleNamespace
 
 import config as test_config
@@ -124,6 +123,410 @@ class TestCleanupFailureScenarios:
         assert_equal(check_count, 0, 'Node should be removed from Check table')
 
 
+class TestRebalanceLockStaleRecovery:
+    """Test stale rebalance lock detection and recovery."""
+
+    def test_stale_rebalance_lock_detected_and_removed(self, postgres):
+        """Verify stale rebalance locks are detected and removed.
+        """
+        config = get_edge_case_config()
+        tables = schema.get_table_names(config)
+        connection_string = postgres.url.render_as_string(hide_password=False)
+
+        stale_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=400)
+
+        with postgres.connect() as conn:
+            conn.execute(text(f"""
+                UPDATE {tables["RebalanceLock"]}
+                SET in_progress = TRUE, started_at = :started_at, started_by = 'dead-node'
+                WHERE singleton = 1
+            """), {'started_at': stale_time})
+            conn.commit()
+
+        coord_config = CoordinationConfig(
+            total_tokens=50,
+            heartbeat_interval_sec=1,
+            stale_rebalance_lock_age_sec=300
+        )
+
+        job = Job('node1', config, wait_on_enter=0, connection_string=connection_string, coordination_config=coord_config)
+        job.__enter__()
+
+        try:
+            acquired = job._acquire_rebalance_lock('test-rebalance')
+            assert_true(acquired, 'Should acquire rebalance lock after removing stale lock')
+
+            with postgres.connect() as conn:
+                result = conn.execute(text(f"""
+                    SELECT in_progress, started_by FROM {tables['RebalanceLock']} WHERE singleton = 1
+                """))
+                lock_status = result.first()
+
+            assert_true(lock_status[0], 'Lock should be in progress')
+            assert_equal(lock_status[1], 'test-rebalance', 'test-rebalance should now hold the lock')
+
+        finally:
+            job.__exit__(None, None, None)
+
+    def test_configurable_stale_rebalance_lock_threshold(self, postgres):
+        """Verify stale rebalance lock threshold is configurable.
+        """
+        config = get_edge_case_config()
+        tables = schema.get_table_names(config)
+        connection_string = postgres.url.render_as_string(hide_password=False)
+
+        lock_age = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=15)
+
+        with postgres.connect() as conn:
+            conn.execute(text(f"""
+                UPDATE {tables["RebalanceLock"]}
+                SET in_progress = TRUE, started_at = :started_at, started_by = 'old-node'
+                WHERE singleton = 1
+            """), {'started_at': lock_age})
+            conn.commit()
+
+        coord_config = CoordinationConfig(
+            total_tokens=50,
+            heartbeat_interval_sec=1,
+            stale_rebalance_lock_age_sec=10
+        )
+
+        job = Job('node1', config, wait_on_enter=0, connection_string=connection_string, coordination_config=coord_config)
+        job.__enter__()
+
+        try:
+            acquired = job._acquire_rebalance_lock('test')
+            assert_true(acquired, 'Should treat 15-second-old rebalance lock as stale with 10s threshold')
+
+        finally:
+            job.__exit__(None, None, None)
+
+    def test_non_stale_rebalance_lock_not_removed(self, postgres):
+        """Verify recent rebalance locks are not removed.
+        """
+        config = get_edge_case_config()
+        tables = schema.get_table_names(config)
+        connection_string = postgres.url.render_as_string(hide_password=False)
+
+        recent_time = datetime.datetime.now(datetime.timezone.utc)
+
+        with postgres.connect() as conn:
+            conn.execute(text(f"""
+                UPDATE {tables["RebalanceLock"]}
+                SET in_progress = TRUE, started_at = :started_at, started_by = 'active-node'
+                WHERE singleton = 1
+            """), {'started_at': recent_time})
+            conn.commit()
+
+        coord_config = CoordinationConfig(
+            total_tokens=50,
+            heartbeat_interval_sec=1,
+            stale_rebalance_lock_age_sec=300
+        )
+
+        job = Job('node1', config, wait_on_enter=0, connection_string=connection_string, coordination_config=coord_config)
+
+        acquired = job._acquire_rebalance_lock('test')
+        assert_false(acquired, 'Should not acquire rebalance lock if recent lock exists')
+
+    def test_stale_rebalance_lock_logged(self, postgres, caplog):
+        """Verify stale rebalance lock detection is logged.
+        """
+        config = get_edge_case_config()
+        tables = schema.get_table_names(config)
+        connection_string = postgres.url.render_as_string(hide_password=False)
+
+        stale_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=400)
+
+        with postgres.connect() as conn:
+            conn.execute(text(f"""
+                UPDATE {tables["RebalanceLock"]}
+                SET in_progress = TRUE, started_at = :started_at, started_by = 'stuck-node'
+                WHERE singleton = 1
+            """), {'started_at': stale_time})
+            conn.commit()
+
+        coord_config = CoordinationConfig(
+            total_tokens=50,
+            stale_rebalance_lock_age_sec=300
+        )
+
+        with caplog.at_level(logging.WARNING):
+            job = Job('node1', config, wait_on_enter=0, connection_string=connection_string, coordination_config=coord_config)
+            job.__enter__()
+
+            try:
+                job._acquire_rebalance_lock('test')
+
+                warning_messages = [record.message for record in caplog.records if record.levelname == 'WARNING']
+                stale_lock_warnings = [msg for msg in warning_messages if 'Stale rebalance lock detected' in msg]
+
+                assert_true(len(stale_lock_warnings) > 0, 'Should log warning about stale rebalance lock')
+                assert_true(any('stuck-node' in msg for msg in stale_lock_warnings), 
+                           'Warning should mention the stuck node')
+
+            finally:
+                job.__exit__(None, None, None)
+
+
+class TestDeadNodeLockCleanup:
+    """Test lock cleanup when nodes die."""
+
+    def test_dead_node_locks_cleaned_up(self, postgres):
+        """Verify locks created by dead nodes are removed during cleanup.
+        """
+        config = get_edge_case_config()
+        tables = schema.get_table_names(config)
+        connection_string = postgres.url.render_as_string(hide_password=False)
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        stale_heartbeat = now - datetime.timedelta(seconds=30)
+
+        with postgres.connect() as conn:
+            conn.execute(text(f'DELETE FROM {tables["Lock"]}'))
+            conn.execute(text(f'DELETE FROM {tables["Node"]}'))
+
+            # Create a dead node
+            conn.execute(text(f"""
+                INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
+                VALUES ('dead-node', :created_on, :heartbeat)
+            """), {'created_on': now, 'heartbeat': stale_heartbeat})
+
+            # Create locks from the dead node
+            for token_id in [1, 2, 3]:
+                conn.execute(text(f"""
+                    INSERT INTO {tables["Lock"]} (token_id, node_patterns, reason, created_at, created_by)
+                    VALUES (:token_id, :patterns, 'test lock', :created_at, 'dead-node')
+                """), {
+                    'token_id': token_id,
+                    'patterns': json.dumps(['pattern-test']),
+                    'created_at': now
+                })
+
+            # Create a lock from a different node
+            conn.execute(text(f"""
+                INSERT INTO {tables["Lock"]} (token_id, node_patterns, reason, created_at, created_by)
+                VALUES (99, :patterns, 'other lock', :created_at, 'other-node')
+            """), {
+                'patterns': json.dumps(['pattern-other']),
+                'created_at': now
+            })
+
+            conn.commit()
+
+        # Start a leader node that will detect and clean up the dead node
+        coord_config = CoordinationConfig(
+            total_tokens=50,
+            heartbeat_timeout_sec=15,
+            dead_node_check_interval_sec=0.5
+        )
+
+        job = Job('leader-node', config, wait_on_enter=2, connection_string=connection_string, coordination_config=coord_config)
+        job.__enter__()
+
+        try:
+            # Wait for dead node detection and cleanup
+            time.sleep(3)
+
+            with postgres.connect() as conn:
+                result = conn.execute(text(f"""
+                    SELECT token_id FROM {tables["Lock"]} WHERE created_by = 'dead-node'
+                """))
+                dead_node_locks = [row[0] for row in result]
+
+                result = conn.execute(text(f"""
+                    SELECT token_id FROM {tables["Lock"]} WHERE created_by = 'other-node'
+                """))
+                other_node_locks = [row[0] for row in result]
+
+            assert_equal(len(dead_node_locks), 0, 'All locks from dead node should be removed')
+            assert_equal(len(other_node_locks), 1, 'Locks from other nodes should remain')
+            assert_equal(other_node_locks[0], 99, 'Lock 99 from other-node should still exist')
+
+        finally:
+            job.__exit__(None, None, None)
+
+    def test_multiple_dead_nodes_all_locks_cleaned(self, postgres):
+        """Verify locks from multiple dead nodes are all cleaned up.
+        """
+        config = get_edge_case_config()
+        tables = schema.get_table_names(config)
+        connection_string = postgres.url.render_as_string(hide_password=False)
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        stale_heartbeat = now - datetime.timedelta(seconds=30)
+
+        with postgres.connect() as conn:
+            conn.execute(text(f'DELETE FROM {tables["Lock"]}'))
+            conn.execute(text(f'DELETE FROM {tables["Node"]}'))
+
+            # Create multiple dead nodes with locks
+            for i in range(1, 4):
+                node_name = f'dead-node-{i}'
+                conn.execute(text(f"""
+                    INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
+                    VALUES (:name, :created_on, :heartbeat)
+                """), {'name': node_name, 'created_on': now, 'heartbeat': stale_heartbeat})
+
+                # Each dead node has 2 locks
+                for j in range(2):
+                    token_id = i * 10 + j
+                    conn.execute(text(f"""
+                        INSERT INTO {tables["Lock"]} (token_id, node_patterns, reason, created_at, created_by)
+                        VALUES (:token_id, :patterns, 'test', :created_at, :created_by)
+                    """), {
+                        'token_id': token_id,
+                        'patterns': json.dumps(['pattern']),
+                        'created_at': now,
+                        'created_by': node_name
+                    })
+
+            conn.commit()
+
+        coord_config = CoordinationConfig(
+            total_tokens=50,
+            heartbeat_timeout_sec=15,
+            dead_node_check_interval_sec=0.5
+        )
+
+        job = Job('cleanup-leader', config, wait_on_enter=2, connection_string=connection_string, coordination_config=coord_config)
+        job.__enter__()
+
+        try:
+            time.sleep(3)
+
+            with postgres.connect() as conn:
+                result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Lock"]}'))
+                remaining_locks = result.scalar()
+
+            assert_equal(remaining_locks, 0, 'All locks from all dead nodes should be removed')
+
+        finally:
+            job.__exit__(None, None, None)
+
+    def test_lock_cleanup_logged(self, postgres, caplog):
+        """Verify lock cleanup from dead nodes is logged.
+        """
+        config = get_edge_case_config()
+        tables = schema.get_table_names(config)
+        connection_string = postgres.url.render_as_string(hide_password=False)
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        stale_heartbeat = now - datetime.timedelta(seconds=30)
+
+        with postgres.connect() as conn:
+            conn.execute(text(f'DELETE FROM {tables["Lock"]}'))
+            conn.execute(text(f'DELETE FROM {tables["Node"]}'))
+
+            conn.execute(text(f"""
+                INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
+                VALUES ('logged-dead-node', :created_on, :heartbeat)
+            """), {'created_on': now, 'heartbeat': stale_heartbeat})
+
+            conn.execute(text(f"""
+                INSERT INTO {tables["Lock"]} (token_id, node_patterns, reason, created_at, created_by)
+                VALUES (1, :patterns, 'test', :created_at, 'logged-dead-node')
+            """), {
+                'patterns': json.dumps(['pattern']),
+                'created_at': now
+            })
+
+            conn.commit()
+
+        coord_config = CoordinationConfig(
+            total_tokens=50,
+            heartbeat_timeout_sec=15,
+            dead_node_check_interval_sec=0.5
+        )
+
+        with caplog.at_level(logging.INFO):
+            job = Job('logging-leader', config, wait_on_enter=2, connection_string=connection_string, coordination_config=coord_config)
+            job.__enter__()
+
+            try:
+                time.sleep(3)
+
+                info_messages = [record.message for record in caplog.records if record.levelname == 'INFO']
+                cleanup_messages = [msg for msg in info_messages if 'cleaned up locks' in msg.lower()]
+
+                assert_true(len(cleanup_messages) > 0, 'Should log lock cleanup')
+                assert_true(any('logged-dead-node' in msg for msg in cleanup_messages),
+                           'Log should mention the dead node')
+
+            finally:
+                job.__exit__(None, None, None)
+
+    def test_expired_locks_cleaned_during_dead_node_rebalance(self, postgres):
+        """Verify dead node cleanup removes locks by creator, and expired locks are cleaned during redistribution.
+        """
+        config = get_edge_case_config()
+        tables = schema.get_table_names(config)
+        connection_string = postgres.url.render_as_string(hide_password=False)
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        stale_heartbeat = now - datetime.timedelta(seconds=30)
+        expired_time = now - datetime.timedelta(days=2)
+
+        with postgres.connect() as conn:
+            conn.execute(text(f'DELETE FROM {tables["Lock"]}'))
+            conn.execute(text(f'DELETE FROM {tables["Node"]}'))
+
+            conn.execute(text(f"""
+                INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
+                VALUES ('dead-node', :created_on, :heartbeat)
+            """), {'created_on': now, 'heartbeat': stale_heartbeat})
+
+            # Lock from dead node (should be removed)
+            conn.execute(text(f"""
+                INSERT INTO {tables["Lock"]} (token_id, node_patterns, reason, created_at, created_by)
+                VALUES (1, :patterns, 'dead node lock', :created_at, 'dead-node')
+            """), {
+                'patterns': json.dumps(['pattern']),
+                'created_at': now
+            })
+
+            # Expired lock from alive node (should NOT be removed by dead node cleanup)
+            conn.execute(text(f"""
+                INSERT INTO {tables["Lock"]} (token_id, node_patterns, reason, created_at, created_by, expires_at)
+                VALUES (2, :patterns, 'expired lock', :created_at, 'alive-node', :expires_at)
+            """), {
+                'patterns': json.dumps(['pattern']),
+                'created_at': now,
+                'expires_at': expired_time
+            })
+
+            conn.commit()
+
+        coord_config = CoordinationConfig(
+            total_tokens=50,
+            heartbeat_timeout_sec=15,
+            dead_node_check_interval_sec=0.5
+        )
+
+        job = Job('separation-leader', config, wait_on_enter=2, connection_string=connection_string, coordination_config=coord_config)
+        job.__enter__()
+
+        try:
+            time.sleep(3)
+
+            with postgres.connect() as conn:
+                result = conn.execute(text(f"""
+                    SELECT token_id, created_by FROM {tables["Lock"]} ORDER BY token_id
+                """))
+                locks = [(row[0], row[1]) for row in result]
+
+            # Dead node lock should be gone (removed by DELETE statement)
+            dead_node_locks = [l for l in locks if l[1] == 'dead-node']
+            assert_equal(len(dead_node_locks), 0, 'Dead node locks should be removed by DELETE')
+
+            # Expired lock also gone (removed by _get_active_locks during token redistribution)
+            expired_locks = [l for l in locks if l[0] == 2]
+            assert_equal(len(expired_locks), 0, 'Expired locks are removed during token redistribution triggered by dead node cleanup')
+
+        finally:
+            job.__exit__(None, None, None)
+
+
 class TestLeaderLockStaleRecovery:
     """Test stale leader lock detection and recovery."""
 
@@ -134,7 +537,7 @@ class TestLeaderLockStaleRecovery:
         tables = schema.get_table_names(config)
         connection_string = postgres.url.render_as_string(hide_password=False)
 
-        stale_time = datetime.datetime.now(timezone.utc) - datetime.timedelta(seconds=400)
+        stale_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=400)
 
         with postgres.connect() as conn:
             conn.execute(text(f"""
@@ -172,7 +575,7 @@ class TestLeaderLockStaleRecovery:
         tables = schema.get_table_names(config)
         connection_string = postgres.url.render_as_string(hide_password=False)
 
-        lock_age = datetime.datetime.now(timezone.utc) - datetime.timedelta(seconds=15)
+        lock_age = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=15)
 
         with postgres.connect() as conn:
             conn.execute(text(f'DELETE FROM {tables["LeaderLock"]}'))
@@ -205,7 +608,7 @@ class TestLeaderLockStaleRecovery:
         tables = schema.get_table_names(config)
         connection_string = postgres.url.render_as_string(hide_password=False)
 
-        recent_time = datetime.datetime.now(timezone.utc)
+        recent_time = datetime.datetime.now(datetime.timezone.utc)
 
         with postgres.connect() as conn:
             conn.execute(text(f'DELETE FROM {tables["LeaderLock"]}'))
@@ -299,18 +702,18 @@ class TestLockExpirationSideEffects:
         tables = schema.get_table_names(config)
         connection_string = postgres.url.render_as_string(hide_password=False)
 
-        expired_time = datetime.datetime.now(timezone.utc) - datetime.timedelta(days=2)
+        expired_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=2)
 
         with postgres.connect() as conn:
             conn.execute(text(f'DELETE FROM {tables["Lock"]}'))
             conn.execute(text(f"""
                 INSERT INTO {tables["Lock"]} (token_id, node_patterns, reason, created_at, created_by, expires_at)
                 VALUES (1, :patterns1, 'expired lock', :created_at, 'node1', :expires_at)
-            """), {'created_at': datetime.datetime.now(timezone.utc), 'expires_at': expired_time, 'patterns1': json.dumps(['pattern-1'])})
+            """), {'created_at': datetime.datetime.now(datetime.timezone.utc), 'expires_at': expired_time, 'patterns1': json.dumps(['pattern-1'])})
             conn.execute(text(f"""
                 INSERT INTO {tables["Lock"]} (token_id, node_patterns, reason, created_at, created_by, expires_at)
                 VALUES (2, :patterns2, 'valid lock', :created_at, 'node1', NULL)
-            """), {'created_at': datetime.datetime.now(timezone.utc), 'patterns2': json.dumps(['pattern-2'])})
+            """), {'created_at': datetime.datetime.now(datetime.timezone.utc), 'patterns2': json.dumps(['pattern-2'])})
             conn.commit()
 
         job = Job('node1', config, wait_on_enter=0, connection_string=connection_string)
@@ -338,8 +741,8 @@ class TestLockExpirationSideEffects:
         tables = schema.get_table_names(config)
         connection_string = postgres.url.render_as_string(hide_password=False)
 
-        soon_to_expire = datetime.datetime.now(timezone.utc) + datetime.timedelta(seconds=0.2)
-        now = datetime.datetime.now(timezone.utc)
+        soon_to_expire = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=0.2)
+        now = datetime.datetime.now(datetime.timezone.utc)
 
         with postgres.connect() as conn:
             conn.execute(text(f'DELETE FROM {tables["Lock"]}'))
@@ -358,7 +761,7 @@ class TestLockExpirationSideEffects:
             conn.execute(text(f"""
                 INSERT INTO {tables["Lock"]} (token_id, node_patterns, reason, created_at, created_by, expires_at)
                 VALUES (5, :patterns, 'about to expire', :created_at, 'test', :expires_at)
-            """), {'created_at': datetime.datetime.now(timezone.utc), 'expires_at': soon_to_expire, 'patterns': json.dumps(['node1'])})
+            """), {'created_at': datetime.datetime.now(datetime.timezone.utc), 'expires_at': soon_to_expire, 'patterns': json.dumps(['node1'])})
             conn.commit()
 
         coord_config = CoordinationConfig(total_tokens=50)
@@ -395,7 +798,7 @@ class TestTokenDistributionUnderContention:
             conn.execute(text(f"""
                 INSERT INTO {tables["LeaderLock"]} (singleton, node, acquired_at, operation)
                 VALUES (1, 'other-node', :acquired_at, 'long-operation')
-            """), {'acquired_at': datetime.datetime.now(timezone.utc)})
+            """), {'acquired_at': datetime.datetime.now(datetime.timezone.utc)})
             conn.commit()
 
         coord_config = CoordinationConfig(
@@ -426,7 +829,7 @@ class TestTokenDistributionUnderContention:
         tables = schema.get_table_names(config)
         connection_string = postgres.url.render_as_string(hide_password=False)
 
-        now = datetime.datetime.now(timezone.utc)
+        now = datetime.datetime.now(datetime.timezone.utc)
 
         with postgres.connect() as conn:
             conn.execute(text(f'DELETE FROM {tables["Lock"]}'))
@@ -446,7 +849,7 @@ class TestTokenDistributionUnderContention:
                 conn.execute(text(f"""
                     INSERT INTO {tables["Lock"]} (token_id, node_patterns, reason, created_at, created_by, expires_at)
                     VALUES (:token_id, :patterns, 'test', :created_at, 'test', NULL)
-                """), {'token_id': token_id, 'created_at': datetime.datetime.now(timezone.utc), 'patterns': json.dumps(['nonexistent-%'])})
+                """), {'token_id': token_id, 'created_at': datetime.datetime.now(datetime.timezone.utc), 'patterns': json.dumps(['nonexistent-%'])})
             conn.commit()
 
         coord_config = CoordinationConfig(total_tokens=20)
@@ -467,7 +870,7 @@ class TestTokenDistributionUnderContention:
         tables = schema.get_table_names(config)
         connection_string = postgres.url.render_as_string(hide_password=False)
 
-        now = datetime.datetime.now(timezone.utc)
+        now = datetime.datetime.now(datetime.timezone.utc)
 
         with postgres.connect() as conn:
             conn.execute(text(f'DELETE FROM {tables["Lock"]}'))
@@ -493,13 +896,13 @@ class TestTokenDistributionUnderContention:
                 conn.execute(text(f"""
                     INSERT INTO {tables["Lock"]} (token_id, node_patterns, reason, created_at, created_by, expires_at)
                     VALUES (:token_id, :patterns, 'valid pattern', :created_at, 'test', NULL)
-                """), {'token_id': token_id, 'created_at': datetime.datetime.now(timezone.utc), 'patterns': json.dumps(['special-%'])})
+                """), {'token_id': token_id, 'created_at': datetime.datetime.now(datetime.timezone.utc), 'patterns': json.dumps(['special-%'])})
 
             for token_id in range(10, 20):
                 conn.execute(text(f"""
                     INSERT INTO {tables["Lock"]} (token_id, node_patterns, reason, created_at, created_by, expires_at)
                     VALUES (:token_id, :patterns, 'invalid pattern', :created_at, 'test', NULL)
-                """), {'token_id': token_id, 'created_at': datetime.datetime.now(timezone.utc), 'patterns': json.dumps(['missing-%'])})
+                """), {'token_id': token_id, 'created_at': datetime.datetime.now(datetime.timezone.utc), 'patterns': json.dumps(['missing-%'])})
             conn.commit()
 
         coord_config = CoordinationConfig(total_tokens=50)

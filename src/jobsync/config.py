@@ -24,6 +24,7 @@ class CoordinationConfig:
     leader_lock_timeout_sec: int = 30
     health_check_interval_sec: int = 30
     stale_leader_lock_age_sec: int = 300
+    stale_rebalance_lock_age_sec: int = 300
 
 
 sync = SimpleNamespace(
@@ -38,7 +39,7 @@ sync = SimpleNamespace(
         port=os.getenv('SYNC_SQL_PORT', 5432)
     ),
     coordination=SimpleNamespace(
-        enabled=os.getenv('SYNC_COORDINATION_ENABLED', 'true').lower() == 'true',
+        enabled=True,
         heartbeat_interval_sec=int(os.getenv('SYNC_HEARTBEAT_INTERVAL', '5')),
         heartbeat_timeout_sec=int(os.getenv('SYNC_HEARTBEAT_TIMEOUT', '15')),
         rebalance_check_interval_sec=int(os.getenv('SYNC_REBALANCE_INTERVAL', '30')),

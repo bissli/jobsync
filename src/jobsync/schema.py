@@ -24,6 +24,12 @@ def get_table_names(config: ModuleType = None) -> dict[str, str]:
     else:
         appname = 'sync_'
 
+    return get_table_names_for_appname(appname)
+
+
+def get_table_names_for_appname(appname: str) -> dict[str, str]:
+    """Get table names for a specific appname prefix.
+    """
     return {
         'Node': f'{appname}node',
         'Check': f'{appname}checkpoint',
