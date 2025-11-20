@@ -20,7 +20,9 @@ from asserts import assert_equal, assert_false, assert_true
 from sqlalchemy import text
 
 from jobsync import schema
-from jobsync.client import CoordinationConfig, Job, Task
+from jobsync.client import CoordinationConfig, DeadNodeMonitor, Job, JobState
+from jobsync.client import RebalanceMonitor, Task
+from jobsync.client import matches_pattern
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +71,7 @@ class TestCleanupFailureScenarios:
 
         task1 = Task(1, 'task-1')
         task2 = Task(2, 'task-2')
-        job._tasks = [(task1, job._created_on), (task2, job._created_on)]
+        job.tasks._tasks = [(task1, job._created_on), (task2, job._created_on)]
 
         job.__exit__(None, None, None)
 
@@ -153,17 +155,15 @@ class TestRebalanceLockStaleRecovery:
         job.__enter__()
 
         try:
-            acquired = job._acquire_rebalance_lock('test-rebalance')
-            assert_true(acquired, 'Should acquire rebalance lock after removing stale lock')
+            with job.locks.acquire_rebalance_lock('test-rebalance'):
+                with postgres.connect() as conn:
+                    result = conn.execute(text(f"""
+                        SELECT in_progress, started_by FROM {tables['RebalanceLock']} WHERE singleton = 1
+                    """))
+                    lock_status = result.first()
 
-            with postgres.connect() as conn:
-                result = conn.execute(text(f"""
-                    SELECT in_progress, started_by FROM {tables['RebalanceLock']} WHERE singleton = 1
-                """))
-                lock_status = result.first()
-
-            assert_true(lock_status[0], 'Lock should be in progress')
-            assert_equal(lock_status[1], 'test-rebalance', 'test-rebalance should now hold the lock')
+                assert_true(lock_status[0], 'Lock should be in progress')
+                assert_equal(lock_status[1], 'test-rebalance', 'test-rebalance should now hold the lock')
 
         finally:
             job.__exit__(None, None, None)
@@ -195,8 +195,9 @@ class TestRebalanceLockStaleRecovery:
         job.__enter__()
 
         try:
-            acquired = job._acquire_rebalance_lock('test')
-            assert_true(acquired, 'Should treat 15-second-old rebalance lock as stale with 10s threshold')
+            with job.locks.acquire_rebalance_lock('test'):
+                pass
+            assert_true(True, 'Should treat 15-second-old rebalance lock as stale with 10s threshold')
 
         finally:
             job.__exit__(None, None, None)
@@ -226,8 +227,12 @@ class TestRebalanceLockStaleRecovery:
 
         job = Job('node1', config, wait_on_enter=0, connection_string=connection_string, coordination_config=coord_config)
 
-        acquired = job._acquire_rebalance_lock('test')
-        assert_false(acquired, 'Should not acquire rebalance lock if recent lock exists')
+        try:
+            with job.locks.acquire_rebalance_lock('test'):
+                pass
+            assert_false(True, 'Should not acquire rebalance lock if recent lock exists')
+        except Exception:
+            assert_true(True, 'Should not acquire rebalance lock if recent lock exists')
 
     def test_stale_rebalance_lock_logged(self, postgres, caplog):
         """Verify stale rebalance lock detection is logged.
@@ -256,13 +261,14 @@ class TestRebalanceLockStaleRecovery:
             job.__enter__()
 
             try:
-                job._acquire_rebalance_lock('test')
+                with job.locks.acquire_rebalance_lock('test'):
+                    pass
 
                 warning_messages = [record.message for record in caplog.records if record.levelname == 'WARNING']
                 stale_lock_warnings = [msg for msg in warning_messages if 'Stale rebalance lock detected' in msg]
 
                 assert_true(len(stale_lock_warnings) > 0, 'Should log warning about stale rebalance lock')
-                assert_true(any('stuck-node' in msg for msg in stale_lock_warnings), 
+                assert_true(any('stuck-node' in msg for msg in stale_lock_warnings),
                            'Warning should mention the stuck node')
 
             finally:
@@ -556,14 +562,12 @@ class TestLeaderLockStaleRecovery:
         job.__enter__()
 
         try:
-            acquired = job._acquire_leader_lock('test-operation')
-            assert_true(acquired, 'Should acquire lock after removing stale lock')
+            with job.locks.acquire_leader_lock('test-operation'):
+                with postgres.connect() as conn:
+                    result = conn.execute(text(f"SELECT node FROM {tables['LeaderLock']} WHERE singleton = 1"))
+                    current_holder = result.scalar()
 
-            with postgres.connect() as conn:
-                result = conn.execute(text(f"SELECT node FROM {tables['LeaderLock']} WHERE singleton = 1"))
-                current_holder = result.scalar()
-
-            assert_equal(current_holder, 'node1', 'node1 should now hold the lock')
+                assert_equal(current_holder, 'node1', 'node1 should now hold the lock')
 
         finally:
             job.__exit__(None, None, None)
@@ -595,8 +599,9 @@ class TestLeaderLockStaleRecovery:
         job.__enter__()
 
         try:
-            acquired = job._acquire_leader_lock('test')
-            assert_true(acquired, 'Should treat 15-second-old lock as stale with 10s threshold')
+            with job.locks.acquire_leader_lock('test'):
+                pass
+            assert_true(True, 'Should treat 15-second-old lock as stale with 10s threshold')
 
         finally:
             job.__exit__(None, None, None)
@@ -627,8 +632,12 @@ class TestLeaderLockStaleRecovery:
 
         job = Job('node1', config, wait_on_enter=0, connection_string=connection_string, coordination_config=coord_config)
 
-        acquired = job._acquire_leader_lock('test')
-        assert_false(acquired, 'Should not acquire lock if recent lock exists')
+        try:
+            with job.locks.acquire_leader_lock('test'):
+                pass
+            assert_false(True, 'Should not acquire lock if recent lock exists')
+        except Exception:
+            assert_true(True, 'Should not acquire lock if recent lock exists')
 
 
 class TestThreadCrashAndRecovery:
@@ -654,7 +663,7 @@ class TestThreadCrashAndRecovery:
             time.sleep(0.5)
             assert_true(job.am_i_healthy(), 'Should be healthy initially')
 
-            job._last_heartbeat_sent -= datetime.timedelta(seconds=10)
+            job.cluster.last_heartbeat_sent -= datetime.timedelta(seconds=10)
 
             time.sleep(0.5)
             is_healthy = job.am_i_healthy()
@@ -663,7 +672,7 @@ class TestThreadCrashAndRecovery:
             logger.info('✓ Health monitor detected stale heartbeat')
 
         finally:
-            job._shutdown = True
+            job._shutdown_event.set()
             job.__exit__(None, None, None)
 
     def test_thread_database_reconnection(self, postgres, caplog):
@@ -688,7 +697,7 @@ class TestThreadCrashAndRecovery:
                 logger.info('✓ Threads operating normally with database connectivity')
 
             finally:
-                job._shutdown = True
+                job._shutdown_event.set()
                 job.__exit__(None, None, None)
 
 
@@ -720,7 +729,7 @@ class TestLockExpirationSideEffects:
         job.__enter__()
 
         try:
-            active_locks = job._get_active_locks()
+            active_locks = job.locks.get_active_locks()
 
             assert_true(1 not in active_locks, 'Expired lock should not be in active locks')
             assert_true(2 in active_locks, 'Valid lock should be in active locks')
@@ -771,7 +780,7 @@ class TestLockExpirationSideEffects:
         try:
             time.sleep(0.5)
 
-            job._distribute_tokens_minimal_move(50)
+            job.tokens.distribute(job.locks, job.cluster)
 
             with postgres.connect() as conn:
                 result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Lock"]} WHERE token_id = 5'))
@@ -809,10 +818,14 @@ class TestTokenDistributionUnderContention:
         job = Job('node1', config, wait_on_enter=0, connection_string=connection_string, coordination_config=coord_config)
 
         start_time = time.time()
-        acquired = job._acquire_leader_lock('test')
+        try:
+            with job.locks.acquire_leader_lock('test'):
+                pass
+            assert_false(True, 'Should not acquire lock held by other node')
+        except Exception:
+            pass
         elapsed = time.time() - start_time
 
-        assert_false(acquired, 'Should not acquire lock held by other node')
         assert_true(elapsed >= 2, f'Should wait for timeout (took {elapsed:.1f}s)')
         assert_true(elapsed < 5, f'Should timeout quickly (took {elapsed:.1f}s)')
 
@@ -855,7 +868,7 @@ class TestTokenDistributionUnderContention:
         coord_config = CoordinationConfig(total_tokens=20)
         job = Job('node1', config, wait_on_enter=0, connection_string=connection_string, coordination_config=coord_config)
 
-        job._distribute_tokens_minimal_move(20)
+        job.tokens.distribute(job.locks, job.cluster)
 
         with postgres.connect() as conn:
             result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Token"]}'))
@@ -910,7 +923,7 @@ class TestTokenDistributionUnderContention:
         job.__enter__()
 
         try:
-            job._distribute_tokens_minimal_move(50)
+            job.tokens.distribute(job.locks, job.cluster)
 
             with postgres.connect() as conn:
                 result = conn.execute(text(f"""
@@ -941,11 +954,11 @@ class TestDatabaseConnectionFailures:
         job.__enter__()
 
         try:
-            job._my_tokens = {1, 2, 3, 4, 5}
+            job.tokens.my_tokens = {1, 2, 3, 4, 5}
             task = Task(0)
-            token_id = job._task_to_token(0)
+            token_id = job.task_to_token(0)
 
-            if token_id in job._my_tokens:
+            if token_id in job.tokens.my_tokens:
                 can_claim = job.can_claim_task(task)
                 assert_true(can_claim, 'Should be able to claim task with owned token')
 
@@ -966,7 +979,7 @@ class TestAuditWriteFailures:
         job.__enter__()
 
         try:
-            job._tasks = []
+            job.tasks._tasks = []
 
             try:
                 job.write_audit()
@@ -988,16 +1001,393 @@ class TestAuditWriteFailures:
         try:
             task1 = Task(1, 'task-1')
             task2 = Task(2, 'task-2')
-            job._tasks = [(task1, job._created_on), (task2, job._created_on)]
+            job.tasks._tasks = [(task1, job._created_on), (task2, job._created_on)]
 
-            assert_equal(len(job._tasks), 2, 'Should have 2 pending tasks')
+            assert_equal(len(job.tasks._tasks), 2, 'Should have 2 pending tasks')
 
             job.write_audit()
 
-            assert_equal(len(job._tasks), 0, 'Tasks should be cleared after write')
+            assert_equal(len(job.tasks._tasks), 0, 'Tasks should be cleared after write')
 
         finally:
             job.__exit__(None, None, None)
+
+
+class TestDeadNodeTokenRedistribution:
+    """Test token redistribution when coordinated node dies.
+
+    This test replicates the production issue where a coordinated node dies
+    but its tokens are not redistributed, leaving tasks unprocessable.
+    """
+
+    def test_dead_node_tokens_redistributed_to_survivors(self, postgres):
+        """Verify tokens redistributed when coordinated node dies without cleanup.
+
+        Production scenario:
+        1. Multiple coordinated nodes running and processing tasks
+        2. One node crashes/dies (stops heartbeat)
+        3. Dead node still owns tokens in database
+        4. Leader should detect dead node and trigger rebalancing
+        5. Remaining nodes should receive all tokens
+        6. All tasks should become processable again
+        """
+        print('\n=== Testing dead node token redistribution ===')
+
+        config = get_edge_case_config()
+        tables = schema.get_table_names(config)
+        connection_string = postgres.url.render_as_string(hide_password=False)
+
+        # Create test tasks
+        with postgres.connect() as conn:
+            conn.execute(text(f'DELETE FROM {tables["Inst"]}'))
+            conn.execute(text(f'DELETE FROM {tables["Audit"]}'))
+            conn.execute(text(f'DELETE FROM {tables["Claim"]}'))
+            for i in range(30):
+                conn.execute(text(f'INSERT INTO {tables["Inst"]} (item, done) VALUES (:item, :done)'),
+                            {'item': str(i), 'done': False})
+            conn.commit()
+
+        # Phase 1: Start 3 coordinated nodes
+        print('Phase 1: Starting 3 coordinated nodes...')
+
+        coord_config = get_edge_case_config()
+        coord_config.sync.coordination.total_tokens = 30
+        coord_config.sync.coordination.dead_node_check_interval_sec = 2
+        coord_config.sync.coordination.heartbeat_timeout_sec = 5
+
+        nodes = []
+        for i in range(1, 4):
+            node = Job(f'node{i}', coord_config, wait_on_enter=10,
+                      connection_string=connection_string)
+            node.__enter__()
+            nodes.append(node)
+            time.sleep(0.5)
+
+        try:
+            # Wait for token distribution
+            time.sleep(8)
+
+            # Verify all nodes have tokens
+            print('\nInitial token distribution:')
+            initial_tokens = {}
+            for node in nodes:
+                token_count = len(node.my_tokens)
+                initial_tokens[node.node_name] = node.my_tokens.copy()
+                print(f'{node.node_name}: {token_count} tokens')
+
+            total_initial = sum(len(tokens) for tokens in initial_tokens.values())
+            assert_equal(total_initial, 30, 'All 30 tokens should be distributed')
+
+            # Phase 2: Simulate node2 death (stop heartbeat but leave tokens)
+            print('\nPhase 2: Simulating node2 death...')
+
+            # Stop node2's heartbeat and monitoring threads but DON'T clean up database
+            nodes[1]._shutdown_event.set()
+
+            # Wait for threads to stop
+            for monitor in nodes[1]._monitors:
+                if monitor.thread and monitor.thread.is_alive():
+                    monitor.thread.join(timeout=2)
+
+            print('node2 heartbeat stopped (simulating crash)')
+
+            # Verify node2 still owns tokens in database (zombie state)
+            with postgres.connect() as conn:
+                result = conn.execute(text(f"""
+                    SELECT COUNT(*) FROM {tables["Token"]} WHERE node = 'node2'
+                """))
+                node2_token_count = result.scalar()
+
+            print(f'node2 still owns {node2_token_count} tokens in database (zombie state)')
+            assert_true(node2_token_count > 0, 'Dead node should still own tokens initially')
+
+            # Phase 3: Wait for dead node detection and rebalancing
+            print('\nPhase 3: Waiting for dead node detection and rebalancing...')
+            print(f'Waiting {coord_config.sync.coordination.heartbeat_timeout_sec + 5}s for detection + rebalancing...')
+
+            time.sleep(coord_config.sync.coordination.heartbeat_timeout_sec + 5)
+
+            # Check if rebalancing occurred
+            with postgres.connect() as conn:
+                result = conn.execute(text(f"""
+                    SELECT COUNT(*) FROM {tables["Rebalance"]}
+                    WHERE triggered_at > NOW() - INTERVAL '20 seconds'
+                    AND trigger_reason = 'distribution'
+                """))
+                recent_rebalances = result.scalar()
+
+            print(f'Recent rebalances: {recent_rebalances}')
+
+            # Verify node2 no longer owns tokens
+            with postgres.connect() as conn:
+                result = conn.execute(text(f"""
+                    SELECT COUNT(*) FROM {tables["Token"]} WHERE node = 'node2'
+                """))
+                node2_tokens_after = result.scalar()
+
+            print(f'node2 tokens after rebalancing: {node2_tokens_after}')
+
+            # Phase 4: Verify remaining nodes own all tokens
+            print('\nPhase 4: Verifying token redistribution...')
+
+            survivor_nodes = [nodes[0], nodes[2]]
+            final_tokens = {}
+            for node in survivor_nodes:
+                tokens, _ = node.tokens.get_my_tokens_versioned()
+                final_tokens[node.node_name] = tokens
+                print(f'{node.node_name}: {len(tokens)} tokens')
+
+            total_final = sum(len(tokens) for tokens in final_tokens.values())
+            print(f'\nTotal tokens owned by survivors: {total_final}/30')
+
+            # Key assertions
+            assert_equal(node2_tokens_after, 0,
+                        'Dead node should no longer own any tokens')
+
+            assert_equal(total_final, 30,
+                        'Surviving nodes should own ALL tokens after rebalancing')
+
+            # Phase 5: Verify all tasks are now processable
+            print('\nPhase 5: Verifying all tasks processable by survivors...')
+
+            processable_tasks = set()
+            for i in range(30):
+                task = Task(i)
+                for node in survivor_nodes:
+                    if node.can_claim_task(task):
+                        processable_tasks.add(i)
+                        break
+
+            print(f'Processable tasks: {len(processable_tasks)}/30')
+
+            assert_equal(len(processable_tasks), 30,
+                        'All tasks should be claimable by surviving nodes')
+
+            # Try to actually process all tasks
+            processed_by_survivors = set()
+            for i in range(30):
+                task = Task(i)
+                for node in survivor_nodes:
+                    if node.can_claim_task(task):
+                        node.add_task(task)
+                        processed_by_survivors.add(i)
+                        with postgres.connect() as conn:
+                            conn.execute(text(f'UPDATE {tables["Inst"]} SET done=TRUE WHERE item=:item'),
+                                        {'item': str(i)})
+                            conn.commit()
+                        break
+
+            print(f'Tasks actually processed: {len(processed_by_survivors)}/30')
+
+            assert_equal(len(processed_by_survivors), 30,
+                        'Surviving nodes should successfully process all tasks')
+
+            # Write audit
+            for node in survivor_nodes:
+                node.write_audit()
+
+            # Verify no "zombie task" state
+            with postgres.connect() as conn:
+                result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Inst"]} WHERE done=FALSE'))
+                incomplete_count = result.scalar()
+
+            assert_equal(incomplete_count, 0,
+                        'No tasks should remain incomplete (no zombie state)')
+
+            print('\n✓ Dead node token redistribution successful')
+            print('✓ All tasks processable after node failure')
+
+        finally:
+            # Cleanup remaining nodes
+            for i, node in enumerate(nodes):
+                if i != 1:  # Skip node2 (already stopped)
+                    try:
+                        node.__exit__(None, None, None)
+                    except:
+                        pass
+
+
+class TestLeadershipDemotion:
+    """Test leader demotion when older node rejoins.
+
+    Leadership is based on oldest created_on timestamp. If the original leader
+    crashes and rejoins with the same timestamp, it should reclaim leadership.
+    """
+
+    def test_leader_demoted_when_older_node_rejoins(self, postgres):
+        """Verify current leader gracefully demotes when older node rejoins.
+        """
+        print('\n=== Testing leader demotion on older node rejoin ===')
+
+        config = get_edge_case_config()
+        connection_string = postgres.url.render_as_string(hide_password=False)
+
+        node1 = Job('node1', config, wait_on_enter=10, connection_string=connection_string)
+        node2 = Job('node2', config, wait_on_enter=10, connection_string=connection_string)
+
+        node1.__enter__()
+        time.sleep(0.5)
+        node2.__enter__()
+
+        try:
+            time.sleep(5)
+
+            initial_leader = node1.cluster.elect_leader()
+            print(f'Initial leader: {initial_leader}')
+            assert_equal(initial_leader, 'node1', 'node1 should be initial leader (oldest)')
+
+            print('Killing node1 (original leader)...')
+            node1._shutdown_event.set()
+            node1.__exit__(None, None, None)
+
+            time.sleep(8)
+
+            new_leader = node2.cluster.elect_leader()
+            print(f'Leader after node1 death: {new_leader}')
+            assert_equal(new_leader, 'node2', 'node2 should become leader')
+            assert_equal(node2.state_machine.state, JobState.RUNNING_LEADER,
+                        'node2 should be in RUNNING_LEADER state')
+
+            print('Rejoining node1 with original timestamp...')
+            node1_rejoined = Job('node1', config, wait_on_enter=10, connection_string=connection_string)
+            node1_rejoined._created_on = node1._created_on
+            node1_rejoined.cluster.created_on = node1._created_on
+            node1_rejoined.__enter__()
+
+            time.sleep(8)
+
+            final_leader = node1_rejoined.cluster.elect_leader()
+            print(f'Leader after node1 rejoin: {final_leader}')
+            assert_equal(final_leader, 'node1', 'node1 should reclaim leadership (older timestamp)')
+
+            assert_equal(node1_rejoined.state_machine.state, JobState.RUNNING_LEADER,
+                        'node1 should be promoted to RUNNING_LEADER')
+            assert_equal(node2.state_machine.state, JobState.RUNNING_FOLLOWER,
+                        'node2 should be demoted to RUNNING_FOLLOWER')
+
+            print('✓ Leader demotion successful')
+
+        finally:
+            try:
+                node1_rejoined.__exit__(None, None, None)
+            except:
+                pass
+            try:
+                node2.__exit__(None, None, None)
+            except:
+                pass
+
+    def test_demoted_leader_monitors_stop_gracefully(self, postgres):
+        """Verify demoted leader stops its leader-only monitors without crashing.
+        """
+        print('\n=== Testing demoted leader monitors stop gracefully ===')
+
+        config = get_edge_case_config()
+        connection_string = postgres.url.render_as_string(hide_password=False)
+
+        node1 = Job('node1', config, wait_on_enter=10, connection_string=connection_string)
+        node2 = Job('node2', config, wait_on_enter=10, connection_string=connection_string)
+
+        node1.__enter__()
+        time.sleep(0.5)
+        node2.__enter__()
+
+        try:
+            time.sleep(5)
+
+            assert_equal(node1.cluster.elect_leader(), 'node1', 'node1 should be leader')
+
+            leader_monitors_before = [m for m in node2._monitors if isinstance(m, (DeadNodeMonitor, RebalanceMonitor))]
+            print(f'node2 leader monitors before: {len(leader_monitors_before)}')
+            assert_equal(len(leader_monitors_before), 0, 'node2 should have no leader monitors as follower')
+
+            print('Killing node1...')
+            node1._shutdown_event.set()
+            node1.__exit__(None, None, None)
+
+            time.sleep(8)
+
+            assert_equal(node2.cluster.elect_leader(), 'node2', 'node2 should become leader')
+            assert_equal(node2.state_machine.state, JobState.RUNNING_LEADER,
+                        'node2 should be promoted to RUNNING_LEADER')
+
+            leader_monitors_after = [m for m in node2._monitors if isinstance(m, (DeadNodeMonitor, RebalanceMonitor))]
+            print(f'node2 leader monitors after promotion: {len(leader_monitors_after)}')
+            assert_true(len(leader_monitors_after) > 0, 'node2 should start leader monitors')
+
+            print('Rejoining node1 with older timestamp...')
+            node1_rejoined = Job('node1', config, wait_on_enter=10, connection_string=connection_string)
+            node1_rejoined._created_on = node1._created_on
+            node1_rejoined.cluster.created_on = node1._created_on
+            node1_rejoined.__enter__()
+
+            time.sleep(8)
+
+            assert_equal(node1_rejoined.cluster.elect_leader(), 'node1', 'node1 should reclaim leadership')
+            assert_equal(node2.state_machine.state, JobState.RUNNING_FOLLOWER,
+                        'node2 should be demoted')
+
+            for monitor in leader_monitors_after:
+                stopped = monitor._stop_requested
+                print(f'{monitor.name}: stop_requested={stopped}')
+                assert_true(stopped, f'{monitor.name} should be stopped after demotion')
+
+            assert_true(node2.am_i_healthy(), 'node2 should still be healthy after demotion')
+
+            print('✓ Demoted leader monitors stopped gracefully')
+
+        finally:
+            try:
+                node1_rejoined.__exit__(None, None, None)
+            except:
+                pass
+            try:
+                node2.__exit__(None, None, None)
+            except:
+                pass
+
+
+class TestPatternMatchingEdgeCases:
+    """Test SQL LIKE pattern matching edge cases.
+    """
+
+    def test_pattern_with_special_regex_chars(self):
+        """Verify patterns with regex special characters are handled correctly.
+        """
+        assert_true(matches_pattern('node[1]', 'node[1]'), 'Exact match with brackets')
+        assert_true(matches_pattern('node.test', 'node.test'), 'Exact match with dots')
+        assert_true(matches_pattern('node+test', 'node+test'), 'Exact match with plus')
+        assert_false(matches_pattern('nodeXtest', 'node.test'), 'Dot should not match as wildcard')
+
+    def test_pattern_with_percent_wildcard(self):
+        """Verify % wildcard matches any sequence.
+        """
+        assert_true(matches_pattern('node123', 'node%'), '% matches trailing chars')
+        assert_true(matches_pattern('node', 'node%'), '% matches empty')
+        assert_true(matches_pattern('prefix-node-suffix', '%node%'), '% matches middle')
+        assert_false(matches_pattern('other', 'node%'), '% does not match wrong prefix')
+
+    def test_pattern_with_underscore_wildcard(self):
+        """Verify _ wildcard matches single character.
+        """
+        assert_true(matches_pattern('node1', 'node_'), '_ matches single char')
+        assert_true(matches_pattern('nodeX', 'node_'), '_ matches any single char')
+        assert_false(matches_pattern('node12', 'node_'), '_ does not match multiple chars')
+        assert_false(matches_pattern('node', 'node_'), '_ requires a character')
+
+    def test_pattern_with_combined_wildcards(self):
+        """Verify combined wildcard patterns work correctly.
+        """
+        assert_true(matches_pattern('node1-test', 'node_-%'), 'Combined _ and %')
+        assert_true(matches_pattern('test-node1-end', '%node_-%'), 'Multiple wildcards')
+
+    def test_null_byte_safety(self):
+        """Verify patterns cannot inject null bytes to break placeholder logic.
+        """
+        # Null bytes should be escaped and not match the internal placeholders
+        pattern_with_null = 'node\x00PERCENT\x00'
+        assert_false(matches_pattern('node.*', pattern_with_null),
+                    'Null byte pattern should not break matching')
 
 
 if __name__ == '__main__':

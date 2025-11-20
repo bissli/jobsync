@@ -39,9 +39,10 @@ def get_callback_test_config():
             token_refresh_steady_interval_sec=5,
             total_tokens=100,
             locks_enabled=True,
-            lock_orphan_warning_hours=24,
             leader_lock_timeout_sec=10,
-            health_check_interval_sec=5
+            health_check_interval_sec=5,
+            stale_leader_lock_age_sec=300,
+            stale_rebalance_lock_age_sec=300
         )
     )
     return coord_config

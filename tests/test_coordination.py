@@ -71,7 +71,7 @@ def node_worker(node_name: str, connection_string: str, items: list, barrier: mu
             # Wait for all nodes to be ready
             barrier.wait()
 
-            logger.info(f'{node_name}: Started with {len(job._my_tokens)} tokens')
+            logger.info(f'{node_name}: Started with {len(job.my_tokens)} tokens')
 
             # Try to claim tasks
             claimed = []
@@ -131,16 +131,16 @@ def test_3node_cluster_formation(postgres):
 
         # Verify leader elected (should be node1 - oldest)
         for node in nodes:
-            leader = node._elect_leader()
+            leader = node.cluster.elect_leader()
             print(f'{node.node_name}: Leader is {leader}')
             assert_equal(leader, 'node1', 'node1 should be elected leader')
 
         # Verify tokens distributed
         total_tokens = 0
         for node in nodes:
-            token_count = len(node._my_tokens)
+            token_count = len(node.my_tokens)
             total_tokens += token_count
-            print(f'{node.node_name}: {token_count} tokens, version {node._token_version}')
+            print(f'{node.node_name}: {token_count} tokens, version {node.token_version}')
             assert_true(token_count > 0, f'{node.node_name} should have tokens')
 
         # Total should equal config total_tokens (100)
@@ -148,7 +148,7 @@ def test_3node_cluster_formation(postgres):
 
         # Verify balanced distribution (each node should have ~33 tokens)
         for node in nodes:
-            token_count = len(node._my_tokens)
+            token_count = len(node.my_tokens)
             assert_true(25 <= token_count <= 40,
                        f'{node.node_name} should have balanced token count (got {token_count})')
 
@@ -237,12 +237,12 @@ def test_node_death_and_rebalancing(postgres):
         time.sleep(5)
 
         # Record initial token distribution
-        initial_tokens = {node.node_name: len(node._my_tokens) for node in nodes}
+        initial_tokens = {node.node_name: len(node.my_tokens) for node in nodes}
         print(f'Initial tokens: {initial_tokens}')
 
         # Kill node2 (simulate death by stopping heartbeat and exiting)
         print('Killing node2...')
-        nodes[1]._shutdown = True
+        nodes[1]._shutdown_event.set()
         nodes[1].__exit__(None, None, None)
 
         # Wait for dead node detection (timeout + check interval)
@@ -258,14 +258,15 @@ def test_node_death_and_rebalancing(postgres):
 
         # Check that node1 and node3 have more tokens now
         for node in [nodes[0], nodes[2]]:
-            new_token_count = len(node._get_my_tokens())
+            new_tokens, _ = node.tokens.get_my_tokens_versioned()
+            new_token_count = len(new_tokens)
             print(f'{node.node_name}: {initial_tokens[node.node_name]} -> {new_token_count} tokens')
             # Should have gained tokens (approximately 50 each instead of 33)
             assert_true(new_token_count > initial_tokens[node.node_name],
                        f'{node.node_name} should have more tokens after rebalance')
 
         # Verify total tokens still 100
-        total = sum(len(node._get_my_tokens()) for node in [nodes[0], nodes[2]])
+        total = sum(len(node.tokens.get_my_tokens_versioned()[0]) for node in [nodes[0], nodes[2]])
         print(f'Total tokens across remaining nodes: {total}')
         assert_true(total >= 90, 'Most tokens should be redistributed')
 
@@ -311,7 +312,7 @@ def test_lock_registration_and_enforcement(postgres):
 
         locked_token_owners = {}
         for task_id in range(10):
-            token_id = node1._task_to_token(task_id)
+            token_id = node1.task_to_token(task_id)
 
             with postgres.connect() as conn:
                 result = conn.execute(text(f'SELECT node FROM {tables["Token"]} WHERE token_id = :token_id'),
@@ -357,11 +358,10 @@ def test_health_monitoring(postgres):
         # Initially should be healthy
         time.sleep(3)
         assert_true(node.am_i_healthy(), 'Node should be healthy initially')
-        print(f'✓ Node is healthy (heartbeat age: {(node._last_heartbeat_sent)})')
+        print(f'✓ Node is healthy (heartbeat age: {(node.cluster.last_heartbeat_sent)})')
 
         # Simulate heartbeat thread failure by stopping it
-        node._heartbeat_thread = None
-        node._last_heartbeat_sent = node._last_heartbeat_sent - timedelta(seconds=20)
+        node.cluster.last_heartbeat_sent = node.cluster.last_heartbeat_sent - timedelta(seconds=20)
 
         # Should now be unhealthy (heartbeat too old)
         is_healthy = node.am_i_healthy()
@@ -371,7 +371,7 @@ def test_health_monitoring(postgres):
         print('✓ Health monitoring works correctly')
 
     finally:
-        node._shutdown = True
+        node._shutdown_event.set()
         node.__exit__(None, None, None)
 
 
@@ -393,25 +393,25 @@ def test_leader_failover(postgres):
         time.sleep(5)
 
         # Verify node1 is leader
-        leader = nodes[0]._elect_leader()
+        leader = nodes[0].cluster.elect_leader()
         print(f'Initial leader: {leader}')
         assert_equal(leader, 'node1', 'node1 should be initial leader')
 
         # Kill node1
         print('Killing leader (node1)...')
-        nodes[0]._shutdown = True
+        nodes[0]._shutdown_event.set()
         nodes[0].__exit__(None, None, None)
 
         # Wait for timeout + detection
         time.sleep(12)
 
         # New leader should be elected (node2 - now oldest)
-        new_leader = nodes[1]._elect_leader()
+        new_leader = nodes[1].cluster.elect_leader()
         print(f'New leader after failover: {new_leader}')
         assert_equal(new_leader, 'node2', 'node2 should become new leader')
 
         # Verify node3 also sees node2 as leader
-        leader_from_node3 = nodes[2]._elect_leader()
+        leader_from_node3 = nodes[2].cluster.elect_leader()
         assert_equal(leader_from_node3, 'node2', 'All nodes should agree on leader')
 
         print('✓ Leader failover successful')
@@ -421,6 +421,133 @@ def test_leader_failover(postgres):
             try:
                 node.__exit__(None, None, None)
             except:
+                pass
+
+
+def test_follower_promotion_starts_leader_duties(postgres):
+    """Test that follower promoted to leader starts monitoring threads and performs rebalancing.
+    
+    This test verifies the critical scenario where:
+    1. Leader node dies
+    2. Follower is elected as new leader
+    3. New leader starts monitoring threads (the bug!)
+    4. New leader detects dead node and triggers rebalancing
+    5. Tokens are redistributed to surviving nodes
+    
+    Without the fix, the new leader never starts monitoring threads,
+    so dead nodes aren't cleaned up and tokens aren't redistributed.
+    """
+    print('\n=== Testing follower promotion to leader ===')
+
+    config = get_coordination_config()
+    tables = schema.get_table_names(config)
+    connection_string = postgres.url.render_as_string(hide_password=False)
+
+    # Start 3 nodes (node1 will be initial leader)
+    nodes = []
+    for i in range(1, 4):
+        node = Job(f'node{i}', config, wait_on_enter=15, connection_string=connection_string)
+        node.__enter__()
+        nodes.append(node)
+        time.sleep(0.5)
+
+    try:
+        time.sleep(5)
+
+        # Verify node1 is initial leader
+        initial_leader = nodes[0].cluster.elect_leader()
+        print(f'Initial leader: {initial_leader}')
+        assert_equal(initial_leader, 'node1', 'node1 should be initial leader')
+
+        # Record initial token distribution
+        initial_tokens = {}
+        for node in nodes:
+            tokens = node.my_tokens
+            initial_tokens[node.node_name] = len(tokens)
+            print(f'{node.node_name}: {len(tokens)} tokens')
+
+        total_initial = sum(initial_tokens.values())
+        assert_equal(total_initial, 100, 'All 100 tokens should be distributed')
+
+        # Kill the leader (node1) - simulate crash by stopping threads but NOT cleaning up DB
+        print('\nKilling leader (node1)...')
+        nodes[0]._shutdown_event.set()
+
+        # Wait for threads to stop (simulates process death, but DB row stays with stale heartbeat)
+        for monitor in nodes[0]._monitors:
+            if monitor.thread and monitor.thread.is_alive():
+                monitor.thread.join(timeout=5)
+
+        # Wait for heartbeat timeout + dead node detection + rebalancing
+        # Need: heartbeat_timeout (6s) + dead_node_check_interval (3s) + buffer
+        print('Waiting for new leader to detect death and rebalance...')
+        time.sleep(15)
+
+        # Verify node2 is now leader
+        new_leader = nodes[1].cluster.elect_leader()
+        print(f'\nNew leader after failover: {new_leader}')
+        assert_equal(new_leader, 'node2', 'node2 should become new leader')
+
+        # Verify node1 is detected as dead and removed from database
+        with postgres.connect() as conn:
+            result = conn.execute(text(f"""
+                SELECT COUNT(*) FROM {tables["Node"]} WHERE name = 'node1'
+            """))
+            node1_count = result.scalar()
+
+        print(f'node1 still in database: {node1_count > 0}')
+        assert_equal(node1_count, 0, 
+                    'Dead leader should be removed from Node table by new leader')
+
+        # Verify tokens were redistributed (THIS IS THE KEY TEST)
+        print('\nToken distribution after rebalancing:')
+        final_tokens = {}
+        for node in [nodes[1], nodes[2]]:
+            tokens = node.my_tokens
+            final_tokens[node.node_name] = len(tokens)
+            print(f'{node.node_name}: {initial_tokens[node.node_name]} -> {len(tokens)} tokens')
+
+        total_final = sum(final_tokens.values())
+        print(f'\nTotal tokens after rebalancing: {total_final}/100')
+
+        # Critical assertion - this fails without the fix
+        assert_equal(total_final, 100,
+                    'All tokens should be redistributed to surviving nodes '
+                    '(new leader must start monitoring threads!)')
+
+        for node_name, token_count in final_tokens.items():
+            assert_true(token_count > initial_tokens[node_name],
+                       f'{node_name} should have gained tokens after leader death')
+            assert_true(45 <= token_count <= 55,
+                       f'{node_name} should have ~50 tokens (got {token_count})')
+
+        # Verify rebalancing was logged by new leader
+        with postgres.connect() as conn:
+            result = conn.execute(text(f"""
+                SELECT COUNT(*) FROM {tables["Rebalance"]}
+                WHERE triggered_at > NOW() - INTERVAL '30 seconds'
+                AND leader_node = 'node2'
+            """))
+            recent_rebalances = result.scalar()
+
+        print(f'\nRecent rebalances by node2: {recent_rebalances}')
+        assert_true(recent_rebalances > 0,
+                   'New leader should have logged rebalancing event')
+
+        print('✓ Follower promotion and leader duties successful')
+
+    finally:
+        # Cleanup: node1 was crashed (manual cleanup), node2/3 normal exit
+        try:
+            nodes[0]._cleanup()
+            nodes[0].db.dispose()
+        except Exception:
+            pass
+        
+        for node in [nodes[1], nodes[2]]:
+            try:
+                node.__exit__(None, None, None)
+            except Exception:
                 pass
 
 
@@ -457,7 +584,7 @@ def test_node_rejoin_restores_original_allocation(postgres):
         # Record initial token allocations
         original_tokens = {}
         for node in nodes:
-            tokens = node._get_my_tokens()
+            tokens = node.my_tokens
             original_tokens[node.node_name] = tokens.copy()
             print(f'{node.node_name}: {len(tokens)} tokens initially')
 
@@ -468,7 +595,7 @@ def test_node_rejoin_restores_original_allocation(postgres):
         # Phase 2: Kill nodeD
         print('\nPhase 2: Killing nodeD...')
         nodeD = nodes[3]
-        nodeD._shutdown = True
+        nodeD._shutdown_event.set()
         nodeD.__exit__(None, None, None)
 
         # Wait for dead node detection and rebalancing
@@ -478,7 +605,7 @@ def test_node_rejoin_restores_original_allocation(postgres):
         print('Verifying redistribution after nodeD death:')
         surviving_nodes = nodes[:3]
         for node in surviving_nodes:
-            new_tokens = node._get_my_tokens()
+            new_tokens = node.my_tokens
             print(f'{node.node_name}: {len(original_tokens[node.node_name])} -> {len(new_tokens)} tokens')
             assert_true(len(new_tokens) > len(original_tokens[node.node_name]),
                        f'{node.node_name} should have gained tokens after nodeD died')
@@ -496,7 +623,7 @@ def test_node_rejoin_restores_original_allocation(postgres):
         print('\nPhase 4: Verifying original allocations restored:')
         all_restored = True
         for node in nodes:
-            current_tokens = node._get_my_tokens()
+            current_tokens = node.my_tokens
             original = original_tokens[node.node_name]
 
             print(f'{node.node_name}: original={len(original)}, current={len(current_tokens)}, '
@@ -512,7 +639,7 @@ def test_node_rejoin_restores_original_allocation(postgres):
         assert_true(all_restored, 'All nodes should have their original token allocations restored')
 
         # Verify total is still 100
-        total_final = sum(len(node._get_my_tokens()) for node in nodes)
+        total_final = sum(len(node.my_tokens) for node in nodes)
         assert_equal(total_final, 100, 'All 100 tokens should be distributed after rejoin')
 
         print('✓ Node rejoin successfully restored original allocation')

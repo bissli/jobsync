@@ -1142,7 +1142,7 @@ def production_lock_pattern():
 
 ### Fallback Pattern Support
 
-The lock system supports ordered fallback patterns for high availability:
+The lock system supports ordered fallback patterns for high availability. Patterns are stored as JSONB arrays in the database (even single patterns become single-element arrays).
 
 ```python
 def register_locks_with_fallback(job):
@@ -1153,6 +1153,8 @@ def register_locks_with_fallback(job):
     2. If no match, try second pattern
     3. Continue until a match is found
     4. If no patterns match, issue warning and treat as unlocked
+    
+    Storage: node_patterns stored as JSONB array ['pattern1', 'pattern2', ...]
     """
     # Example 1: Prefer primary, fall back to pool
     job.register_lock(
@@ -1594,8 +1596,9 @@ FROM stats;
 
 **View All Locks with Details:**
 ```sql
+-- node_patterns is JSONB array (even for single patterns)
 SELECT 
-    node_patterns,
+    node_patterns::text as patterns,
     COUNT(*) as locked_token_count,
     reason,
     expires_at,
@@ -1613,9 +1616,10 @@ ORDER BY locked_token_count DESC;
 **Locks with Token Assignments:**
 ```sql
 -- Show locks and which nodes actually own the tokens
+-- node_patterns is JSONB array of ordered fallback patterns
 SELECT 
     l.token_id,
-    l.node_patterns,
+    l.node_patterns::text as patterns,
     t.node as actual_node,
     l.reason,
     l.created_by,

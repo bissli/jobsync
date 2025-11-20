@@ -245,7 +245,7 @@ LIMIT 20;
 \echo 'Used for resource requirements (GPU, high memory, data locality)'
 \echo ''
 SELECT 
-    node_patterns,
+    node_patterns::text as patterns,
     COUNT(*) as locked_token_count,
     STRING_AGG(DISTINCT created_by, ', ') as created_by_nodes,
     MIN(created_at) as first_created,
@@ -258,19 +258,28 @@ ORDER BY locked_token_count DESC;
 \echo ''
 \echo 'Lock Pattern Matching (First 20 Tokens):'
 \echo '(Verify locked tokens are assigned to matching nodes)'
+\echo '(node_patterns is JSONB array - patterns tried in order)'
+WITH lock_patterns AS (
+    SELECT 
+        l.token_id,
+        l.node_patterns::text as patterns_text,
+        jsonb_array_elements_text(l.node_patterns) as pattern,
+        l.reason,
+        l.created_by,
+        t.node as assigned_node
+    FROM sync_lock l
+    JOIN sync_token t ON l.token_id = t.token_id
+)
 SELECT 
-    l.token_id,
-    l.node_patterns,
-    t.node as assigned_node,
-    l.reason,
-    l.created_by,
-    CASE 
-        WHEN t.node LIKE ANY(STRING_TO_ARRAY(l.node_patterns::text, ',')) THEN '✓ MATCH'
-        ELSE '✗ MISMATCH'
-    END as pattern_status
-FROM sync_lock l
-JOIN sync_token t ON l.token_id = t.token_id
-ORDER BY l.token_id
+    token_id,
+    patterns_text,
+    assigned_node,
+    reason,
+    created_by,
+    bool_or(assigned_node LIKE pattern) as matches_any_pattern
+FROM lock_patterns
+GROUP BY token_id, patterns_text, assigned_node, reason, created_by
+ORDER BY token_id
 LIMIT 20;
 
 \echo ''

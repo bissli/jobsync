@@ -436,5 +436,75 @@ class TestLargeScale:
             assert assignments[tid] == pattern
 
 
+class TestMinimalMoveDistributionEdgeCases:
+    """Test minimal-move distribution algorithm edge cases from production scenarios.
+    """
+
+    def test_empty_nodes_list(self):
+        """Verify distribution handles empty nodes gracefully.
+        """
+        assignments, moves = compute_minimal_move_distribution(
+            total_tokens=100,
+            active_nodes=[],
+            current_assignments={},
+            locked_tokens={},
+            pattern_matcher=exact_match
+        )
+
+        assert len(assignments) == 0, 'No assignments with no nodes'
+        assert moves == 0, 'No moves with no nodes'
+
+    def test_all_tokens_locked_to_nonexistent_pattern(self):
+        """Verify behavior when all tokens locked to pattern with no matching nodes.
+        """
+        locked = {i: ['missing-%'] for i in range(10)}
+
+        assignments, moves = compute_minimal_move_distribution(
+            total_tokens=10,
+            active_nodes=['node1', 'node2'],
+            current_assignments={},
+            locked_tokens=locked,
+            pattern_matcher=wildcard_match
+        )
+
+        assert len(assignments) == 0, 'No assignments when locks match no nodes'
+
+    def test_fallback_patterns_used(self):
+        """Verify fallback patterns are tried when primary pattern fails.
+        """
+        locked = {
+            5: ['missing-%', 'special-%', 'node%']
+        }
+
+        assignments, moves = compute_minimal_move_distribution(
+            total_tokens=10,
+            active_nodes=['node1', 'special-alpha'],
+            current_assignments={},
+            locked_tokens=locked,
+            pattern_matcher=wildcard_match
+        )
+
+        assert assignments[5] == 'special-alpha', 'Should use second fallback pattern when first fails'
+
+    def test_reverse_iteration_minimizes_moves(self):
+        """Verify reverse iteration helps minimize token movement.
+        
+        This test documents the behavior of the reverse iteration optimization.
+        """
+        current = {i: 'node1' if i < 70 else 'node2' for i in range(100)}
+
+        assignments_reverse, moves_reverse = compute_minimal_move_distribution(
+            total_tokens=100,
+            active_nodes=['node1', 'node2', 'node3'],
+            current_assignments=current,
+            locked_tokens={},
+            pattern_matcher=exact_match
+        )
+
+        # Each node should get ~33 tokens, so expect ~34 moves minimum
+        assert moves_reverse >= 30, 'Should require rebalancing moves'
+        assert moves_reverse <= 45, 'Reverse iteration should minimize moves'
+
+
 if __name__ == '__main__':
     __import__('pytest').main([__file__])

@@ -57,7 +57,8 @@ class TestLockClearing:
             conn.execute(text(f'DELETE FROM {tables["Lock"]}'))
             conn.commit()
 
-        job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
+        connection_string = postgres.url.render_as_string(hide_password=False)
+        job = Job('node1', config, connection_string=connection_string)
 
         job.register_lock('task-1', 'pattern-1', 'reason-1')
         job.register_lock('task-2', 'pattern-2', 'reason-2')
@@ -185,7 +186,8 @@ class TestLockListing:
             conn.execute(text(f'DELETE FROM {tables["Lock"]}'))
             conn.commit()
 
-        job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
+        connection_string = postgres.url.render_as_string(hide_password=False)
+        job = Job('node1', config, connection_string=connection_string)
 
         job.register_lock('task-1', 'pattern-1', 'not expired')
         job.register_lock('task-2', 'pattern-2', 'expires soon', expires_in_days=1)
@@ -232,11 +234,10 @@ class TestClearExistingLocks:
             job.register_lock('task-1', 'pattern-OLD', 'first run')
             job.register_lock('task-2', 'pattern-OLD', 'first run')
 
-        job1 = Job('node1', config, connection_string=connection_string,
-                   lock_provider=first_lock_provider, clear_existing_locks=False)
-        job1._register_node()
-        if job1._lock_provider and job1._locks_enabled:
-            job1._lock_provider(job1)
+        with Job('node1', config, connection_string=connection_string,
+                 lock_provider=first_lock_provider, clear_existing_locks=False,
+                 wait_on_enter=0, wait_on_exit=0):
+            pass
 
         with postgres.connect() as conn:
             count_after_first = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Lock"]} WHERE created_by = :creator'),
@@ -246,13 +247,10 @@ class TestClearExistingLocks:
         def second_lock_provider(job):
             job.register_lock('task-3', 'pattern-NEW', 'second run')
 
-        job2 = Job('node1', config, connection_string=connection_string,
-                   lock_provider=second_lock_provider, clear_existing_locks=True)
-        job2._register_node()
-        if job2._lock_provider and job2._locks_enabled:
-            if job2._clear_existing_locks:
-                job2.clear_locks_by_creator(job2.node_name)
-            job2._lock_provider(job2)
+        with Job('node1', config, connection_string=connection_string,
+                 lock_provider=second_lock_provider, clear_existing_locks=True,
+                 wait_on_enter=0, wait_on_exit=0):
+            pass
 
         with postgres.connect() as conn:
             result = conn.execute(text(f'SELECT node_patterns FROM {tables["Lock"]} WHERE created_by = :creator'),
@@ -279,22 +277,18 @@ class TestClearExistingLocks:
         def first_lock_provider(job):
             job.register_lock('task-1', 'pattern-OLD', 'first run')
 
-        job1 = Job('node1', config, connection_string=connection_string,
-                   lock_provider=first_lock_provider, clear_existing_locks=False)
-        job1._register_node()
-        if job1._lock_provider and job1._locks_enabled:
-            job1._lock_provider(job1)
+        with Job('node1', config, connection_string=connection_string,
+                 lock_provider=first_lock_provider, clear_existing_locks=False,
+                 wait_on_enter=0, wait_on_exit=0):
+            pass
 
         def second_lock_provider(job):
             job.register_lock('task-2', 'pattern-NEW', 'second run')
 
-        job2 = Job('node1', config, connection_string=connection_string,
-                   lock_provider=second_lock_provider, clear_existing_locks=False)
-        job2._register_node()
-        if job2._lock_provider and job2._locks_enabled:
-            if job2._clear_existing_locks:
-                job2.clear_locks_by_creator(job2.node_name)
-            job2._lock_provider(job2)
+        with Job('node1', config, connection_string=connection_string,
+                 lock_provider=second_lock_provider, clear_existing_locks=False,
+                 wait_on_enter=0, wait_on_exit=0):
+            pass
 
         with postgres.connect() as conn:
             result = conn.execute(text(f'SELECT node_patterns FROM {tables["Lock"]} WHERE created_by = :creator ORDER BY token_id'),
@@ -397,11 +391,8 @@ class TestConcurrentLockRegistration:
             job.register_lock('task-X3', 'special-node', 'lock X3')
 
         for i in range(1, 6):
-            job = Job(f'node{i}', config, connection_string=connection_string,
-                     lock_provider=shared_lock_provider)
-            job._register_node()
-            if job._lock_provider and job._locks_enabled:
-                job._lock_provider(job)
+            job = Job(f'node{i}', config, connection_string=connection_string)
+            shared_lock_provider(job)
 
         with postgres.connect() as conn:
             result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Lock"]}'))

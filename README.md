@@ -195,15 +195,18 @@ The leader automatically rebalances tokens as workers join and leave.
 
 ### Task Pinning
 
-Lock specific tasks to specific workers using patterns:
+Lock specific tasks to specific workers using patterns (supports single pattern or ordered fallback list):
 
 ```python
 def register_locks(job):
     gpu_tasks = get_gpu_task_ids()
     locks = [
-        (task_id, ['gpu-01', '%-gpu'], 'requires_gpu')  # Fallback support
+        # Ordered fallback: try gpu-01 first, then any GPU node
+        (task_id, ['gpu-01', '%-gpu'], 'requires_gpu')
         for task_id in gpu_tasks
     ]
+    # Simple case: single pattern string also accepted
+    # locks.append((task_id, '%-gpu', 'requires_gpu'))
     job.register_locks_bulk(locks)
 
 with Job('worker-gpu-01', config, 

@@ -13,7 +13,7 @@ from asserts import assert_equal, assert_true
 from sqlalchemy import text
 
 from jobsync import schema
-from jobsync.client import CoordinationConfig, Job, Task
+from jobsync.client import CoordinationConfig, Job, JobState, Task
 
 logger = logging.getLogger(__name__)
 
@@ -51,17 +51,17 @@ class TestTaskToToken:
         job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
 
         task_id = 'test-task-123'
-        token1 = job._task_to_token(task_id)
-        token2 = job._task_to_token(task_id)
+        token1 = job.task_to_token(task_id)
+        token2 = job.task_to_token(task_id)
 
         assert_equal(token1, token2, 'Same task should map to same token')
         assert_true(0 <= token1 < 100, 'Token should be in valid range')
 
-        tokens = {job._task_to_token(f'task-{i}') for i in range(20)}
+        tokens = {job.task_to_token(f'task-{i}') for i in range(20)}
         assert_true(len(tokens) >= 15, 'Most tasks should map to different tokens')
 
-        numeric_token = job._task_to_token(123)
-        string_token = job._task_to_token('abc-def-ghi')
+        numeric_token = job.task_to_token(123)
+        string_token = job.task_to_token('abc-def-ghi')
         assert_true(0 <= numeric_token < 100, 'Numeric ID should produce valid token')
         assert_true(0 <= string_token < 100, 'String ID should produce valid token')
 
@@ -87,10 +87,9 @@ class TestPatternMatching:
     ])
     def test_pattern_matching(self, postgres, node_name, pattern, should_match):
         """Test SQL LIKE pattern matching with various patterns."""
-        config = get_unit_test_config()
-        job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
+        from jobsync.client import matches_pattern
 
-        result = job._matches_pattern(node_name, pattern)
+        result = matches_pattern(node_name, pattern)
         if should_match:
             assert_true(result, f'{node_name} should match pattern {pattern}')
         else:
@@ -124,7 +123,7 @@ class TestLeaderElection:
             conn.commit()
 
         job = Job('test', config, connection_string=postgres.url.render_as_string(hide_password=False))
-        leader = job._elect_leader()
+        leader = job.cluster.elect_leader()
 
         assert_equal(leader, 'node1', 'Oldest node should be elected leader')
 
@@ -143,7 +142,7 @@ class TestLeaderElection:
             conn.commit()
 
         job = Job('test', config, connection_string=postgres.url.render_as_string(hide_password=False))
-        leader = job._elect_leader()
+        leader = job.cluster.elect_leader()
 
         assert_equal(leader, 'node-a', 'Alphabetically first node should win tiebreaker')
 
@@ -168,7 +167,7 @@ class TestLeaderElection:
             conn.commit()
 
         job = Job('test', config, connection_string=postgres.url.render_as_string(hide_password=False))
-        leader = job._elect_leader()
+        leader = job.cluster.elect_leader()
 
         assert_equal(leader, 'node2', 'Only alive nodes should be considered')
 
@@ -194,7 +193,7 @@ class TestTokenDistribution:
         job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False),
                  coordination_config=coord_config)
 
-        job._distribute_tokens_minimal_move(99)
+        job.tokens.distribute(job.locks, job.cluster)
 
         for i in range(1, 4):
             with postgres.connect() as conn:
@@ -235,7 +234,7 @@ class TestTokenDistribution:
         job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False),
                  coordination_config=coord_config)
 
-        job._distribute_tokens_minimal_move(30)
+        job.tokens.distribute(job.locks, job.cluster)
 
         locked_correct = 0
         for token_id in range(10):
@@ -291,7 +290,7 @@ class TestLockRegistration:
                 SELECT node_patterns, reason, created_by
                 FROM {tables["Lock"]}
                 WHERE token_id = :token_id
-            """), {'token_id': job._task_to_token(task_id)})
+            """), {'token_id': job.task_to_token(task_id)})
             lock = [dict(row._mapping) for row in result]
 
         assert_equal(len(lock), 1, 'Lock should be created')
@@ -344,7 +343,7 @@ class TestLockRegistration:
             result = conn.execute(text(f"""
                 SELECT node_patterns FROM {tables["Lock"]}
                 WHERE token_id = :token_id
-            """), {'token_id': job._task_to_token(task_id)})
+            """), {'token_id': job.task_to_token(task_id)})
             locks = [dict(row._mapping) for row in result]
 
         assert_equal(len(locks), 1, 'Should only have 1 lock (ON CONFLICT DO UPDATE)')
@@ -365,7 +364,6 @@ class TestCanClaimTask:
             conn.commit()
 
         job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
-        job._coordination_enabled = True
 
         token_id = 5
         with postgres.connect() as conn:
@@ -376,13 +374,13 @@ class TestCanClaimTask:
             """), {'token_id': token_id, 'node': 'node1', 'assigned_at': assigned_at, 'version': 1})
             conn.commit()
 
-        # Update job's token cache
-        job._my_tokens = {5}
+        job.tokens.my_tokens = {5}
+        job.tokens.token_version = 1
+        job.state_machine.state = JobState.RUNNING_FOLLOWER
 
-        # Find a task that hashes to token 5
         task = None
         for i in range(1000):
-            if job._task_to_token(i) == 5:
+            if job.task_to_token(i) == 5:
                 task = Task(i)
                 break
 
@@ -394,10 +392,9 @@ class TestCanClaimTask:
         config = get_unit_test_config()
 
         job = Job('node1', config, connection_string=postgres.url.render_as_string(hide_password=False))
-        job._coordination_enabled = True
 
-        # Node has no tokens
-        job._my_tokens = set()
+        job.tokens.my_tokens = set()
+        job.state_machine.state = JobState.RUNNING_FOLLOWER
 
         task = Task(123)
         assert_equal(job.can_claim_task(task), False,
@@ -431,22 +428,23 @@ class TestThreadShutdown:
 
         node = Job('node1', config, wait_on_enter=5, connection_string=postgres.url.render_as_string(hide_password=False))
         node.__enter__()
-        time.sleep(1)
+        time.sleep(2)
 
-        assert_true(node._heartbeat_thread.is_alive(), 'Heartbeat thread should be running')
-        assert_true(node._health_thread.is_alive(), 'Health thread should be running')
-        assert_true(node._refresh_thread.is_alive(), 'Refresh thread should be running')
+        heartbeat_monitor = next((m for m in node._monitors if 'heartbeat' in m.name), None)
+        health_monitor = next((m for m in node._monitors if 'health' in m.name), None)
 
-        node._shutdown = True
+        assert_true(heartbeat_monitor is not None, 'Should have heartbeat monitor')
+        assert_true(health_monitor is not None, 'Should have health monitor')
+        assert_true(heartbeat_monitor.thread.is_alive(), 'Heartbeat thread should be running')
+        assert_true(health_monitor.thread.is_alive(), 'Health thread should be running')
+
         node._shutdown_event.set()
 
-        node._heartbeat_thread.join(timeout=1)
-        node._health_thread.join(timeout=1)
-        node._refresh_thread.join(timeout=1)
+        heartbeat_monitor.thread.join(timeout=1)
+        health_monitor.thread.join(timeout=1)
 
-        assert_equal(node._heartbeat_thread.is_alive(), False, 'Heartbeat thread should stop')
-        assert_equal(node._health_thread.is_alive(), False, 'Health thread should stop')
-        assert_equal(node._refresh_thread.is_alive(), False, 'Refresh thread should stop')
+        assert_equal(heartbeat_monitor.thread.is_alive(), False, 'Heartbeat thread should stop')
+        assert_equal(health_monitor.thread.is_alive(), False, 'Health thread should stop')
 
         logger.info('✓ All threads responded to shutdown within 1 second')
 
@@ -469,19 +467,21 @@ class TestThreadShutdown:
 
         time.sleep(2)
 
-        assert_true(node._monitor_thread is not None, 'Leader should have monitor thread')
-        assert_true(node._rebalance_thread is not None, 'Leader should have rebalance thread')
-        assert_true(node._monitor_thread.is_alive(), 'Monitor thread should be running')
-        assert_true(node._rebalance_thread.is_alive(), 'Rebalance thread should be running')
+        dead_node_monitor = next((m for m in node._monitors if 'dead-node' in m.name), None)
+        rebalance_monitor = next((m for m in node._monitors if 'rebalance' in m.name), None)
 
-        node._shutdown = True
+        assert_true(dead_node_monitor is not None, 'Leader should have dead node monitor')
+        assert_true(rebalance_monitor is not None, 'Leader should have rebalance monitor')
+        assert_true(dead_node_monitor.thread.is_alive(), 'Dead node monitor thread should be running')
+        assert_true(rebalance_monitor.thread.is_alive(), 'Rebalance monitor thread should be running')
+
         node._shutdown_event.set()
 
-        node._monitor_thread.join(timeout=2)
-        node._rebalance_thread.join(timeout=2)
+        dead_node_monitor.thread.join(timeout=2)
+        rebalance_monitor.thread.join(timeout=2)
 
-        assert_equal(node._monitor_thread.is_alive(), False, 'Monitor thread should stop')
-        assert_equal(node._rebalance_thread.is_alive(), False, 'Rebalance thread should stop')
+        assert_equal(dead_node_monitor.thread.is_alive(), False, 'Dead node monitor thread should stop')
+        assert_equal(rebalance_monitor.thread.is_alive(), False, 'Rebalance monitor thread should stop')
 
         logger.info('✓ Leader threads responded to shutdown within 2 seconds')
 

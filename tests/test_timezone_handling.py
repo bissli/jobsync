@@ -21,7 +21,7 @@ from asserts import assert_equal, assert_true
 from sqlalchemy import text
 
 from jobsync import schema
-from jobsync.client import CoordinationConfig, Job, Task
+from jobsync.client import CoordinationConfig, Job, LockNotAcquired, Task
 
 logger = logging.getLogger(__name__)
 
@@ -233,7 +233,7 @@ class TestLockExpirationTimezones:
 
         job = Job('test', config, wait_on_enter=0, connection_string=connection_string)
 
-        active_locks = job._get_active_locks()
+        active_locks = job.locks.get_active_locks()
 
         # Only valid lock should remain
         assert_true(1 not in active_locks, 'Expired UTC lock should be removed')
@@ -276,7 +276,7 @@ class TestLockExpirationTimezones:
         job = Job('test', config, wait_on_enter=0,
                  connection_string=connection_string)
 
-        active_locks = job._get_active_locks()
+        active_locks = job.locks.get_active_locks()
         assert_true(100 not in active_locks,
                    'Lock expired at midnight should be removed')
 
@@ -317,10 +317,12 @@ class TestLeaderLockTimezones:
                  connection_string=connection_string, coordination_config=coord_config)
 
         # Should be able to acquire lock (stale lock removed)
-        acquired = job._acquire_leader_lock('test-operation')
+        try:
+            with job.locks.acquire_leader_lock('test-operation'):
+                acquired = True
+        except LockNotAcquired:
+            acquired = False
         assert_true(acquired, 'Should acquire lock after removing stale NY timezone lock')
-
-        job._release_leader_lock()
 
     def test_leader_lock_acquired_time_across_timezones(self, postgres):
         """Verify leader lock timing works when nodes are in different timezones.
@@ -337,22 +339,31 @@ class TestLeaderLockTimezones:
         tokyo_time = datetime.datetime.now(ZoneInfo('Asia/Tokyo'))
         job1 = Job('node-tokyo', config, wait_on_enter=0, connection_string=connection_string)
 
-        acquired_tokyo = job1._acquire_leader_lock('tokyo-operation')
+        try:
+            with job1.locks.acquire_leader_lock('tokyo-operation'):
+                acquired_tokyo = True
+                
+                # Node2 in NY timezone tries to acquire immediately
+                job2 = Job('node-ny', config, wait_on_enter=0, connection_string=connection_string)
+                
+                try:
+                    with job2.locks.acquire_leader_lock('ny-operation'):
+                        acquired_ny = True
+                except LockNotAcquired:
+                    acquired_ny = False
+                assert_true(not acquired_ny, 'NY node should not acquire lock held by Tokyo node')
+        except LockNotAcquired:
+            acquired_tokyo = False
+            
         assert_true(acquired_tokyo, 'Tokyo node should acquire lock')
 
-        # Node2 in NY timezone tries to acquire immediately
-        job2 = Job('node-ny', config, wait_on_enter=0, connection_string=connection_string)
-
-        acquired_ny = job2._acquire_leader_lock('ny-operation')
-        assert_true(not acquired_ny, 'NY node should not acquire lock held by Tokyo node')
-
-        job1._release_leader_lock()
-
         # Now NY node should be able to acquire
-        acquired_ny_after = job2._acquire_leader_lock('ny-operation-after')
+        try:
+            with job2.locks.acquire_leader_lock('ny-operation-after'):
+                acquired_ny_after = True
+        except LockNotAcquired:
+            acquired_ny_after = False
         assert_true(acquired_ny_after, 'NY node should acquire after Tokyo released')
-
-        job2._release_leader_lock()
 
 
 class TestLeaderElectionTimezones:
@@ -389,7 +400,7 @@ class TestLeaderElectionTimezones:
 
         job = Job('test', config, wait_on_enter=0, connection_string=connection_string)
 
-        leader = job._elect_leader()
+        leader = job.cluster.elect_leader()
         assert_equal(leader, 'node-tokyo',
                     'Oldest node (Tokyo) should be elected regardless of timezone')
 
@@ -428,7 +439,7 @@ class TestLeaderElectionTimezones:
 
         job = Job('test', config, wait_on_enter=0, connection_string=connection_string)
 
-        leader = job._elect_leader()
+        leader = job.cluster.elect_leader()
         assert_equal(leader, 'node-before-dst',
                     'Node created before DST should be older despite DST transition')
 
@@ -466,7 +477,7 @@ class TestTokenDistributionTimezones:
         coord_config = CoordinationConfig(total_tokens=30)
         job = Job('node-1', config, wait_on_enter=0, connection_string=connection_string, coordination_config=coord_config)
 
-        job._distribute_tokens_minimal_move(30)
+        job.tokens.distribute(job.locks, job.cluster)
 
         # Verify all tokens have assigned_at timestamps
         with postgres.connect() as conn:
@@ -510,7 +521,7 @@ class TestTokenDistributionTimezones:
         job = Job('node1', config, wait_on_enter=0, connection_string=connection_string, coordination_config=coord_config)
 
         # First distribution
-        job._distribute_tokens_minimal_move(30)
+        job.tokens.distribute(job.locks, job.cluster)
 
         with postgres.connect() as conn:
             result = conn.execute(text(f'SELECT MAX(version) FROM {tables["Token"]}'))
@@ -518,7 +529,7 @@ class TestTokenDistributionTimezones:
 
         # Second distribution (simulating rebalance)
         time.sleep(1)
-        job._distribute_tokens_minimal_move(30)
+        job.tokens.distribute(job.locks, job.cluster)
 
         with postgres.connect() as conn:
             result = conn.execute(text(f'SELECT MAX(version) FROM {tables["Token"]}'))
@@ -749,7 +760,7 @@ class TestDatabaseTimezoneConsistency:
             client_time_tokyo = datetime.datetime.now(ZoneInfo('Asia/Tokyo'))
             client_time_db = datetime.datetime.now(ZoneInfo(db_timezone))
 
-            job._tasks = [
+            job.tasks._tasks = [
                 (task1, client_time_utc),
                 (task2, client_time_tokyo),
             ]
@@ -812,10 +823,10 @@ class TestDatetimeParameterTimezones:
         job = Job(f'test-{label}', config, date=dt, wait_on_enter=0,
                  connection_string=connection_string)
 
-        assert_true(job._date is not None, f'{label}: Date should be set')
-        assert_equal(job._date.year, 2024, f'{label}: Year should match')
-        assert_equal(job._date.month, 3, f'{label}: Month should match')
-        assert_equal(job._date.day, 15, f'{label}: Day should match')
+        assert_true(job.tasks.date is not None, f'{label}: Date should be set')
+        assert_equal(job.tasks.date.year, 2024, f'{label}: Year should match')
+        assert_equal(job.tasks.date.month, 3, f'{label}: Month should match')
+        assert_equal(job.tasks.date.day, 15, f'{label}: Day should match')
 
         job.__enter__()
         try:
@@ -848,7 +859,7 @@ class TestDatetimeParameterTimezones:
 
             try:
                 task = Task(1, f'task-{label}')
-                job.add_task(task)
+                job.tasks._tasks.append((task, datetime.datetime.now(datetime.timezone.utc)))
                 job.write_audit()
 
                 with postgres.connect() as conn:
@@ -893,7 +904,7 @@ class TestDatetimeParameterTimezones:
             job.__enter__()
 
         try:
-            dates = [job._date for job in jobs]
+            dates = [job.tasks.date for job in jobs]
 
             for i, date1 in enumerate(dates):
                 for j, date2 in enumerate(dates):
@@ -929,8 +940,8 @@ class TestDatetimeParameterTimezones:
             job = Job(label, config, date=dt, wait_on_enter=0,
                      connection_string=connection_string)
 
-            assert_equal(job._date.day, 15, f'{label} should preserve day 15')
-            logger.info(f'✓ {label}: {dt} -> day={job._date.day}')
+            assert_equal(job.tasks.date.day, 15, f'{label} should preserve day 15')
+            logger.info(f'✓ {label}: {dt} -> day={job.tasks.date.day}')
 
     def test_timezone_aware_datetime_types(self, postgres):
         """Verify timezone-aware datetime objects work correctly.
@@ -943,10 +954,10 @@ class TestDatetimeParameterTimezones:
         job = Job('test-tzaware', config, date=tz_aware_dt, wait_on_enter=0,
                  connection_string=connection_string)
 
-        assert_true(job._date is not None, 'Date should be set')
-        assert_equal(job._date.year, 2024, 'Year should match')
-        assert_equal(job._date.month, 3, 'Month should match')
-        assert_equal(job._date.day, 15, 'Day should match')
+        assert_true(job.tasks.date is not None, 'Date should be set')
+        assert_equal(job.tasks.date.year, 2024, 'Year should match')
+        assert_equal(job.tasks.date.month, 3, 'Month should match')
+        assert_equal(job.tasks.date.day, 15, 'Day should match')
 
         job.__enter__()
         try:
@@ -967,10 +978,10 @@ class TestDateConsistency:
         job = Job('test-none', config, date=None, wait_on_enter=0,
                  connection_string=connection_string)
 
-        assert_true(isinstance(job._date, datetime.date),
-                   f'date=None should create date object, got {type(job._date).__name__}')
-        assert_true(not isinstance(job._date, datetime.datetime),
-                   f'date=None should NOT create datetime object, got {type(job._date).__name__}')
+        assert_true(isinstance(job.tasks.date, datetime.date),
+                   f'date=None should create date object, got {type(job.tasks.date).__name__}')
+        assert_true(not isinstance(job.tasks.date, datetime.datetime),
+                   f'date=None should NOT create datetime object, got {type(job.tasks.date).__name__}')
 
     def test_all_date_inputs_return_date_type(self, postgres):
         """Verify all date initialization paths result in date-only objects (datetime.date).
@@ -990,12 +1001,12 @@ class TestDateConsistency:
             job = Job(f'test-{label}', config, date=date_input, wait_on_enter=0,
                      connection_string=connection_string)
 
-            assert_true(isinstance(job._date, datetime.date),
-                       f'{label}: should create date object, got {type(job._date).__name__}')
-            assert_true(not isinstance(job._date, datetime.datetime),
-                       f'{label}: should NOT create datetime object, got {type(job._date).__name__}')
+            assert_true(isinstance(job.tasks.date, datetime.date),
+                       f'{label}: should create date object, got {type(job.tasks.date).__name__}')
+            assert_true(not isinstance(job.tasks.date, datetime.datetime),
+                       f'{label}: should NOT create datetime object, got {type(job.tasks.date).__name__}')
 
-            logger.info(f'✓ {label}: correctly creates date object (type={type(job._date).__name__})')
+            logger.info(f'✓ {label}: correctly creates date object (type={type(job.tasks.date).__name__})')
 
     def test_date_type_prevents_timezone_issues(self, postgres):
         """Verify date objects don't have timezone information that could cause issues.
@@ -1008,15 +1019,15 @@ class TestDateConsistency:
         job = Job('test-date-only', config, date=tokyo_dt, wait_on_enter=0,
                  connection_string=connection_string)
 
-        assert_true(isinstance(job._date, datetime.date), 'Should be date-only object')
-        assert_true(not isinstance(job._date, datetime.datetime), 'Should NOT be datetime object')
+        assert_true(isinstance(job.tasks.date, datetime.date), 'Should be date-only object')
+        assert_true(not isinstance(job.tasks.date, datetime.datetime), 'Should NOT be datetime object')
 
-        assert_equal(job._date.year, 2024, 'Year should match')
-        assert_equal(job._date.month, 3, 'Month should match')
-        assert_equal(job._date.day, 15, 'Day should preserve input date regardless of timezone')
+        assert_equal(job.tasks.date.year, 2024, 'Year should match')
+        assert_equal(job.tasks.date.month, 3, 'Month should match')
+        assert_equal(job.tasks.date.day, 15, 'Day should preserve input date regardless of timezone')
 
         # Note: date objects don't have tzinfo attribute
-        assert_true(not hasattr(job._date, 'tzinfo') or job._date.tzinfo is None,
+        assert_true(not hasattr(job.tasks.date, 'tzinfo') or job.tasks.date.tzinfo is None,
                    'Date objects should not have timezone information')
 
 
