@@ -2,6 +2,7 @@
 """
 import contextlib
 import datetime
+import functools
 import hashlib
 import json
 import logging
@@ -36,6 +37,56 @@ def build_connection_string(config: ModuleType) -> str:
         f'postgresql+psycopg://{sql_config.user}:{sql_config.passwd}'
         f'@{sql_config.host}:{sql_config.port}/{sql_config.dbname}'
     )
+
+
+def retry_with_backoff(max_attempts: int = 5, base_delay: float = 1.0, operation_name: str = None):
+    """Decorator to retry function with exponential backoff on database errors.
+
+    Args:
+        max_attempts: Maximum retry attempts
+        base_delay: Base delay in seconds (doubles each retry)
+        operation_name: Name for logging (defaults to function name)
+
+    Returns
+        Decorated function
+    """
+    def decorator(func: callable):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            name = operation_name or func.__name__
+            last_exception = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_exception = e
+                    if attempt == max_attempts:
+                        logger.error(f'{name} failed after {max_attempts} attempts: {e}')
+                        raise
+                    delay = base_delay * (2 ** (attempt - 1))
+                    logger.warning(f'{name} attempt {attempt}/{max_attempts} failed: {e}, retrying in {delay:.1f}s')
+                    time.sleep(delay)
+            raise last_exception
+        return wrapper
+    return decorator
+
+
+def ensure_timezone_aware(dt: datetime.datetime, name: str = 'datetime') -> datetime.datetime:
+    """Ensure datetime is timezone-aware.
+
+    Args:
+        dt: Datetime to check
+        name: Name for error message
+
+    Returns
+        The datetime (unchanged if already aware)
+
+    Raises
+        ValueError: If datetime is naive
+    """
+    if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+        raise ValueError(f'{name} must be timezone-aware (has tzinfo), got naive datetime: {dt}')
+    return dt
 
 
 def load_coordination_config(config: ModuleType, coordination_config: CoordinationConfig = None) -> dict:
@@ -262,6 +313,11 @@ class StateEvent(Enum):
     LEADER_DEMOTED = 'leader_demoted'
     DEAD_NODES_DETECTED = 'dead_nodes_detected'
     MEMBERSHIP_CHANGED = 'membership_changed'
+    NODE_UNHEALTHY = 'node_unhealthy'
+    SHUTDOWN_REQUESTED = 'shutdown_requested'
+    DISTRIBUTION_FAILED = 'distribution_failed'
+    INITIALIZATION_FAILED = 'initialization_failed'
+    ROLE_DETERMINED = 'role_determined'
 
 
 class EventBus:
@@ -312,6 +368,7 @@ class JobState(Enum):
     DISTRIBUTING = 'distributing'
     RUNNING_FOLLOWER = 'running_follower'
     RUNNING_LEADER = 'running_leader'
+    ERROR = 'error'
     SHUTTING_DOWN = 'shutting_down'
 
 
@@ -335,14 +392,19 @@ class JobStateMachine:
         """Define valid state transitions.
         """
         self._add_transition(JobState.INITIALIZING, JobState.CLUSTER_FORMING)
+        self._add_transition(JobState.INITIALIZING, JobState.ERROR)
         self._add_transition(JobState.CLUSTER_FORMING, JobState.ELECTING)
+        self._add_transition(JobState.CLUSTER_FORMING, JobState.ERROR)
         self._add_transition(JobState.ELECTING, JobState.DISTRIBUTING)
+        self._add_transition(JobState.ELECTING, JobState.ERROR)
         self._add_transition(JobState.DISTRIBUTING, JobState.RUNNING_LEADER)
         self._add_transition(JobState.DISTRIBUTING, JobState.RUNNING_FOLLOWER)
+        self._add_transition(JobState.DISTRIBUTING, JobState.ERROR)
         self._add_transition(JobState.RUNNING_FOLLOWER, JobState.RUNNING_LEADER)
         self._add_transition(JobState.RUNNING_LEADER, JobState.RUNNING_FOLLOWER)
         self._add_transition(JobState.RUNNING_LEADER, JobState.SHUTTING_DOWN)
         self._add_transition(JobState.RUNNING_FOLLOWER, JobState.SHUTTING_DOWN)
+        self._add_transition(JobState.ERROR, JobState.SHUTTING_DOWN)
 
     def _add_transition(self, from_state: JobState, to_state: JobState) -> None:
         """Register a valid transition.
@@ -402,13 +464,61 @@ class JobStateMachine:
 
         return True
 
+    def is_leader(self) -> bool:
+        """Check if in leader state.
+
+        Returns
+            True if in RUNNING_LEADER state
+        """
+        return self.state == JobState.RUNNING_LEADER
+
+    def is_follower(self) -> bool:
+        """Check if in follower state.
+
+        Returns
+            True if in RUNNING_FOLLOWER state
+        """
+        return self.state == JobState.RUNNING_FOLLOWER
+
+    def is_running(self) -> bool:
+        """Check if in running state (leader or follower).
+
+        Returns
+            True if in either RUNNING_LEADER or RUNNING_FOLLOWER state
+        """
+        return self.state in {JobState.RUNNING_LEADER, JobState.RUNNING_FOLLOWER}
+
+    def is_initializing(self) -> bool:
+        """Check if in initialization states.
+
+        Returns
+            True if in any initialization state
+        """
+        return self.state in {JobState.INITIALIZING, JobState.CLUSTER_FORMING, JobState.ELECTING, JobState.DISTRIBUTING}
+
+    def is_error(self) -> bool:
+        """Check if in error state.
+
+        Returns
+            True if in ERROR state
+        """
+        return self.state == JobState.ERROR
+
     def can_claim_task(self) -> bool:
         """Check if tasks can be claimed in current state.
 
         Returns
             True if claiming allowed
         """
-        return self.state in {JobState.RUNNING_LEADER, JobState.RUNNING_FOLLOWER}
+        return self.is_running()
+
+    def can_distribute(self) -> bool:
+        """Check if token distribution is allowed in current state.
+
+        Returns
+            True if in DISTRIBUTING or RUNNING_LEADER state
+        """
+        return self.state in {JobState.DISTRIBUTING, JobState.RUNNING_LEADER}
 
 
 # ============================================================
@@ -472,6 +582,7 @@ class ClusterCoordinator:
         ORDER BY created_on ASC, name ASC
         """
 
+    @retry_with_backoff()
     def register(self) -> None:
         """Register node with initial heartbeat.
         """
@@ -500,13 +611,14 @@ class ClusterCoordinator:
         self._heartbeat_monitor = HeartbeatMonitor(self, shutdown_event)
         self._heartbeat_monitor.start()
 
-    def start_health_monitor(self, shutdown_event: threading.Event) -> None:
+    def start_health_monitor(self, job: 'Job', shutdown_event: threading.Event) -> None:
         """Start health monitor thread.
 
         Args:
+            job: Parent Job instance
             shutdown_event: Event to signal shutdown
         """
-        self._health_monitor = HealthMonitor(self, shutdown_event)
+        self._health_monitor = HealthMonitor(self, job, shutdown_event)
         self._health_monitor.start()
 
     def elect_leader(self) -> str:
@@ -645,6 +757,16 @@ class TokenDistributor:
 
         logger.debug(f'Computed new assignments: {len(new_assignments)} tokens across {len(set(new_assignments.values()))} nodes, {tokens_moved} moves')
 
+        if len(new_assignments) > self.total_tokens:
+            logger.error(f'Token distribution produced {len(new_assignments)} assignments but total_tokens={self.total_tokens}')
+            raise ValueError(f'Invalid token distribution: {len(new_assignments)} > {self.total_tokens}')
+
+        assigned_nodes = set(new_assignments.values())
+        invalid_nodes = assigned_nodes - set(active_node_names)
+        if invalid_nodes:
+            logger.error(f'Token distribution assigned to non-active nodes: {invalid_nodes}')
+            raise ValueError(f'Tokens assigned to inactive nodes: {invalid_nodes}')
+
         with self.db.engine.connect() as conn:
             result = conn.execute(text(f'SELECT MAX(version) FROM {self.db.tables["Token"]}'))
             current_version = result.scalar() or 0
@@ -652,13 +774,11 @@ class TokenDistributor:
 
             conn.execute(text(f'DELETE FROM {self.db.tables["Token"]}'))
 
-            assignment_time = datetime.datetime.now(datetime.timezone.utc)
             for tid, node in new_assignments.items():
-                sql = f'INSERT INTO {self.db.tables["Token"]} (token_id, node, assigned_at, version) VALUES (:token_id, :node, :assigned_at, :version)'
+                sql = f'INSERT INTO {self.db.tables["Token"]} (token_id, node, assigned_at, version) VALUES (:token_id, :node, NOW(), :version)'
                 conn.execute(text(sql), {
                     'token_id': tid,
                     'node': node,
-                    'assigned_at': assignment_time,
                     'version': new_version
                 })
 
@@ -689,13 +809,15 @@ class TokenDistributor:
         logger.debug(f'Node {self.node_name} owns {len(tokens)} tokens, version {version}')
         return tokens, version
 
-    def wait_for_distribution(self, timeout_sec: int = 30) -> None:
+    def wait_for_distribution(self, timeout_sec: int = 30, check_interval: float = 0.5) -> None:
         """Wait for initial token distribution to complete.
 
         Args:
             timeout_sec: Maximum seconds to wait
+            check_interval: How often to check for tokens
         """
         start = time.time()
+
         while time.time() - start < timeout_sec:
             with self.db.engine.connect() as conn:
                 result = conn.execute(text(f'SELECT COUNT(*) FROM {self.db.tables["Token"]}'))
@@ -705,7 +827,7 @@ class TokenDistributor:
                 logger.info(f'Token distribution detected ({count} tokens)')
                 return
 
-            time.sleep(0.5)
+            time.sleep(check_interval)
 
         raise TimeoutError(f'Token distribution did not complete within {timeout_sec}s')
 
@@ -738,11 +860,10 @@ class TokenDistributor:
         sql = f"""
         INSERT INTO {self.db.tables["Rebalance"]}
         (triggered_at, trigger_reason, leader_node, nodes_before, nodes_after, tokens_moved, duration_ms)
-        VALUES (:triggered_at, :reason, :leader, :before, :after, :moved, :duration)
+        VALUES (NOW(), :reason, :leader, :before, :after, :moved, :duration)
         """
         with self.db.engine.connect() as conn:
             conn.execute(text(sql), {
-                'triggered_at': datetime.datetime.now(datetime.timezone.utc),
                 'reason': reason,
                 'leader': self.node_name,
                 'before': nodes_before,
@@ -792,7 +913,7 @@ class LockManager:
         sql = f"""
         INSERT INTO {self.db.tables["Lock"]}
         (token_id, node_patterns, reason, created_at, created_by, expires_at)
-        VALUES (:token_id, :patterns, :reason, :created_at, :created_by, :expires_at)
+        VALUES (:token_id, :patterns, :reason, NOW(), :created_by, :expires_at)
         ON CONFLICT (token_id) DO UPDATE
         SET node_patterns = EXCLUDED.node_patterns,
             reason = EXCLUDED.reason,
@@ -806,7 +927,6 @@ class LockManager:
                 'token_id': token_id,
                 'patterns': json.dumps(node_patterns),
                 'reason': reason,
-                'created_at': datetime.datetime.now(datetime.timezone.utc),
                 'created_by': self.node_name,
                 'expires_at': expires_at
             })
@@ -832,7 +952,6 @@ class LockManager:
                 'token_id': task_to_token(task_id, self.total_tokens),
                 'patterns': json.dumps(node_patterns),
                 'reason': reason,
-                'created_at': datetime.datetime.now(datetime.timezone.utc),
                 'created_by': self.node_name,
                 'expires_at': None
             })
@@ -840,7 +959,7 @@ class LockManager:
         sql = f"""
         INSERT INTO {self.db.tables["Lock"]}
         (token_id, node_patterns, reason, created_at, created_by, expires_at)
-        VALUES (:token_id, :patterns, :reason, :created_at, :created_by, :expires_at)
+        VALUES (:token_id, :patterns, :reason, NOW(), :created_by, :expires_at)
         ON CONFLICT (token_id) DO UPDATE
         SET node_patterns = EXCLUDED.node_patterns,
             reason = EXCLUDED.reason,
@@ -922,8 +1041,15 @@ class LockManager:
 
             locked_tokens = {}
             for row in records:
-                patterns = row['node_patterns']
-                locked_tokens[row['token_id']] = patterns
+                try:
+                    patterns = row['node_patterns']
+                    if not isinstance(patterns, list):
+                        logger.warning(f'Invalid lock pattern for token {row["token_id"]}: expected list, got {type(patterns).__name__}')
+                        continue
+                    locked_tokens[row['token_id']] = patterns
+                except (json.JSONDecodeError, TypeError, KeyError) as e:
+                    logger.warning(f'Failed to parse lock pattern for token {row["token_id"]}: {e}')
+                    continue
 
             conn.commit()
             return locked_tokens
@@ -1294,7 +1420,7 @@ class HeartbeatMonitor(Monitor):
         """
         conn = self.cluster.db.engine.connect()
         try:
-            while not self.shutdown_event.is_set():
+            while not self.shutdown_event.is_set() and not self._stop_requested:
                 try:
                     self.check(conn)
                 except Exception as e:
@@ -1335,22 +1461,24 @@ class HealthMonitor(Monitor):
     """Monitors node health by checking heartbeat age and database connectivity.
     """
 
-    def __init__(self, cluster: ClusterCoordinator, shutdown_event: threading.Event):
+    def __init__(self, cluster: ClusterCoordinator, job: 'Job', shutdown_event: threading.Event):
         """Initialize health monitor.
 
         Args:
             cluster: Cluster coordinator
+            job: Parent Job instance
             shutdown_event: Shutdown event
         """
         super().__init__(f'health-{cluster.node_name}', cluster.health_check_interval, shutdown_event)
         self.cluster = cluster
+        self.job = job
 
     def _run(self) -> None:
         """Main health check loop.
         """
         conn = self.cluster.db.engine.connect()
         try:
-            while not self.shutdown_event.is_set():
+            while not self.shutdown_event.is_set() and not self._stop_requested:
                 try:
                     self.check(conn)
                 except Exception as e:
@@ -1378,7 +1506,9 @@ class HealthMonitor(Monitor):
         if self.cluster.last_heartbeat_sent:
             age_seconds = (datetime.datetime.now(datetime.timezone.utc) - self.cluster.last_heartbeat_sent).total_seconds()
             if age_seconds > self.cluster.heartbeat_timeout:
-                logger.error(f'Heartbeat thread appears dead (>{self.cluster.heartbeat_timeout}s old)')
+                logger.error(f'Heartbeat thread appears dead (age: {age_seconds:.1f}s > timeout: {self.cluster.heartbeat_timeout}s)')
+                self.job.event_bus.publish(StateEvent.NODE_UNHEALTHY, {'reason': 'heartbeat_timeout', 'age_seconds': age_seconds})
+                return
 
         conn.execute(text('SELECT 1'))
         conn.rollback()
@@ -1508,7 +1638,7 @@ class DeadNodeMonitor(Monitor):
         """
         conn = self.job.db.engine.connect()
         try:
-            while not self.shutdown_event.is_set():
+            while not self.shutdown_event.is_set() and not self._stop_requested:
                 try:
                     self.check(conn)
                 except Exception as e:
@@ -1533,11 +1663,6 @@ class DeadNodeMonitor(Monitor):
         Args:
             conn: Database connection
         """
-        if not self.job.am_i_leader():
-            logger.debug('No longer leader, exiting dead node monitor')
-            self.stop()
-            return
-
         sql = f"""
         SELECT name
         FROM {self.job.db.tables["Node"]}
@@ -1590,7 +1715,7 @@ class RebalanceMonitor(Monitor):
         """
         conn = self.job.db.engine.connect()
         try:
-            while not self.shutdown_event.is_set():
+            while not self.shutdown_event.is_set() and not self._stop_requested:
                 try:
                     self.check(conn)
                 except Exception as e:
@@ -1615,11 +1740,6 @@ class RebalanceMonitor(Monitor):
         Args:
             conn: Database connection
         """
-        if not self.job.am_i_leader():
-            logger.debug('No longer leader, exiting rebalance monitor')
-            self.stop()
-            return
-
         result = conn.execute(text(self.job.cluster.active_nodes_sql))
         current_count = len(list(result))
         conn.rollback()
@@ -1700,7 +1820,7 @@ class Job:
         if connection_string is None:
             connection_string = build_connection_string(config)
 
-        self._created_on = datetime.datetime.now(datetime.timezone.utc)
+        self._created_on = ensure_timezone_aware(datetime.datetime.now(datetime.timezone.utc), 'node created_on')
         self._shutdown_event = threading.Event()
         self._lock_provider = lock_provider
         self._clear_existing_locks = clear_existing_locks
@@ -1732,9 +1852,12 @@ class Job:
         """Register callbacks for state entry/exit actions.
         """
         self.state_machine.on_enter(JobState.CLUSTER_FORMING, self._on_enter_cluster_forming)
+        self.state_machine.on_enter(JobState.ELECTING, self._on_enter_electing)
+        self.state_machine.on_enter(JobState.DISTRIBUTING, self._on_enter_distributing)
         self.state_machine.on_enter(JobState.RUNNING_LEADER, self._on_enter_running_leader)
         self.state_machine.on_exit(JobState.RUNNING_LEADER, self._on_exit_running_leader)
         self.state_machine.on_enter(JobState.RUNNING_FOLLOWER, self._on_enter_running_follower)
+        self.state_machine.on_enter(JobState.SHUTTING_DOWN, self._on_enter_shutting_down)
 
     def _register_event_handlers(self) -> None:
         """Register handlers for monitor events.
@@ -1743,24 +1866,48 @@ class Job:
         self.event_bus.subscribe(StateEvent.LEADER_DEMOTED, self._handle_leader_demoted)
         self.event_bus.subscribe(StateEvent.DEAD_NODES_DETECTED, self._handle_dead_nodes)
         self.event_bus.subscribe(StateEvent.MEMBERSHIP_CHANGED, self._handle_membership_changed)
+        self.event_bus.subscribe(StateEvent.NODE_UNHEALTHY, self._handle_node_unhealthy)
+        self.event_bus.subscribe(StateEvent.SHUTDOWN_REQUESTED, self._handle_shutdown_requested)
+        self.event_bus.subscribe(StateEvent.DISTRIBUTION_FAILED, self._handle_distribution_failed)
+        self.event_bus.subscribe(StateEvent.INITIALIZATION_FAILED, self._handle_initialization_failed)
+        self.event_bus.subscribe(StateEvent.ROLE_DETERMINED, self._handle_role_determined)
 
     def _on_enter_cluster_forming(self) -> None:
         """Entry action for CLUSTER_FORMING state.
         """
         self.cluster.register()
         self.cluster.start_heartbeat(self._shutdown_event)
-        self.cluster.start_health_monitor(self._shutdown_event)
+        self.cluster.start_health_monitor(self, self._shutdown_event)
         self._monitors.append(self.cluster._heartbeat_monitor)
         self._monitors.append(self.cluster._health_monitor)
+
+        if self._lock_provider and self._locks_enabled:
+            if self._clear_existing_locks:
+                logger.info(f'Clearing existing locks created by {self.node_name}')
+                self.locks.clear_locks_by_creator(self.node_name)
+            logger.info('Invoking lock_provider callback')
+            self._lock_provider(self)
+
+    def _on_enter_electing(self) -> None:
+        """Entry action for ELECTING state.
+        """
+
+    def _on_enter_distributing(self) -> None:
+        """Entry action for DISTRIBUTING state.
+        """
+        self._distribute_tokens_safe()
 
     def _on_enter_running_leader(self) -> None:
         """Entry action for RUNNING_LEADER state.
         """
         logger.info('Starting leader monitoring threads...')
-        self._monitors.append(TokenRefreshMonitor(self, self._shutdown_event))
+        if not any('token-refresh' in m.name for m in self._monitors):
+            monitor = TokenRefreshMonitor(self, self._shutdown_event)
+            self._monitors.append(monitor)
+            monitor.start()
         self._monitors.append(DeadNodeMonitor(self, self._shutdown_event))
         self._monitors.append(RebalanceMonitor(self, self._shutdown_event))
-        for monitor in self._monitors[-3:]:
+        for monitor in self._monitors[-2:]:
             monitor.start()
 
     def _on_exit_running_leader(self) -> None:
@@ -1776,8 +1923,14 @@ class Job:
     def _on_enter_running_follower(self) -> None:
         """Entry action for RUNNING_FOLLOWER state.
         """
-        self._monitors.append(TokenRefreshMonitor(self, self._shutdown_event))
-        self._monitors[-1].start()
+        if not any('token-refresh' in m.name for m in self._monitors):
+            self._monitors.append(TokenRefreshMonitor(self, self._shutdown_event))
+            self._monitors[-1].start()
+
+    def _on_enter_shutting_down(self) -> None:
+        """Entry action for SHUTTING_DOWN state.
+        """
+        self._shutdown_event.set()
 
     def _handle_leader_promoted(self, data: dict) -> None:
         """Handle leader promotion event from monitor.
@@ -1785,7 +1938,7 @@ class Job:
         Args:
             data: Event data
         """
-        if self.state_machine.state == JobState.RUNNING_FOLLOWER:
+        if self.state_machine.is_follower():
             logger.warning(f'{self.node_name} promoted to leader')
             self.state_machine.transition_to(JobState.RUNNING_LEADER)
 
@@ -1795,7 +1948,7 @@ class Job:
         Args:
             data: Event data
         """
-        if self.state_machine.state == JobState.RUNNING_LEADER:
+        if self.state_machine.is_leader():
             logger.warning(f'{self.node_name} demoted from leader (older node rejoined)')
             self.state_machine.transition_to(JobState.RUNNING_FOLLOWER)
 
@@ -1805,6 +1958,9 @@ class Job:
         Args:
             data: Event data with 'nodes' list
         """
+        if not self.state_machine.can_distribute():
+            logger.debug('Cannot distribute in non-leader state')
+            return
         self._distribute_tokens_safe()
 
     def _handle_membership_changed(self, data: dict) -> None:
@@ -1813,28 +1969,82 @@ class Job:
         Args:
             data: Event data with previous_count and current_count
         """
-        try:
-            with self.locks.acquire_rebalance_lock('membership_monitor'):
-                self._distribute_tokens_safe()
-        except LockNotAcquired:
-            logger.debug('Rebalance already in progress, will retry next cycle')
+        if not self.state_machine.can_distribute():
+            logger.debug('Cannot distribute in non-leader state')
+            return
+        self._distribute_tokens_safe()
+
+    def _handle_node_unhealthy(self, data: dict) -> None:
+        """Handle node unhealthy event.
+
+        Args:
+            data: Event data
+        """
+        logger.error('Node detected as unhealthy, triggering shutdown')
+        if not self.state_machine.is_error():
+            self.state_machine.transition_to(JobState.ERROR)
+        self.state_machine.transition_to(JobState.SHUTTING_DOWN)
+
+    def _handle_shutdown_requested(self, data: dict) -> None:
+        """Handle shutdown request event.
+
+        Args:
+            data: Event data
+        """
+        logger.info('Shutdown requested')
+        if self.state_machine.state != JobState.SHUTTING_DOWN:
+            self.state_machine.transition_to(JobState.SHUTTING_DOWN)
+
+    def _handle_distribution_failed(self, data: dict) -> None:
+        """Handle distribution failure event.
+
+        Args:
+            data: Event data with error information
+        """
+        if self.state_machine.is_initializing():
+            logger.error('Distribution failed during initialization, transitioning to ERROR state')
+            self.state_machine.transition_to(JobState.ERROR)
+
+    def _handle_initialization_failed(self, data: dict) -> None:
+        """Handle initialization failure event.
+
+        Args:
+            data: Event data with error and phase information
+        """
+        error = data.get('error', 'unknown')
+        phase = data.get('phase', 'unknown')
+        logger.error(f'Initialization failed during {phase}: {error}')
+        self.state_machine.transition_to(JobState.ERROR)
+
+    def _handle_role_determined(self, data: dict) -> None:
+        """Handle role determination event.
+
+        Args:
+            data: Event data with is_leader flag
+        """
+        if data.get('is_leader'):
+            self.state_machine.transition_to(JobState.RUNNING_LEADER)
+        else:
+            self.state_machine.transition_to(JobState.RUNNING_FOLLOWER)
 
     def __enter__(self):
         """Enter context and perform coordination setup.
         """
         self._cleanup()
 
-        if self._coordination_enabled:
-            logger.info(f'Starting {self.node_name} in coordination mode')
+        if not self._coordination_enabled:
+            return self
 
-            self.state_machine.transition_to(JobState.CLUSTER_FORMING)
+        logger.info(f'Starting {self.node_name} in coordination mode')
 
-            if self._lock_provider and self._locks_enabled:
-                if self._clear_existing_locks:
-                    logger.info(f'Clearing existing locks created by {self.node_name}')
-                    self.locks.clear_locks_by_creator(self.node_name)
-                logger.info('Invoking lock_provider callback')
-                self._lock_provider(self)
+        try:
+            if not self.state_machine.transition_to(JobState.CLUSTER_FORMING):
+                logger.error('Failed to transition to CLUSTER_FORMING')
+                self.event_bus.publish(StateEvent.INITIALIZATION_FAILED, {
+                    'error': 'Invalid state transition to CLUSTER_FORMING',
+                    'phase': 'state_transition'
+                })
+                return self
 
             logger.info(f'Waiting {self._wait_on_enter}s for cluster formation...')
             if self._shutdown_event.wait(timeout=self._wait_on_enter):
@@ -1844,15 +2054,27 @@ class Job:
             self._nodes = self.cluster.get_active_nodes()
             logger.info(f'Active nodes: {[n["name"] for n in self._nodes]}')
 
-            self.state_machine.transition_to(JobState.ELECTING)
-            leader = self.cluster.elect_leader()
-            is_leader = (leader == self.node_name)
-            logger.info(f'Leader elected: {leader}, am_i_leader={is_leader}')
+            if not self.state_machine.transition_to(JobState.ELECTING):
+                logger.error('Failed to transition to ELECTING')
+                self.event_bus.publish(StateEvent.INITIALIZATION_FAILED, {
+                    'error': 'Invalid state transition to ELECTING',
+                    'phase': 'electing'
+                })
+                return self
 
-            self.state_machine.transition_to(JobState.DISTRIBUTING)
-            if is_leader:
-                logger.info('I am leader, distributing tokens...')
-                self._distribute_tokens_safe()
+            if self.state_machine.is_error():
+                return self
+
+            if not self.state_machine.transition_to(JobState.DISTRIBUTING):
+                logger.error('Failed to transition to DISTRIBUTING')
+                self.event_bus.publish(StateEvent.INITIALIZATION_FAILED, {
+                    'error': 'Invalid state transition to DISTRIBUTING',
+                    'phase': 'distributing'
+                })
+                return self
+
+            if self.state_machine.is_error():
+                return self
 
             logger.info('Waiting for token distribution...')
             self.tokens.wait_for_distribution()
@@ -1860,10 +2082,20 @@ class Job:
             self.tokens.my_tokens, self.tokens.token_version = self.tokens.get_my_tokens_versioned()
             logger.info(f'Node {self.node_name} assigned {len(self.tokens.my_tokens)} tokens, version {self.tokens.token_version}')
 
-            if is_leader:
-                self.state_machine.transition_to(JobState.RUNNING_LEADER)
-            else:
-                self.state_machine.transition_to(JobState.RUNNING_FOLLOWER)
+            # Determine role via event-driven pattern
+            elected_leader = self.cluster.elect_leader()
+            is_leader = elected_leader == self.node_name
+            self.event_bus.publish(StateEvent.ROLE_DETERMINED, {
+                'is_leader': is_leader,
+                'elected_leader': elected_leader
+            })
+
+        except Exception as e:
+            logger.error(f'Initialization failed: {e}', exc_info=True)
+            self.event_bus.publish(StateEvent.INITIALIZATION_FAILED, {
+                'error': str(e),
+                'phase': 'initialization'
+            })
 
         return self
 
@@ -1876,8 +2108,7 @@ class Job:
             logger.error(exc_val)
 
         if self._coordination_enabled:
-            self.state_machine.transition_to(JobState.SHUTTING_DOWN)
-            self._shutdown_event.set()
+            self.event_bus.publish(StateEvent.SHUTDOWN_REQUESTED)
 
             for monitor in self._monitors:
                 if monitor.thread and monitor.thread.is_alive():
@@ -1955,6 +2186,10 @@ class Job:
         """
         if not self._coordination_enabled:
             return True
+
+        if self.state_machine.is_error():
+            logger.debug(f'Cannot claim task {task.id} in ERROR state')
+            return False
 
         if not self.state_machine.can_claim_task():
             logger.debug(f'Cannot claim task {task.id} in state {self.state_machine.state.value}')
@@ -2054,15 +2289,18 @@ class Job:
         return self.cluster.am_i_healthy()
 
     def am_i_leader(self) -> bool:
-        """Check if this node is the elected leader.
+        """Check if this node should be the elected leader based on database state.
 
         Returns
-            True if leader, False otherwise
+            True if this node should be leader (oldest active node), False otherwise
         """
+        if not self._coordination_enabled:
+            return False
+
         try:
-            leader = self.cluster.elect_leader()
-            return leader == self.node_name
-        except RuntimeError:
+            elected_leader = self.cluster.elect_leader()
+            return elected_leader == self.node_name
+        except Exception:
             return False
 
     def get_active_nodes(self) -> list[dict]:
@@ -2082,15 +2320,21 @@ class Job:
         return self.cluster.get_dead_nodes()
 
     def _distribute_tokens_safe(self) -> None:
-        """Leader distributes tokens with leader lock protection.
+        """Leader distributes tokens with rebalance and leader lock protection.
+
+        Acquires locks in order to prevent deadlock:
+        1. rebalance_lock - coarse-grained "who's rebalancing"
+        2. leader_lock - fine-grained "which leader is distributing"
         """
         try:
-            with self.locks.acquire_leader_lock('distribute'):
-                self.tokens.distribute(self.locks, self.cluster)
-        except LockNotAcquired:
-            logger.debug('Could not acquire leader lock for token distribution')
+            with self.locks.acquire_rebalance_lock('token_distribution'):
+                with self.locks.acquire_leader_lock('distribute'):
+                    self.tokens.distribute(self.locks, self.cluster)
+        except LockNotAcquired as e:
+            logger.debug(f'Could not acquire lock for token distribution: {e}')
         except Exception as e:
             logger.error(f'Token distribution failed: {e}', exc_info=True)
+            self.event_bus.publish(StateEvent.DISTRIBUTION_FAILED, {'error': str(e)})
 
     def _cleanup(self) -> None:
         """Cleanup tables and write audit log.
