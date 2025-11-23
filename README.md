@@ -23,10 +23,19 @@ pip install jobsync
 ### Basic Example
 
 ```python
-from jobsync import Job, Task, config
+from jobsync import Job, Task, CoordinationConfig
+
+# Configure coordination
+coord_config = CoordinationConfig(
+    host='localhost',
+    dbname='jobsync',
+    user='postgres',
+    password='postgres',
+    appname='myapp_'  # Prefix for database tables
+)
 
 # Each worker runs this code
-with Job('worker-01', config) as job:
+with Job('worker-01', coordination_config=coord_config) as job:
     for item_id in get_pending_items():
         task = Task(item_id)
         
@@ -39,6 +48,8 @@ with Job('worker-01', config) as job:
 ### Long-Running Task Example
 
 ```python
+from jobsync import Job, CoordinationConfig
+
 # For subscriptions, WebSockets, or continuous processing
 active_subscriptions = {}
 
@@ -59,7 +70,15 @@ def on_tokens_removed(token_ids: set[int]):
                 active_subscriptions[task_id].close()
                 del active_subscriptions[task_id]
 
-with Job('worker-01', config,
+coord_config = CoordinationConfig(
+    host='localhost',
+    dbname='jobsync',
+    user='postgres',
+    password='postgres',
+    appname='myapp_'
+)
+
+with Job('worker-01', coordination_config=coord_config,
          on_tokens_added=on_tokens_added,
          on_tokens_removed=on_tokens_removed) as job:
     # Callbacks handle starting/stopping subscriptions
@@ -100,19 +119,20 @@ Each worker processes different tasks - no duplicate work.
 
 ## Configuration
 
-Set environment variables for PostgreSQL connection:
+Configure database connection and coordination settings using `CoordinationConfig`:
 
-```bash
-export SYNC_SQL_HOST=localhost
-export SYNC_SQL_DATABASE=jobsync
-export SYNC_SQL_USERNAME=postgres
-export SYNC_SQL_PASSWORD=postgres
-```
+```python
+from jobsync import CoordinationConfig
 
-Optional coordination settings (defaults work for most cases):
-
-```bash
-export SYNC_TOTAL_TOKENS=10000          # Token pool size (default: 10000)
+coord_config = CoordinationConfig(
+    host='localhost',
+    port=5432,
+    dbname='jobsync',
+    user='postgres',
+    password='postgres',
+    appname='myapp_',  # Prefix for database tables (e.g., myapp_node, myapp_token)
+    total_tokens=10000  # Optional: customize token pool size
+)
 ```
 
 **See [Usage Guide](docs/USAGE_GUIDE.md#coordination-configuration)** for detailed configuration options and **[Operator Guide](docs/OPERATOR_GUIDE.md#performance-tuning)** for tuning parameters.
@@ -122,9 +142,17 @@ export SYNC_TOTAL_TOKENS=10000          # Token pool size (default: 10000)
 ### Basic Task Processing
 
 ```python
-from jobsync import Job, Task
+from jobsync import Job, Task, CoordinationConfig
 
-with Job('worker-01', config) as job:
+coord_config = CoordinationConfig(
+    host='localhost',
+    dbname='jobsync',
+    user='postgres',
+    password='postgres',
+    appname='myapp_'
+)
+
+with Job('worker-01', coordination_config=coord_config) as job:
     for item_id in get_pending_items():
         task = Task(item_id)
         if job.can_claim_task(task):
@@ -136,12 +164,22 @@ with Job('worker-01', config) as job:
 ### Task Pinning (Lock GPU tasks to GPU workers)
 
 ```python
+from jobsync import Job, Task, CoordinationConfig
+
 def register_gpu_locks(job):
     gpu_tasks = get_gpu_task_ids()
     locks = [(task_id, '%gpu%', 'requires_gpu') for task_id in gpu_tasks]
     job.register_locks_bulk(locks)
 
-with Job('worker-gpu-01', config, 
+coord_config = CoordinationConfig(
+    host='localhost',
+    dbname='jobsync',
+    user='postgres',
+    password='postgres',
+    appname='myapp_'
+)
+
+with Job('worker-gpu-01', coordination_config=coord_config,
          lock_provider=register_gpu_locks) as job:
     for task_id in get_all_tasks():
         if job.can_claim_task(Task(task_id)):
@@ -152,128 +190,94 @@ with Job('worker-gpu-01', config,
 
 ## Key Features
 
-### Lock Lifecycle Management
+### Automatic Load Balancing and Failover
 
-Control how locks are managed across runs:
+- **Token-based distribution** - 10,000 tokens evenly distributed across all active workers
+- **Consistent hashing** - Each task always hashes to the same token
+- **Automatic rebalancing** - When workers join/leave, tokens are redistributed with minimal movement
+- **Leader-based coordination** - Oldest worker manages cluster state and triggers rebalancing
+- **Zero-downtime deployments** - Add new workers, wait for tokens, then stop old workers
 
-```python
-# Dynamic locks (changes each run)
-def dynamic_lock_provider(job):
-    heavy_tasks = get_current_heavy_tasks()  # Different each day
-    locks = [(t, 'high-mem-%', 'heavy') for t in heavy_tasks]
-    job.register_task_locks_bulk(locks)
+### Task Locking and Pinning
 
-with Job('worker', 'prod', config,
-         lock_provider=dynamic_lock_provider,
-         clear_existing_locks=True) as job:  # Clean old locks
-    process_tasks(job)
-
-# Manual lock management
-with Job('admin', config) as job:
-    locks = job.list_locks()  # Review all locks
-    job.clear_locks_by_creator('old-node')  # Clean up specific node
-    job.clear_all_locks()  # Nuclear option
-```
-
-### Zero-Downtime Deployments
-
-Start new workers with updated code, then stop old workers:
-
-```bash
-# Start new version
-python worker_v2.py --node-name worker-v2-01 &
-python worker_v2.py --node-name worker-v2-02 &
-
-# Wait for them to join and get tokens (30-60 seconds)
-
-# Stop old version
-kill -TERM $(pgrep -f worker_v1.py)
-```
-
-The leader automatically rebalances tokens as workers join and leave.
-
-
-### Task Pinning
-
-Lock specific tasks to specific workers using patterns (supports single pattern or ordered fallback list):
+Lock specific tasks to specific workers using SQL LIKE patterns with ordered fallback support. Locks are registered by `task_id` and stored in the database. During distribution, each `task_id` is hashed to a `token_id`, and lock patterns determine which node receives that token.
 
 ```python
+from jobsync import Job, CoordinationConfig
+
 def register_locks(job):
     gpu_tasks = get_gpu_task_ids()
+    
+    # Ordered fallback: try primary GPU first, then any GPU node
     locks = [
-        # Ordered fallback: try gpu-01 first, then any GPU node
-        (task_id, ['gpu-01', '%-gpu'], 'requires_gpu')
+        (task_id, ['gpu-primary-01', '%-gpu'], 'requires_gpu')
         for task_id in gpu_tasks
     ]
-    # Simple case: single pattern string also accepted
-    # locks.append((task_id, '%-gpu', 'requires_gpu'))
     job.register_locks_bulk(locks)
 
-with Job('worker-gpu-01', config, 
-         lock_provider=register_locks) as job:
-    for task_id in get_all_tasks():
-        if job.can_claim_task(Task(task_id)):
-            process_gpu_task(task_id)
+coord_config = CoordinationConfig(
+    host='localhost',
+    dbname='jobsync',
+    user='postgres',
+    password='postgres',
+    appname='myapp_'
+)
+
+with Job('worker-gpu-01', coordination_config=coord_config,
+         lock_provider=register_locks,
+         clear_existing_locks=True) as job:
+    process_tasks(job)
 ```
 
-**See [Usage Guide](docs/USAGE_GUIDE.md#task-locking-and-pinning)** for complete lock API reference including bulk registration, pattern matching, fallback patterns, and lifecycle management.
+**Use cases:**
+- Pin GPU tasks to GPU-enabled workers
+- Route high-memory tasks to large-memory nodes
+- Ensure data locality (tasks process data in same region)
+- Resource-aware scheduling
 
-### Health Monitoring
+**See [Usage Guide](docs/USAGE_GUIDE.md#task-locking-and-pinning)** for complete lock API including pattern matching, fallback chains, expiration, and lifecycle management.
 
-Integrate with load balancers:
+### Health Monitoring and Custom Configuration
 
+**Health checks for load balancers:**
 ```python
 from flask import Flask, jsonify
-
-app = Flask(__name__)
+from jobsync import Job, CoordinationConfig
 
 @app.route('/health/ready')
 def health():
     if job.am_i_healthy():
         return jsonify({'status': 'ready'}), 200
     return jsonify({'status': 'not_ready'}), 503
-
-with Job('worker-01', config) as job:
-    app.run(host='0.0.0.0', port=8080)
 ```
 
-### Custom Configuration
-
-Fine-tune coordination behavior:
-
+**Fine-tune coordination:**
 ```python
-from jobsync import CoordinationConfig
-
-config = CoordinationConfig(
+coord_config = CoordinationConfig(
+    host='localhost',
+    dbname='jobsync',
+    user='postgres',
+    password='postgres',
+    appname='myapp_',
     total_tokens=50000,                   # More tokens for large clusters
+    minimum_nodes=2,                      # Wait for 2 nodes before distribution
     heartbeat_interval_sec=3,             # Faster heartbeat
     heartbeat_timeout_sec=9,              # Quicker failure detection
     rebalance_check_interval_sec=15       # More responsive rebalancing
 )
-
-with Job('worker-01', base_config, coordination_config=config) as job:
-    process_tasks(job)
 ```
+
+**See [Usage Guide](docs/USAGE_GUIDE.md#coordination-configuration)** and **[Operator Guide](docs/OPERATOR_GUIDE.md#performance-tuning)** for tuning recommendations.
 
 ## Documentation
 
-### 📚 Documentation Overview
+### 📚 Documentation
 
-This README provides a high-level overview and quick start. For detailed information:
+**[Usage Guide](docs/USAGE_GUIDE.md)** - Developer reference with examples, configuration, and patterns
 
-**[Usage Guide](docs/USAGE_GUIDE.md)** - Complete developer reference:
-- API documentation with code examples
-- Long-running task patterns (WebSockets, Kafka, subscriptions)  
-- Task locking with fallback patterns
-- Configuration options and tuning
-- Best practices and common patterns
+**[Operator Guide](docs/OPERATOR_GUIDE.md)** - Deployment, monitoring, and troubleshooting
 
-**[Operator Guide](docs/OPERATOR_GUIDE.md)** - Operations reference:
-- Deployment and scaling procedures
-- Monitoring, alerting, and dashboards
-- Troubleshooting guide with diagnostics
-- Emergency procedures and recovery
-- Database maintenance and tuning
+**[SQL Cheatsheet](docs/Cheatsheet.sql)** - Common monitoring queries
 
 
 ## Monitoring
@@ -286,13 +290,7 @@ SELECT COUNT(*) as active_nodes FROM sync_node
 WHERE last_heartbeat > NOW() - INTERVAL '15 seconds';
 ```
 
-**Quick Reference**: See [Cheatsheet.sql](docs/Cheatsheet.sql) for a printable collection of common monitoring queries.
-
-**See [Operator Guide](docs/OPERATOR_GUIDE.md#monitoring-and-alerting)** for:
-- Complete monitoring setup with alerting rules
-- Prometheus/Grafana integration examples
-- Diagnostic SQL queries
-- Troubleshooting procedures
+**See [Operator Guide](docs/OPERATOR_GUIDE.md#monitoring)** for metrics, alerts, and troubleshooting.
 
 ## Performance
 
@@ -320,9 +318,9 @@ pytest tests/test_coordination.py -v
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.10+
 - PostgreSQL 12+
-- Required packages: psycopg2, pandas (installed automatically)
+- Required packages: psycopg (psycopg3), sqlalchemy (installed automatically)
 
 ## License
 
@@ -330,6 +328,6 @@ MIT
 
 ## Support
 
-- **Issues**: https://github.com/yourorg/jobsync/issues
+- **Issues**: https://github.com/bissli/jobsync/issues
 - **Documentation**: See `docs/` folder
 - **Examples**: See `tests/` folder

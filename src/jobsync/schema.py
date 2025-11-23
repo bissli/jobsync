@@ -1,29 +1,19 @@
 import logging
-from types import ModuleType
 
 from sqlalchemy import Engine, text
-
-from jobsync import config as default_config
 
 logger = logging.getLogger(__name__)
 
 
-def get_table_names(config: ModuleType = None) -> dict[str, str]:
-    """Get table names based on config.
+def get_table_names(appname: str = 'sync_') -> dict[str, str]:
+    """Get table names based on appname prefix.
 
-    Parameters
-        config: Configuration module to use. If None, uses default config.
+    Args
+        appname: Application name prefix for tables
 
     Returns
         Dictionary containing table names
     """
-    _config = config or default_config
-
-    if hasattr(_config, 'sync') and hasattr(_config.sync, 'sql') and hasattr(_config.sync.sql, 'appname'):
-        appname = _config.sync.sql.appname
-    else:
-        appname = 'sync_'
-
     return get_table_names_for_appname(appname)
 
 
@@ -44,29 +34,23 @@ def get_table_names_for_appname(appname: str) -> dict[str, str]:
     }
 
 
-def verify_tables_exist(engine: Engine, config: ModuleType = None, coordination_enabled: bool = True) -> dict[str, bool]:
+def verify_tables_exist(engine: Engine, appname: str = 'sync_') -> dict[str, bool]:
     """Verify which required tables exist in the database.
 
     Args:
         engine: SQLAlchemy engine
-        config: Configuration module to use
-        coordination_enabled: Whether coordination tables should be checked
+        appname: Application name prefix for tables
 
     Returns
         Dictionary mapping table keys to existence status (True if exists, False otherwise)
     """
-    tables = get_table_names(config)
+    tables = get_table_names(appname)
     status = {}
 
-    core_table_keys = ['Node', 'Check', 'Audit', 'Claim']
-    coordination_table_keys = ['Token', 'Lock', 'LeaderLock', 'RebalanceLock', 'Rebalance']
-
-    tables_to_check = core_table_keys
-    if coordination_enabled:
-        tables_to_check = core_table_keys + coordination_table_keys
+    table_keys = ['Node', 'Check', 'Audit', 'Claim', 'Token', 'Lock', 'LeaderLock', 'RebalanceLock', 'Rebalance']
 
     with engine.connect() as conn:
-        for table_key in tables_to_check:
+        for table_key in table_keys:
             table_name = tables[table_key]
             result = conn.execute(text("""
                 SELECT EXISTS (
@@ -159,13 +143,13 @@ CREATE TABLE IF NOT EXISTS {Token} (
 
         conn.execute(text(f"""
 CREATE TABLE IF NOT EXISTS {Lock} (
-    token_id integer not null,
+    task_id varchar not null,
     node_patterns jsonb not null,
     reason varchar,
     created_at timestamp with time zone not null,
     created_by varchar not null,
     expires_at timestamp with time zone,
-    primary key (token_id)
+    primary key (task_id)
 );
         """))
 
@@ -218,7 +202,7 @@ CREATE TABLE IF NOT EXISTS {Rebalance} (
     logger.debug(f'Coordination tables verified: {Token}, {Lock}, {LeaderLock}, {RebalanceLock}, {Rebalance}')
 
 
-def ensure_database_ready(engine: Engine, config: ModuleType = None, coordination_enabled: bool = True) -> None:
+def ensure_database_ready(engine: Engine, appname: str = 'sync_') -> None:
     """Ensure database has all required tables with correct structure.
 
     This function checks which tables exist and creates any missing tables.
@@ -226,37 +210,25 @@ def ensure_database_ready(engine: Engine, config: ModuleType = None, coordinatio
 
     Args:
         engine: SQLAlchemy engine
-        config: Configuration module to use
-        coordination_enabled: Whether to ensure coordination tables exist
+        appname: Application name prefix for tables
     """
-    tables = get_table_names(config)
+    tables = get_table_names(appname)
 
-    logger.debug(f'Verifying database structure (coordination_enabled={coordination_enabled})')
+    logger.debug('Verifying database structure')
 
-    table_status = verify_tables_exist(engine, config, coordination_enabled)
+    table_status = verify_tables_exist(engine, appname)
 
-    missing_core = [k for k in ['Node', 'Check', 'Audit', 'Claim'] if not table_status.get(k, False)]
-    if missing_core:
-        logger.info(f'Creating missing core tables: {missing_core}')
+    missing_tables = [k for k in ['Node', 'Check', 'Audit', 'Claim', 'Token', 'Lock', 'LeaderLock', 'RebalanceLock', 'Rebalance']
+                     if not table_status.get(k, False)]
+    if missing_tables:
+        logger.info(f'Creating missing tables: {missing_tables}')
 
     try:
         _create_core_tables(engine, tables)
-        logger.info('Core tables ready')
+        _create_coordination_tables(engine, tables)
+        logger.info('Database tables ready')
     except Exception as e:
-        logger.error(f'Failed to create core tables: {e}')
+        logger.error(f'Failed to create tables: {e}')
         raise
 
-    if coordination_enabled:
-        missing_coord = [k for k in ['Token', 'Lock', 'LeaderLock', 'RebalanceLock', 'Rebalance']
-                        if not table_status.get(k, False)]
-        if missing_coord:
-            logger.info(f'Creating missing coordination tables: {missing_coord}')
-
-        try:
-            _create_coordination_tables(engine, tables)
-            logger.info('Coordination tables ready')
-        except Exception as e:
-            logger.error(f'Failed to create coordination tables: {e}')
-            raise
-
-    logger.info(f'Database structure verified and ready (coordination_enabled={coordination_enabled})')
+    logger.info('Database structure verified and ready')

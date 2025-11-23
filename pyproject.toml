@@ -13,7 +13,6 @@ psycopg = { extras = ["binary"], version = "3.2.10" }
 sqlalchemy = "^2.0.0"
 
 # == test
-asserts = { version = "*", optional = true }
 docker = { version = "*", optional = true }
 pytest = { version = "*", optional = true }
 pytest-mock = { version = "*", optional = true }
@@ -22,7 +21,6 @@ wrapt = { version = "*", optional = true }
 
 [tool.poetry.extras]
 test = [
-  "asserts",
   "docker",
   "pytest",
   "pytest-mock",

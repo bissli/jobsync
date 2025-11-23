@@ -1,9 +1,22 @@
+"""Pytest configuration and shared fixtures.
+
+WHAT THIS FILE PROVIDES:
+- psql_docker: PostgreSQL Docker container for tests
+- postgres: SQLAlchemy engine with test database setup
+- Helper functions for table management (drop_tables, create_extensions)
+- Database connection cleanup (terminate_postgres_connections)
+
+This file sets up the test environment with:
+- PostgreSQL 17 in Docker
+- America/New_York timezone configuration
+- Required extensions (hstore)
+- Automatic table cleanup between tests
+"""
 import logging
 import os
 import pathlib
 import time
 
-import config
 import docker
 import pytest
 from sqlalchemy import create_engine, text
@@ -45,10 +58,10 @@ def psql_docker():
     container.stop()
 
 
-def drop_tables(engine, config):
+def drop_tables(engine, appname: str = 'sync_'):
     """Drop all test tables.
     """
-    tables = schema.get_table_names(config)
+    tables = schema.get_table_names(appname)
     with engine.connect() as conn:
         for table in [
             tables['Rebalance'],
@@ -92,10 +105,7 @@ def terminate_postgres_connections(engine):
 def postgres(psql_docker):
     """Provide SQLAlchemy engine for PostgreSQL tests.
     """
-    connection_string = (
-        f'postgresql+psycopg://{config.postgres.username}:{config.postgres.password}'
-        f'@{config.postgres.hostname}:{config.postgres.port}/{config.postgres.database}'
-    )
+    connection_string = 'postgresql+psycopg://postgres:postgres@localhost:5432/jobsync'
     engine = create_engine(connection_string, pool_pre_ping=True, pool_size=10, max_overflow=5)
 
     create_extensions(engine)
@@ -103,9 +113,9 @@ def postgres(psql_docker):
     engine.dispose()
 
     engine = create_engine(connection_string, pool_pre_ping=True, pool_size=10, max_overflow=5)
-    schema.ensure_database_ready(engine, config, coordination_enabled=True)
+    schema.ensure_database_ready(engine, 'sync_')
 
-    tables = schema.get_table_names(config)
+    tables = schema.get_table_names('sync_')
     with engine.connect() as conn:
         conn.execute(text(f"""
 CREATE TABLE IF NOT EXISTS {tables['Inst']} (
@@ -119,5 +129,5 @@ CREATE TABLE IF NOT EXISTS {tables['Inst']} (
         yield engine
     finally:
         terminate_postgres_connections(engine)
-        drop_tables(engine, config)
+        drop_tables(engine, 'sync_')
         engine.dispose()

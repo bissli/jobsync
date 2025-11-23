@@ -3,7 +3,10 @@
 -- ============================================================================
 --
 -- Quick reference for checking cluster health and status.
--- All queries use the standard 'sync_' table prefix.
+-- All queries use the default 'sync_' table prefix.
+--
+-- NOTE: If you customized 'appname' in CoordinationConfig, replace 'sync_'
+--       with your prefix (e.g., 'myapp_') throughout these queries.
 --
 -- Usage:
 --   Run the entire file:
@@ -12,13 +15,16 @@
 --   Or copy individual queries to run them separately.
 --
 -- TABLE REFERENCE:
---   sync_node        - Worker registration and heartbeat
---   sync_token       - Token ownership assignments
---   sync_leader_lock - Current leader election lock
---   sync_rebalance   - Token rebalancing audit log
---   sync_lock        - Task pinning to specific nodes
---   sync_claim       - Tasks claimed by workers
---   sync_audit       - Completed task tracking
+--   sync_node           - Worker registration and heartbeat
+--   sync_token          - Token ownership assignments
+--   sync_leader_lock    - Current leader election lock
+--   sync_rebalance      - Token rebalancing audit log
+--   sync_rebalance_lock - Rebalancing coordination lock
+--   sync_lock           - Task pinning to specific nodes (by task_id)
+--   sync_claim          - Tasks claimed by workers
+--   sync_audit          - Completed task tracking
+--   sync_check          - Task processing checkpoints
+--   sync_checkpoint     - Job execution checkpoints
 --
 -- ============================================================================
 
@@ -194,7 +200,7 @@ ORDER BY tasks_claimed DESC;
 
 \echo ''
 \echo 'Task Completion Rate (Today):'
-\echo '(Compare claimed vs completed - incomplete tasks may indicate failures)'
+\echo '(Claims are transient, cleaned on node exit; audit records are permanent)'
 WITH claimed AS (
     SELECT COUNT(DISTINCT item) as count
     FROM sync_claim
@@ -208,9 +214,14 @@ completed AS (
 SELECT 
     claimed.count as claimed_tasks,
     completed.count as completed_tasks,
-    claimed.count - completed.count as incomplete_tasks,
+    CASE 
+        WHEN claimed.count > 0 THEN claimed.count - completed.count
+        ELSE NULL
+    END as incomplete_tasks,
     ROUND(100.0 * completed.count / NULLIF(claimed.count, 0), 1) as completion_percent,
     CASE 
+        WHEN claimed.count = 0 AND completed.count > 0 THEN '✓ NODES EXITED CLEANLY'
+        WHEN claimed.count = 0 THEN '- NO ACTIVITY'
         WHEN claimed.count = completed.count THEN '✓ ALL COMPLETE'
         WHEN completed.count::float / NULLIF(claimed.count, 0) > 0.9 THEN '⚠ MOSTLY COMPLETE'
         ELSE '✗ MANY INCOMPLETE'
@@ -219,7 +230,7 @@ FROM claimed, completed;
 
 \echo ''
 \echo 'Incomplete Tasks (First 20):'
-\echo '(Tasks claimed but not yet completed)'
+\echo '(Tasks claimed but not yet completed - empty when nodes exit cleanly)'
 SELECT 
     c.item as task_id,
     c.node,
@@ -256,37 +267,32 @@ GROUP BY node_patterns, reason
 ORDER BY locked_token_count DESC;
 
 \echo ''
-\echo 'Lock Pattern Matching (First 20 Tokens):'
-\echo '(Verify locked tokens are assigned to matching nodes)'
+\echo 'Lock Pattern Matching (First 20 Tasks):'
+\echo '(Verify locked tasks are assigned to matching nodes)'
 \echo '(node_patterns is JSONB array - patterns tried in order)'
 WITH lock_patterns AS (
     SELECT 
-        l.token_id,
+        l.task_id,
         l.node_patterns::text as patterns_text,
         jsonb_array_elements_text(l.node_patterns) as pattern,
         l.reason,
-        l.created_by,
-        t.node as assigned_node
+        l.created_by
     FROM sync_lock l
-    JOIN sync_token t ON l.token_id = t.token_id
 )
 SELECT 
-    token_id,
+    task_id,
     patterns_text,
-    assigned_node,
     reason,
-    created_by,
-    bool_or(assigned_node LIKE pattern) as matches_any_pattern
+    created_by
 FROM lock_patterns
-GROUP BY token_id, patterns_text, assigned_node, reason, created_by
-ORDER BY token_id
+ORDER BY task_id
 LIMIT 20;
 
 \echo ''
 \echo 'Orphaned Locks:'
 \echo '(Locks from nodes no longer in cluster - may need cleanup)'
 SELECT 
-    l.token_id,
+    l.task_id,
     l.node_patterns,
     l.created_by,
     l.reason,
