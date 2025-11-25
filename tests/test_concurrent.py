@@ -299,20 +299,20 @@ class TestConcurrentCallbackAndRebalance:
 
     @clean_tables('Node', 'Token')
     def test_rebalance_during_callback_execution(self, postgres):
-        """Verify rebalance can occur while on_tokens_added is executing.
+        """Verify rebalance can occur while on_rebalance is executing.
         """
         coord_cfg = get_coordination_config()
         tables = schema.get_table_names(coord_cfg.appname)
 
         callback_states = []
 
-        def long_callback(token_ids: set[int]):
-            callback_states.append(('started', len(token_ids)))
+        def long_callback():
+            callback_states.append(('started', 0))
             time.sleep(3)
-            callback_states.append(('finished', len(token_ids)))
+            callback_states.append(('finished', 0))
 
-        job1 = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
-                  on_tokens_added=long_callback)
+        job1 = create_job('node1', postgres, coordination_config=coord_cfg,
+                          wait_on_enter=10, on_rebalance=long_callback)
         job1.__enter__()
 
         try:
@@ -349,13 +349,13 @@ class TestConcurrentCallbackAndRebalance:
 
         callback_active = []
 
-        def blocking_callback(token_ids: set[int]):
+        def blocking_callback():
             callback_active.append(True)
             time.sleep(8)
             callback_active.append(False)
 
         job1 = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
-                  on_tokens_removed=blocking_callback)
+                  on_rebalance=blocking_callback)
         job1.__enter__()
 
         try:
@@ -401,10 +401,10 @@ class TestConcurrentCallbackAndRebalance:
 
         callback_events = []
 
-        def slow_callback(token_ids: set[int]):
-            callback_events.append(('callback_start', len(token_ids)))
+        def slow_callback():
+            callback_events.append(('callback_start', 0))
             time.sleep(4)
-            callback_events.append(('callback_end', len(token_ids)))
+            callback_events.append(('callback_end', 0))
 
         now = datetime.datetime.now(datetime.timezone.utc)
         insert_active_node(postgres, tables, 'node1', created_on=now)
@@ -412,7 +412,7 @@ class TestConcurrentCallbackAndRebalance:
 
         job1 = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=5)
         job2 = create_job('node2', postgres, coordination_config=coord_cfg, wait_on_enter=5,
-                  on_tokens_added=slow_callback)
+                  on_rebalance=slow_callback)
 
         job1.__enter__()
         time.sleep(0.5)
@@ -452,12 +452,12 @@ class TestConcurrentCallbackAndRebalance:
 
         version_history = []
 
-        def version_tracking_callback(token_ids: set[int]):
-            version_history.append(('callback', len(token_ids)))
+        def version_tracking_callback():
+            version_history.append(('callback', 0))
             time.sleep(6)
 
         job1 = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
-                  on_tokens_removed=version_tracking_callback)
+                  on_rebalance=version_tracking_callback)
         job1.__enter__()
 
         try:

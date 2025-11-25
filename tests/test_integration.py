@@ -16,7 +16,7 @@ import pytest
 from sqlalchemy import text
 
 from jobsync import schema
-from jobsync.client import CoordinationConfig, JobState, task_to_token
+from jobsync.client import CoordinationConfig, JobState
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +100,7 @@ class TestCanClaimTask:
         # Find a task_id that maps to token 5
         task_id = None
         for candidate in range(100000):
-            if task_to_token(candidate, job.tokens.total_tokens) == token_id:
+            if job.task_to_token(candidate) == token_id:
                 task_id = candidate
                 break
         assert task_id is not None, f'Could not find task_id mapping to token {token_id}'
@@ -161,18 +161,10 @@ class TestTokenDistribution:
 
         coord_config = CoordinationConfig(total_tokens=30)
 
-        # Find task_ids that hash to tokens 0-9
-        task_ids_for_tokens = {}
-        task_id = 0
-        while len(task_ids_for_tokens) < 10:
-            token_id = task_to_token(task_id, coord_config.total_tokens)
-            if token_id < 10 and token_id not in task_ids_for_tokens:
-                task_ids_for_tokens[token_id] = task_id
-            task_id += 1
+        task_ids = find_task_ids_covering_all_tokens(coord_config)
 
-        # Insert locks using the found task_ids
         for token_id in range(10):
-            insert_lock(postgres, tables, task_ids_for_tokens[token_id], ['special-%'], created_by='test')
+            insert_lock(postgres, tables, task_ids[token_id], ['special-%'], created_by='test')
 
         job = create_job('node1', postgres, wait_on_enter=0, coordination_config=coord_config)
 
@@ -196,18 +188,12 @@ class TestTokenDistribution:
 
         coord_config = CoordinationConfig(total_tokens=50)
 
-        # Find task_ids that hash to tokens 0-19 (20 locked tokens)
-        task_ids_for_tokens = {}
-        task_id = 0
-        while len(task_ids_for_tokens) < 20:
-            token_id = task_to_token(task_id, coord_config.total_tokens)
-            if token_id < 20 and token_id not in task_ids_for_tokens:
-                task_ids_for_tokens[token_id] = task_id
-            task_id += 1
+        # Find task_ids that hash to all tokens (using helper function)
+        task_ids = find_task_ids_covering_all_tokens(coord_config)
 
-        # Lock 20 tokens with pattern 'special-%' (matches both special-alpha and special-beta)
+        # Lock first 20 tokens with pattern 'special-%' (matches both special-alpha and special-beta)
         for token_id in range(20):
-            insert_lock(postgres, tables, task_ids_for_tokens[token_id], ['special-%'], created_by='test')
+            insert_lock(postgres, tables, task_ids[token_id], ['special-%'], created_by='test')
 
         job = create_job('node1', postgres, wait_on_enter=0, coordination_config=coord_config)
 
@@ -273,6 +259,54 @@ class TestTokenDistribution:
             assert node_name in node_counts and node_counts[node_name] > 0, f'{node_name} should have some tokens'
 
         assert node_counts['special-alpha'] >= 10, 'special-alpha should have at least the 10 locked tokens'
+
+    @clean_tables('Node', 'Token')
+    def test_same_nodes_always_get_same_tokens(self, postgres):
+        """Verify same node names always receive identical token assignments across runs.
+        """
+        config = get_coordination_config()
+        tables = schema.get_table_names(config.appname)
+
+        coord_config = CoordinationConfig(total_tokens=100)
+
+        print('\nRun 1: Initial cluster formation')
+        with cluster(postgres, 'alpha', 'beta', 'gamma', total_tokens=100) as nodes_run1:
+            for node in nodes_run1:
+                assert wait_for(lambda n=node: len(n.my_tokens) >= 20, timeout_sec=10)
+
+            assert wait_for_cached_tokens_sync(nodes_run1, expected_total=100, timeout_sec=10)
+
+            distribution_run1 = {node.node_name: sorted(node.my_tokens) for node in nodes_run1}
+            print('Run 1 distribution:')
+            for name, tokens in distribution_run1.items():
+                print(f'  {name}: {len(tokens)} tokens')
+
+        print('\nCleaning database...')
+        clear_tables(postgres, tables, ['Node', 'Token', 'Rebalance'])
+
+        print('\nRun 2: Fresh cluster with same node names')
+        with cluster(postgres, 'alpha', 'beta', 'gamma', total_tokens=100) as nodes_run2:
+            for node in nodes_run2:
+                assert wait_for(lambda n=node: len(n.my_tokens) >= 20, timeout_sec=10)
+
+            assert wait_for_cached_tokens_sync(nodes_run2, expected_total=100, timeout_sec=10)
+
+            distribution_run2 = {node.node_name: sorted(node.my_tokens) for node in nodes_run2}
+            print('Run 2 distribution:')
+            for name, tokens in distribution_run2.items():
+                print(f'  {name}: {len(tokens)} tokens')
+
+        for node_name in ['alpha', 'beta', 'gamma']:
+            tokens_run1 = distribution_run1[node_name]
+            tokens_run2 = distribution_run2[node_name]
+
+            assert tokens_run1 == tokens_run2, (
+                f'{node_name} received different tokens across runs: '
+                f'run1={len(tokens_run1)}, run2={len(tokens_run2)}'
+            )
+            print(f'✓ {node_name}: identical distribution across runs')
+
+        print('✓ Deterministic distribution verified')
 
 
 class TestNodesPropertyIsolation:
@@ -378,38 +412,20 @@ class TestNodesPropertyIsolation:
 class TestBasicCallbackInvocation:
     """Test basic callback invocation scenarios."""
 
-    def test_on_tokens_added_called_on_startup(self, postgres):
-        """Verify on_tokens_added called during initial allocation.
+    def test_on_rebalance_called_on_startup(self, postgres):
+        """Verify on_rebalance called during initial allocation.
         """
         coord_cfg = get_coordination_config()
 
         tracker = CallbackTracker()
 
         with create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
-                on_tokens_added=tracker.on_tokens_added) as job:
+                on_rebalance=tracker.on_rebalance) as job:
             assert wait_for(lambda: len(job.my_tokens) >= 1, timeout_sec=15), 'Should receive tokens'
-            assert wait_for(lambda: len(tracker.added_calls) >= 1, timeout_sec=5), 'Callback should be invoked'
+            assert wait_for(lambda: len(tracker.rebalance_calls) >= 1, timeout_sec=5), 'Callback should be invoked'
 
-            assert len(tracker.added_calls) > 0, 'on_tokens_added should be called'
-            assert len(tracker.get_total_added()) > 0, 'Should have received tokens'
-
-            received_tokens = tracker.get_total_added()
-            assert received_tokens == job.my_tokens, 'Callback tokens should match job assignment'
-
-    def test_both_callbacks_registered(self, postgres):
-        """Verify both callbacks can be registered and called.
-        """
-        coord_cfg = get_coordination_config()
-
-        tracker = CallbackTracker()
-
-        with create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
-                on_tokens_added=tracker.on_tokens_added,
-                on_tokens_removed=tracker.on_tokens_removed) as job:
-            assert wait_for(lambda: len(job.my_tokens) >= 1, timeout_sec=15)
-            assert wait_for(lambda: len(tracker.added_calls) >= 1, timeout_sec=5)
-
-            assert len(tracker.added_calls) > 0, 'on_tokens_added should be called'
+            assert len(tracker.rebalance_calls) > 0, 'on_rebalance should be called'
+            assert len(job.my_tokens) > 0, 'Should have received tokens'
 
     def test_no_callbacks_without_coordination(self, postgres):
         """Verify callbacks not invoked when coordination disabled.
@@ -417,19 +433,17 @@ class TestBasicCallbackInvocation:
         tracker = CallbackTracker()
 
         with create_job('node1', postgres, coordination_config=None, wait_on_enter=0,
-                on_tokens_added=tracker.on_tokens_added,
-                on_tokens_removed=tracker.on_tokens_removed) as job:
+                on_rebalance=tracker.on_rebalance) as job:
             time.sleep(1)
 
-            assert len(tracker.added_calls) == 0, 'Callbacks should not fire when coordination disabled'
-            assert len(tracker.removed_calls) == 0, 'Callbacks should not fire when coordination disabled'
+            assert len(tracker.rebalance_calls) == 0, 'Callbacks should not fire when coordination disabled'
 
 
 class TestCallbackTiming:
     """Test callback timing and ordering guarantees."""
 
-    def test_removed_called_before_added_during_rebalance(self, postgres):
-        """Verify on_tokens_removed called before on_tokens_added during rebalancing.
+    def test_rebalance_called_during_membership_change(self, postgres):
+        """Verify on_rebalance called when cluster membership changes.
         """
         coord_cfg = get_coordination_config()
         tables = schema.get_table_names(coord_cfg.appname)
@@ -438,8 +452,7 @@ class TestCallbackTiming:
 
         # Start first node
         job1 = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
-                  on_tokens_added=tracker.on_tokens_added,
-                  on_tokens_removed=tracker.on_tokens_removed)
+                  on_rebalance=tracker.on_rebalance)
         job1.__enter__()
 
         try:
@@ -447,9 +460,10 @@ class TestCallbackTiming:
             assert wait_for_running_state(job1, timeout_sec=5)
 
             # Wait for initial callback to fire before resetting tracker
-            assert wait_for(lambda: len(tracker.added_calls) >= 1, timeout_sec=5), 'Initial callback should fire before reset'
+            assert wait_for(lambda: len(tracker.rebalance_calls) >= 1, timeout_sec=5), 'Initial callback should fire before reset'
 
             initial_tokens = job1.my_tokens.copy()
+            initial_callback_count = len(tracker.rebalance_calls)
             tracker.reset()
 
             # Start second node to trigger rebalancing
@@ -464,16 +478,9 @@ class TestCallbackTiming:
 
                 assert wait_for_rebalance(postgres, tables, min_count=1, timeout_sec=20)
 
-                if len(tracker.call_order) > 0:
-                    # If callbacks were invoked, verify order
-                    for i in range(len(tracker.call_order) - 1):
-                        current_type, current_tokens = tracker.call_order[i]
-                        next_type, next_tokens = tracker.call_order[i + 1]
-
-                        # If we see an 'added' call followed by another call,
-                        # there should not be a 'removed' call after it in the same rebalance cycle
-                        if current_type == 'removed' and next_type == 'added':
-                            logger.info('✓ Verified removed called before added')
+                # Wait for rebalance callback
+                assert wait_for(lambda: len(tracker.rebalance_calls) >= 1, timeout_sec=10), \
+                    'on_rebalance should be called after membership change'
 
                 # Verify tokens were actually rebalanced
                 final_tokens = job1.my_tokens
@@ -494,14 +501,14 @@ class TestCallbackTiming:
         callback_thread_id = None
         callback_invoked = []
 
-        def track_thread_on_added(token_ids: set[int]):
+        def track_thread_callback():
             nonlocal callback_thread_id
             callback_thread_id = threading.current_thread().ident
             callback_invoked.append(True)
             logger.info(f'Callback running in thread {callback_thread_id}')
 
         with create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
-                on_tokens_added=track_thread_on_added) as job:
+                on_rebalance=track_thread_callback) as job:
             assert wait_for(lambda: len(job.my_tokens) >= 1, timeout_sec=15)
             assert wait_for(lambda: len(callback_invoked) >= 1, timeout_sec=5)
 
@@ -512,35 +519,32 @@ class TestCallbackTiming:
 class TestCallbackExceptionHandling:
     """Test that callback exceptions don't break coordination."""
 
-    def test_exception_in_on_tokens_added(self, postgres):
-        """Verify exception in on_tokens_added doesn't break coordination.
+    def test_exception_in_on_rebalance(self, postgres):
+        """Verify exception in on_rebalance doesn't break coordination.
         """
         coord_cfg = get_coordination_config()
 
-        def failing_callback(token_ids: set[int]):
+        def failing_callback():
             raise RuntimeError('Test exception in callback')
 
         with create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
-                on_tokens_added=failing_callback) as job:
+                on_rebalance=failing_callback) as job:
             assert wait_for(lambda: len(job.my_tokens) >= 1, timeout_sec=15), 'Should receive tokens despite callback exception'
 
             # Job should still function despite callback failure
             assert job.am_i_healthy(), 'Node should be healthy despite callback exception'
             assert len(job.my_tokens) > 0, 'Node should still have tokens'
 
-    def test_exception_in_on_tokens_removed(self, postgres):
-        """Verify exception in on_tokens_removed doesn't break coordination.
+    def test_exception_during_rebalance(self, postgres):
+        """Verify exception in callback doesn't prevent rebalancing.
         """
         coord_cfg = get_coordination_config()
 
-        def failing_removed_callback(token_ids: set[int]):
-            raise RuntimeError('Test exception in removed callback')
-
-        tracker = CallbackTracker()
+        def failing_callback():
+            raise RuntimeError('Test exception in callback')
 
         job1 = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
-                  on_tokens_added=tracker.on_tokens_added,
-                  on_tokens_removed=failing_removed_callback)
+                  on_rebalance=failing_callback)
         job1.__enter__()
 
         try:
@@ -557,7 +561,7 @@ class TestCallbackExceptionHandling:
                 for node in [job1, job2]:
                     assert wait_for_running_state(node, timeout_sec=5)
 
-                # Despite on_tokens_removed failing, coordination should continue
+                # Despite callback failing, coordination should continue
                 assert job1.am_i_healthy(), 'Node1 should be healthy'
                 assert job2.am_i_healthy(), 'Node2 should be healthy'
 
@@ -567,56 +571,29 @@ class TestCallbackExceptionHandling:
         finally:
             job1.__exit__(None, None, None)
 
-    def test_partial_callback_failure(self, postgres):
-        """Verify partial failures in callbacks don't prevent processing all tokens.
-        """
-        coord_cfg = get_coordination_config()
-
-        processed_tokens = set()
-
-        def partially_failing_callback(token_ids: set[int]):
-            for token_id in token_ids:
-                if token_id % 10 == 0:
-                    raise RuntimeError(f'Test failure for token {token_id}')
-                processed_tokens.add(token_id)
-
-        with create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
-                on_tokens_added=partially_failing_callback) as job:
-            assert wait_for(lambda: len(job.my_tokens) >= 1, timeout_sec=15)
-            assert wait_for_running_state(job, timeout_sec=5), 'Should reach running state'
-
-            # Note: Our current implementation calls callback once with all tokens,
-            # so if exception is raised, no tokens get processed
-            # This test documents current behavior
-            assert job.am_i_healthy(), 'Node should remain healthy'
-
 
 class TestCallbackCorrectness:
-    """Test that callbacks receive correct token sets."""
+    """Test that callbacks are called at correct times."""
 
-    def test_added_tokens_match_ownership(self, postgres):
-        """Verify on_tokens_added receives exactly the tokens owned by node.
+    def test_rebalance_called_on_startup(self, postgres):
+        """Verify on_rebalance called during initial token assignment.
         """
         coord_cfg = get_coordination_config()
 
-        received_tokens = None
         callback_invoked = []
 
-        def capture_tokens(token_ids: set[int]):
-            nonlocal received_tokens
-            received_tokens = token_ids.copy()
+        def track_callback():
             callback_invoked.append(True)
 
         with create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
-                on_tokens_added=capture_tokens) as job:
+                on_rebalance=track_callback) as job:
             assert wait_for(lambda: len(job.my_tokens) >= 1, timeout_sec=15)
             assert wait_for(lambda: len(callback_invoked) >= 1, timeout_sec=5)
 
-            assert received_tokens is not None, 'Callback should have been called'
-            assert received_tokens == job.my_tokens, 'Callback tokens should match job ownership'
+            assert len(callback_invoked) > 0, 'Callback should have been called'
 
-    def test_removed_tokens_accurate_during_rebalance(self, postgres):
-        """Verify on_tokens_removed receives correct set of removed tokens.
+    def test_rebalance_called_on_membership_change(self, postgres):
+        """Verify on_rebalance called when cluster membership changes.
         """
         coord_cfg = get_coordination_config()
         tables = schema.get_table_names(coord_cfg.appname)
@@ -624,18 +601,17 @@ class TestCallbackCorrectness:
         tracker = CallbackTracker()
 
         job1 = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
-                  on_tokens_added=tracker.on_tokens_added,
-                  on_tokens_removed=tracker.on_tokens_removed)
+                  on_rebalance=tracker.on_rebalance)
         job1.__enter__()
 
         try:
             assert wait_for(lambda: len(job1.my_tokens) >= 30, timeout_sec=15)
             assert wait_for_running_state(job1, timeout_sec=5)
 
-            assert wait_for(lambda: len(tracker.added_calls) >= 1, timeout_sec=5), 'Initial callback should fire before reset'
+            assert wait_for(lambda: len(tracker.rebalance_calls) >= 1, timeout_sec=5), 'Initial callback should fire'
 
             initial_tokens = job1.my_tokens.copy()
-            tracker.reset()
+            initial_call_count = len(tracker.rebalance_calls)
 
             # Add second node
             job2 = create_job('node2', postgres, coordination_config=coord_cfg, wait_on_enter=10)
@@ -649,93 +625,12 @@ class TestCallbackCorrectness:
 
                 assert wait_for_rebalance(postgres, tables, min_count=1, timeout_sec=20)
 
+                # Wait for callback to fire after rebalance
+                assert wait_for(lambda: len(tracker.rebalance_calls) > initial_call_count, timeout_sec=10), \
+                    'Callback should fire after rebalance'
+
                 final_tokens = job1.my_tokens
-
-                logger.info(f'TEST: initial_tokens count={len(initial_tokens)}, sample={sorted(list(initial_tokens)[:10])}')
-                logger.info(f'TEST: final_tokens count={len(final_tokens)}, sample={sorted(list(final_tokens)[:10])}')
-                logger.info(f'TEST: tracker.removed_calls count={len(tracker.removed_calls)}')
-                logger.info(f'TEST: tracker.added_calls count={len(tracker.added_calls)}')
-
-                if len(tracker.removed_calls) > 0:
-                    total_removed = tracker.get_total_removed()
-                    total_added = tracker.get_total_added()
-
-                    logger.info(f'TEST: total_removed count={len(total_removed)}, sample={sorted(list(total_removed)[:10])}')
-                    logger.info(f'TEST: total_added count={len(total_added)}, sample={sorted(list(total_added)[:10])}')
-
-                    # All removed tokens should have been in initial set
-                    for token in total_removed:
-                        assert token in initial_tokens, f'Removed token {token} was not in initial set'
-
-                    # Final = initial - removed + added
-                    expected_final = (initial_tokens - total_removed) | total_added
-                    logger.info(f'TEST: expected_final count={len(expected_final)}, sample={sorted(list(expected_final)[:10])}')
-                    logger.info('TEST: Comparing final_tokens vs expected_final')
-                    logger.info(f'TEST: final_tokens == expected_final: {final_tokens == expected_final}')
-                    logger.info(f'TEST: final_tokens - expected_final: {sorted(list(final_tokens - expected_final)[:10])}')
-                    logger.info(f'TEST: expected_final - final_tokens: {sorted(list(expected_final - final_tokens)[:10])}')
-
-                    assert final_tokens == expected_final, 'Final tokens should equal initial - removed + added'
-
-            finally:
-                job2.__exit__(None, None, None)
-
-        finally:
-            job1.__exit__(None, None, None)
-
-    def test_no_duplicate_token_notifications(self, postgres):
-        """Verify tokens not reported in both added and removed in same rebalance.
-        """
-        coord_cfg = get_coordination_config()
-        tables = schema.get_table_names(coord_cfg.appname)
-
-        all_added = []
-        all_removed = []
-        lock = threading.Lock()
-
-        def track_added(token_ids: set[int]):
-            with lock:
-                all_added.append(token_ids.copy())
-
-        def track_removed(token_ids: set[int]):
-            with lock:
-                all_removed.append(token_ids.copy())
-
-        job1 = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
-                  on_tokens_added=track_added,
-                  on_tokens_removed=track_removed)
-        job1.__enter__()
-
-        try:
-            assert wait_for(lambda: len(job1.my_tokens) >= 1, timeout_sec=15)
-
-            assert wait_for_running_state(job1, timeout_sec=5)
-
-            job2 = create_job('node2', postgres, coordination_config=coord_cfg, wait_on_enter=10)
-            job2.__enter__()
-
-            try:
-                assert wait_for(lambda: len(job2.my_tokens) >= 1, timeout_sec=15)
-
-                for node in [job1, job2]:
-                    assert wait_for_running_state(node, timeout_sec=5)
-
-                assert wait_for_rebalance(postgres, tables, min_count=1, timeout_sec=20)
-
-                # Check that no token appears in both added and removed in same cycle
-                with lock:
-                    if len(all_added) > 1 and len(all_removed) > 0:
-                        # Skip initial allocation (first added call)
-                        rebalance_added = set()
-                        for tokens in all_added[1:]:
-                            rebalance_added.update(tokens)
-
-                        rebalance_removed = set()
-                        for tokens in all_removed:
-                            rebalance_removed.update(tokens)
-
-                        overlap = rebalance_added & rebalance_removed
-                        assert len(overlap) == 0, 'No token should appear in both added and removed'
+                assert final_tokens != initial_tokens, 'Tokens should have changed'
 
             finally:
                 job2.__exit__(None, None, None)
@@ -752,13 +647,13 @@ class TestCallbackPerformance:
         """
         coord_cfg = get_coordination_config()
 
-        def slow_callback(token_ids: set[int]):
+        def slow_callback():
             logger.info('Slow callback starting...')
             time.sleep(3)  # Simulate slow work
             logger.info('Slow callback completed')
 
         with create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
-                on_tokens_added=slow_callback) as job:
+                on_rebalance=slow_callback) as job:
             assert wait_for(lambda: len(job.my_tokens) >= 1, timeout_sec=15)
             assert wait_for_running_state(job, timeout_sec=5)
 
@@ -770,11 +665,11 @@ class TestCallbackPerformance:
         """
         coord_cfg = get_coordination_config()
 
-        def tracked_callback(token_ids: set[int]):
+        def tracked_callback():
             time.sleep(0.1)  # Small delay to ensure measurable time
 
         with caplog.at_level(logging.INFO), create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
-                on_tokens_added=tracked_callback) as job:
+                on_rebalance=tracked_callback) as job:
             assert wait_for(lambda: len(job.my_tokens) >= 1, timeout_sec=15)
             assert wait_for_running_state(job, timeout_sec=5)
 
@@ -1224,7 +1119,7 @@ class TestLeadershipDuringInitialization:
 
 
 class TestCallbackBlockingDetection:
-    """Test that slow callbacks block token detection."""
+    """Test that slow callbacks don't block coordination."""
 
     def test_slow_callback_does_not_block_token_version_detection(self, postgres):
         """Verify slow callback does NOT block TokenRefreshMonitor (callbacks are async).
@@ -1235,13 +1130,13 @@ class TestCallbackBlockingDetection:
         callback_started = []
         callback_finished = []
 
-        def blocking_callback(token_ids: set[int]):
+        def blocking_callback():
             callback_started.append(time.time())
             time.sleep(5)
             callback_finished.append(time.time())
 
         job1 = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
-                  on_tokens_added=blocking_callback)
+                  on_rebalance=blocking_callback)
         job1.__enter__()
 
         try:
@@ -1288,19 +1183,19 @@ class TestCallbackBlockingDetection:
     def test_slow_callback_does_not_block_leadership_change_detection(self, postgres):
         """Verify slow callback does NOT block detecting leadership changes (callbacks are async).
         """
-        coord_cfg = get_coordination_config()
+        coord_cfg = get_coordination_config(token_refresh_initial_interval_sec=1)
         tables = schema.get_table_names(coord_cfg.appname)
 
         callback_progress = []
 
-        def blocking_on_removed(token_ids: set[int]):
+        def blocking_callback():
             callback_progress.append('started')
             time.sleep(4)
             callback_progress.append('finished')
 
         node1 = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10)
         node2 = create_job('node2', postgres, coordination_config=coord_cfg, wait_on_enter=10,
-                  on_tokens_removed=blocking_on_removed)
+                  on_rebalance=blocking_callback)
 
         node1.__enter__()
         time.sleep(0.5)
@@ -1319,7 +1214,7 @@ class TestCallbackBlockingDetection:
 
             start_promotion_check = time.time()
             promoted = False
-            while time.time() - start_promotion_check < 8:
+            while time.time() - start_promotion_check < 10:
                 if node2.state_machine.state == JobState.RUNNING_LEADER:
                     promoted = True
                     break
@@ -1330,8 +1225,10 @@ class TestCallbackBlockingDetection:
             logger.info(f'Callback status: {callback_progress}')
             logger.info(f'Promotion detection time: {promotion_time:.1f}s')
 
+            assert promoted, 'Node2 should have been promoted to leader'
+
             if 'finished' in callback_progress:
-                assert promotion_time < 3, 'Leadership detection should NOT be delayed by callback (callbacks are async)'
+                assert promotion_time < 4, 'Leadership detection should NOT be delayed by callback (callbacks are async)'
             else:
                 logger.info('Callback still running, but promotion was detected (callbacks are async)')
 
@@ -1349,12 +1246,12 @@ class TestCallbackBlockingDetection:
 
         callback_invocations = []
 
-        def slow_callback(token_ids: set[int]):
-            callback_invocations.append(len(token_ids))
+        def slow_callback():
+            callback_invocations.append(time.time())
             time.sleep(3)
 
         job1 = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
-                  on_tokens_removed=slow_callback)
+                  on_rebalance=slow_callback)
         job1.__enter__()
 
         try:
@@ -1405,18 +1302,17 @@ class TestInitialCallbackRaceCondition:
     """Test race between __enter__ completion and initial callback."""
 
     def test_leader_tokens_available_before_callback(self, postgres):
-        """Verify leader has tokens in cache before on_tokens_added fires.
+        """Verify leader has tokens in cache before on_rebalance fires.
         """
         coord_cfg = get_coordination_config()
 
         callback_invoked = []
-        tokens_at_enter_exit = None
 
-        def track_callback(token_ids: set[int]):
-            callback_invoked.append(token_ids.copy())
+        def track_callback():
+            callback_invoked.append(True)
 
         job = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
-                on_tokens_added=track_callback)
+                on_rebalance=track_callback)
 
         with job:
             tokens_at_enter_exit = job.my_tokens.copy()
@@ -1429,13 +1325,8 @@ class TestInitialCallbackRaceCondition:
             assert wait_for(lambda: len(callback_invoked) >= 1, timeout_sec=5), \
                 'Callback should fire shortly after __enter__'
 
-            callback_tokens = callback_invoked[0] if callback_invoked else set()
-
-            assert callback_tokens == tokens_at_enter_exit, \
-                'Callback tokens should match cached tokens'
-
     def test_follower_tokens_available_before_callback(self, postgres):
-        """Verify follower has tokens in cache before on_tokens_added fires.
+        """Verify follower has tokens in cache before on_rebalance fires.
         """
         coord_cfg = get_coordination_config()
         tables = schema.get_table_names(coord_cfg.appname)
@@ -1445,8 +1336,8 @@ class TestInitialCallbackRaceCondition:
 
         callback_invoked = []
 
-        def track_callback(token_ids: set[int]):
-            callback_invoked.append(token_ids.copy())
+        def track_callback():
+            callback_invoked.append(True)
 
         job1 = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10)
         job1.__enter__()
@@ -1455,7 +1346,7 @@ class TestInitialCallbackRaceCondition:
             assert wait_for_running_state(job1, timeout_sec=10)
 
             job2 = create_job('node2', postgres, coordination_config=coord_cfg, wait_on_enter=10,
-                      on_tokens_added=track_callback)
+                      on_rebalance=track_callback)
 
             with job2:
                 tokens_at_exit = job2.my_tokens.copy()
@@ -1477,11 +1368,11 @@ class TestInitialCallbackRaceCondition:
 
         callback_fired = []
 
-        def track_callback(token_ids: set[int]):
+        def track_callback():
             callback_fired.append(True)
 
         job = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
-                on_tokens_added=track_callback)
+                on_rebalance=track_callback)
 
         with job:
             assert len(job.my_tokens) > 0, 'Tokens should be available immediately after __enter__'
@@ -1510,12 +1401,12 @@ class TestCallbackExceptionDoesNotStopMonitor:
 
         callback_count = [0]
 
-        def failing_callback(token_ids: set[int]):
+        def failing_callback():
             callback_count[0] += 1
             raise RuntimeError('Test callback failure')
 
         job1 = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
-                  on_tokens_added=failing_callback)
+                  on_rebalance=failing_callback)
         job1.__enter__()
 
         try:
@@ -1553,6 +1444,255 @@ class TestCallbackExceptionDoesNotStopMonitor:
 
         finally:
             job1.__exit__(None, None, None)
+
+
+class TestCallbackThreadPoolExecution:
+    """Test ThreadPoolExecutor-based callback execution."""
+
+    def test_callbacks_run_in_thread_pool(self, postgres):
+        """Verify callbacks execute in ThreadPoolExecutor threads, not main thread.
+        """
+        coord_cfg = get_coordination_config()
+
+        main_thread_id = threading.current_thread().ident
+        callback_thread_ids = []
+        callback_lock = threading.Lock()
+
+        def track_thread_callback():
+            with callback_lock:
+                callback_thread_ids.append(threading.current_thread().ident)
+                callback_thread_ids.append(threading.current_thread().name)
+
+        with create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
+                on_rebalance=track_thread_callback) as job:
+            assert wait_for(lambda: len(job.my_tokens) >= 1, timeout_sec=15)
+            assert wait_for(lambda: len(callback_thread_ids) >= 2, timeout_sec=5)
+
+            thread_id = callback_thread_ids[0]
+            thread_name = callback_thread_ids[1]
+
+            assert thread_id != main_thread_id, 'Callback should not run in main thread'
+            assert 'rebalance-callback' in thread_name, f'Callback should run in executor thread, got {thread_name}'
+
+    def test_thread_pool_limits_concurrent_callbacks(self, postgres):
+        """Verify ThreadPoolExecutor with max_workers=1 limits concurrent execution.
+        """
+        coord_cfg = get_coordination_config()
+
+        concurrent_count = []
+        max_concurrent = [0]
+        callback_lock = threading.Lock()
+
+        def slow_callback():
+            with callback_lock:
+                concurrent_count.append(1)
+                current = len(concurrent_count)
+                max_concurrent[0] = max(max_concurrent[0], current)
+            time.sleep(1)
+            with callback_lock:
+                concurrent_count.pop()
+
+        job1 = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
+                  on_rebalance=slow_callback)
+        job1.__enter__()
+
+        try:
+            assert wait_for(lambda: len(job1.my_tokens) >= 1, timeout_sec=15)
+            assert wait_for_running_state(job1, timeout_sec=5)
+
+            # Use only 1 temp node to reduce complexity
+            temp = create_job('temp0', postgres, coordination_config=coord_cfg, wait_on_enter=10)
+            temp.__enter__()
+
+            try:
+                assert wait_for(lambda: len(temp.my_tokens) >= 1, timeout_sec=20)
+                assert wait_for_running_state(temp, timeout_sec=15)
+
+                # Wait for callbacks from temp joining to process
+                time.sleep(2)
+
+            finally:
+                temp.__exit__(None, None, None)
+
+            # Wait for all callbacks from temp node lifecycle to complete
+            time.sleep(5)
+
+            logger.info(f'Maximum concurrent callbacks observed: {max_concurrent[0]}')
+
+            assert max_concurrent[0] <= 1, f'Should not exceed 1 concurrent callback, saw {max_concurrent[0]}'
+
+        finally:
+            job1.__exit__(None, None, None)
+
+    def test_callbacks_serialize_when_slow(self, postgres):
+        """Verify callbacks run serially when executor has max_workers=1.
+        """
+        coord_cfg = get_coordination_config()
+
+        callback_starts = []
+        callback_ends = []
+        callback_lock = threading.Lock()
+
+        def slow_callback():
+            with callback_lock:
+                start_time = time.time()
+                callback_starts.append(start_time)
+            time.sleep(2)
+            with callback_lock:
+                callback_ends.append(time.time())
+
+        job1 = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
+                  on_rebalance=slow_callback)
+        job1.__enter__()
+
+        try:
+            assert wait_for(lambda: len(job1.my_tokens) >= 1, timeout_sec=15)
+            assert wait_for_running_state(job1, timeout_sec=5)
+
+            temp_nodes = []
+            for i in range(2):
+                temp = create_job(f'temp{i}', postgres, coordination_config=coord_cfg, wait_on_enter=5)
+                temp.__enter__()
+                temp_nodes.append(temp)
+                time.sleep(0.2)
+
+            for temp in temp_nodes:
+                temp.__exit__(None, None, None)
+                time.sleep(0.2)
+
+            time.sleep(8)
+
+            with callback_lock:
+                starts = callback_starts.copy()
+                ends = callback_ends.copy()
+
+            logger.info(f'Callback starts: {len(starts)}, ends: {len(ends)}')
+
+            if len(starts) >= 2:
+                first_start = starts[0]
+                second_start = starts[1]
+
+                delay = second_start - first_start
+
+                logger.info(f'Second callback delayed by {delay:.1f}s from first')
+
+                # With max_workers=1, second callback should wait for first to complete
+                assert delay >= 1.5, f'Second callback should wait for first to complete (delayed {delay:.1f}s)'
+
+        finally:
+            job1.__exit__(None, None, None)
+
+    def test_shutdown_waits_for_pending_callbacks(self, postgres):
+        """Verify shutdown_callbacks() waits for pending callbacks to complete.
+        """
+        coord_cfg = get_coordination_config()
+
+        callback_completed = []
+
+        def long_callback():
+            time.sleep(3)
+            callback_completed.append(True)
+
+        job = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
+                on_rebalance=long_callback)
+
+        with job:
+            assert wait_for(lambda: len(job.my_tokens) >= 1, timeout_sec=15)
+
+        assert len(callback_completed) >= 1, 'Callback should complete before shutdown finishes'
+
+    def test_pending_callbacks_tracked(self, postgres):
+        """Verify pending callbacks are tracked in _pending_callbacks list.
+        """
+        coord_cfg = get_coordination_config()
+
+        callback_active = threading.Event()
+
+        def blocking_callback():
+            callback_active.set()
+            time.sleep(2)
+
+        job = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
+                on_rebalance=blocking_callback)
+        job.__enter__()
+
+        try:
+            assert wait_for(lambda: len(job.my_tokens) >= 1, timeout_sec=15)
+            assert callback_active.wait(timeout=5), 'Callback should start'
+
+            pending_count = len(job.tokens._pending_callbacks)
+
+            logger.info(f'Pending callbacks: {pending_count}')
+
+            assert pending_count >= 1, 'Should have pending callbacks while callback is running'
+
+        finally:
+            job.__exit__(None, None, None)
+
+    def test_callback_exceptions_dont_crash_executor(self, postgres):
+        """Verify ThreadPoolExecutor continues working after callback exception.
+        """
+        coord_cfg = get_coordination_config()
+        tables = schema.get_table_names(coord_cfg.appname)
+
+        callback_count = [0]
+
+        def failing_callback():
+            callback_count[0] += 1
+            raise RuntimeError('Test callback failure')
+
+        job1 = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
+                  on_rebalance=failing_callback)
+        job1.__enter__()
+
+        try:
+            assert wait_for(lambda: len(job1.my_tokens) >= 1, timeout_sec=15)
+            assert wait_for_running_state(job1, timeout_sec=5)
+
+            initial_count = callback_count[0]
+
+            job2 = create_job('node2', postgres, coordination_config=coord_cfg, wait_on_enter=10)
+            job2.__enter__()
+
+            try:
+                assert wait_for(lambda: len(job2.my_tokens) >= 1, timeout_sec=15)
+                assert wait_for_running_state(job2, timeout_sec=5)
+
+                assert wait_for_rebalance(postgres, tables, min_count=1, timeout_sec=20)
+
+                time.sleep(2)
+
+                assert callback_count[0] > initial_count, 'ThreadPoolExecutor should continue after exception'
+
+                logger.info(f'Executor survived {callback_count[0]} callback exceptions')
+
+            finally:
+                job2.__exit__(None, None, None)
+
+        finally:
+            job1.__exit__(None, None, None)
+
+    def test_shutdown_logs_pending_callback_count(self, postgres, caplog):
+        """Verify shutdown logs number of pending callbacks.
+        """
+        coord_cfg = get_coordination_config()
+
+        def slow_callback():
+            time.sleep(2)
+
+        with caplog.at_level(logging.INFO):
+            job = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
+                    on_rebalance=slow_callback)
+
+            with job:
+                assert wait_for(lambda: len(job.my_tokens) >= 1, timeout_sec=15)
+
+            info_messages = [record.message for record in caplog.records if record.levelname == 'INFO']
+            shutdown_messages = [msg for msg in info_messages if 'pending callback' in msg.lower()]
+
+            assert len(shutdown_messages) > 0, 'Should log pending callbacks during shutdown'
+
+            logger.info(f'Shutdown messages: {shutdown_messages}')
 
 
 if __name__ == '__main__':

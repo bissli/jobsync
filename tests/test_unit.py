@@ -809,10 +809,10 @@ class TestEventQueueWithHistory:
         queue = EventQueue(history_size=10)
         queue.publish('event1', {'id': 1})
         queue.publish('event2', {'id': 2})
-        
+
         consumed = queue.consume_all()
         assert len(consumed) == 2
-        
+
         history = queue.get_history()
         assert len(history) == 2
         assert history[0].type == 'event1'
@@ -822,11 +822,11 @@ class TestEventQueueWithHistory:
         """Verify ring buffer respects maximum size.
         """
         queue = EventQueue(history_size=5)
-        
+
         for i in range(10):
             queue.publish(f'event{i}')
             queue.consume_all()
-        
+
         history = queue.get_history()
         assert len(history) == 5
         assert history[0].type == 'event5'
@@ -836,13 +836,13 @@ class TestEventQueueWithHistory:
         """Verify get_history returns both processed and unprocessed events.
         """
         queue = EventQueue(history_size=10)
-        
+
         queue.publish('event1')
         queue.consume_all()
-        
+
         queue.publish('event2')
         queue.publish('event3')
-        
+
         history = queue.get_history()
         assert len(history) == 3
         assert history[0].type == 'event1'
@@ -853,11 +853,11 @@ class TestEventQueueWithHistory:
         """Verify limit parameter works with ring buffer.
         """
         queue = EventQueue(history_size=20)
-        
+
         for i in range(10):
             queue.publish(f'event{i}')
         queue.consume_all()
-        
+
         history = queue.get_history(limit=3)
         assert len(history) == 3
         assert history[0].type == 'event7'
@@ -868,16 +868,16 @@ class TestEventQueueWithHistory:
         """Verify history accumulates across multiple consume cycles.
         """
         queue = EventQueue(history_size=20)
-        
+
         queue.publish('event1')
         queue.consume_all()
-        
+
         queue.publish('event2')
         queue.consume_all()
-        
+
         queue.publish('event3')
         queue.consume_all()
-        
+
         history = queue.get_history()
         assert len(history) == 3
         assert [e.type for e in history] == ['event1', 'event2', 'event3']
@@ -894,10 +894,10 @@ class TestEventQueueWithHistory:
         """
         queue = EventQueue(history_size=10)
         queue.publish('event1')
-        
+
         consumed = queue.consume_all()
         history = queue.get_history()
-        
+
         assert len(consumed) == 1
         assert len(history) == 1
         assert consumed[0].type == history[0].type
@@ -906,15 +906,15 @@ class TestEventQueueWithHistory:
         """Verify ring buffer drops oldest events when full.
         """
         queue = EventQueue(history_size=3)
-        
+
         queue.publish('event1')
         queue.publish('event2')
         queue.publish('event3')
         queue.consume_all()
-        
+
         queue.publish('event4')
         queue.consume_all()
-        
+
         history = queue.get_history()
         assert len(history) == 3
         assert history[0].type == 'event2'
@@ -925,14 +925,14 @@ class TestEventQueueWithHistory:
         """Verify limit works correctly with both consumed and unconsumed events.
         """
         queue = EventQueue(history_size=20)
-        
+
         for i in range(5):
             queue.publish(f'consumed{i}')
         queue.consume_all()
-        
+
         for i in range(3):
             queue.publish(f'unconsumed{i}')
-        
+
         history = queue.get_history(limit=4)
         assert len(history) == 4
         assert history[0].type == 'consumed4'
@@ -946,14 +946,14 @@ class TestEventQueueWithHistory:
         import threading
         queue = EventQueue(history_size=1000)
         errors = []
-        
+
         def publisher():
             try:
                 for i in range(100):
                     queue.publish(f'event{i}')
             except Exception as e:
                 errors.append(e)
-        
+
         def consumer():
             try:
                 for _ in range(10):
@@ -961,7 +961,7 @@ class TestEventQueueWithHistory:
                     time.sleep(0.001)
             except Exception as e:
                 errors.append(e)
-        
+
         def reader():
             try:
                 for _ in range(10):
@@ -969,18 +969,18 @@ class TestEventQueueWithHistory:
                     time.sleep(0.001)
             except Exception as e:
                 errors.append(e)
-        
+
         threads = [
             threading.Thread(target=publisher),
             threading.Thread(target=consumer),
             threading.Thread(target=reader)
         ]
-        
+
         for t in threads:
             t.start()
         for t in threads:
             t.join()
-        
+
         assert errors == [], f'Thread safety errors: {errors}'
 
 
@@ -992,7 +992,7 @@ class TestJobCoordinationStatus:
         """
         job = Job('test-node', coordination_config=None)
         status = job.get_coordination_status()
-        
+
         assert status == {'coordination_enabled': False}
 
     def test_coordination_enabled_returns_full_status(self, postgres):
@@ -1000,12 +1000,12 @@ class TestJobCoordinationStatus:
         """
         coord_config = get_coordination_config()
         job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
-        
+
         with job:
             job._event_queue.publish('test_event', {'test': 'data'})
-            
+
             status = job.get_coordination_status()
-            
+
             assert 'coordination_enabled' in status
             assert status['node_name'] == 'node1'
             assert status['state'] in [s.value for s in JobState]
@@ -1023,13 +1023,13 @@ class TestJobCoordinationStatus:
         """
         coord_config = get_coordination_config()
         job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
-        
+
         with job:
             for i in range(30):
                 job._event_queue.publish(f'event{i}')
-            
+
             status = job.get_coordination_status()
-            
+
             assert len(status['recent_events']) <= 20
 
     def test_recent_events_includes_metadata(self, postgres):
@@ -1037,12 +1037,12 @@ class TestJobCoordinationStatus:
         """
         coord_config = get_coordination_config()
         job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
-        
+
         with job:
             job._event_queue.publish('test_event', {'key': 'value'})
-            
+
             status = job.get_coordination_status()
-            
+
             assert len(status['recent_events']) >= 1
             event = status['recent_events'][-1]
             assert 'type' in event
@@ -1056,10 +1056,10 @@ class TestJobCoordinationStatus:
         """
         coord_config = get_coordination_config()
         job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
-        
+
         with job:
             status = job.get_coordination_status()
-            
+
             assert 'monitors' in status
             assert isinstance(status['monitors'], list)
             assert 'coordination' in status['monitors']
@@ -1069,11 +1069,11 @@ class TestJobCoordinationStatus:
         """
         coord_config = get_coordination_config()
         job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
-        
+
         with job:
             status = job.get_coordination_status()
-            
-            assert status['state'] in ['running_leader', 'running_follower']
+
+            assert status['state'] in {'running_leader', 'running_follower'}
             assert status['is_leader'] == (status['state'] == 'running_leader')
 
     def test_status_includes_token_metrics(self, postgres):
@@ -1081,10 +1081,10 @@ class TestJobCoordinationStatus:
         """
         coord_config = get_coordination_config()
         job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
-        
+
         with job:
             status = job.get_coordination_status()
-            
+
             assert 'my_tokens' in status
             assert 'token_version' in status
             assert 'total_tokens' in status
@@ -1096,10 +1096,10 @@ class TestJobCoordinationStatus:
         """
         coord_config = get_coordination_config()
         job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
-        
+
         with job:
             status = job.get_coordination_status()
-            
+
             assert 'active_nodes' in status
             assert status['active_nodes'] >= 1
 
@@ -1107,47 +1107,178 @@ class TestJobCoordinationStatus:
         """Verify status method works even when coordination disabled.
         """
         job = Job('standalone-node', coordination_config=None)
-        
+
         status = job.get_coordination_status()
-        
+
         assert status is not None
         assert isinstance(status, dict)
-        assert status['coordination_enabled'] == False
+        assert not status['coordination_enabled']
 
 
 class TestTaskTokenMapping:
     """Test task-to-token mapping and related methods."""
 
-    def test_consistent_hashing(self, postgres):
+    @pytest.mark.parametrize('hash_function', ['md5', 'sha256', 'double_sha256'])
+    def test_consistent_hashing(self, postgres, hash_function):
         """Verify task IDs consistently map to same token and handle various ID types."""
-        coord_config = get_coordination_config()
+        coord_config = get_coordination_config(hash_function=hash_function)
         job = create_job('node1', postgres, coordination_config=coord_config)
 
         task_id = 'test-task-123'
         token1 = job.task_to_token(task_id)
         token2 = job.task_to_token(task_id)
 
-        assert token1 == token2, 'Same task should map to same token'
-        assert 0 <= token1 < coord_config.total_tokens, 'Token should be in valid range'
+        assert token1 == token2, f'Same task should map to same token ({hash_function})'
+        assert 0 <= token1 < coord_config.total_tokens, f'Token should be in valid range ({hash_function})'
 
         tokens = {job.task_to_token(f'task-{i}') for i in range(20)}
-        assert len(tokens) >= 15, 'Most tasks should map to different tokens'
+        assert len(tokens) >= 15, f'Most tasks should map to different tokens ({hash_function})'
 
         numeric_token = job.task_to_token(123)
         string_token = job.task_to_token('abc-def-ghi')
-        assert 0 <= numeric_token < 10000, 'Numeric ID should produce valid token'
-        assert 0 <= string_token < 10000, 'String ID should produce valid token'
+        assert 0 <= numeric_token < 10000, f'Numeric ID should produce valid token ({hash_function})'
+        assert 0 <= string_token < 10000, f'String ID should produce valid token ({hash_function})'
 
-    def test_task_to_token_matches_module_function(self, postgres):
+    @pytest.mark.parametrize('hash_function', ['md5', 'sha256', 'double_sha256'])
+    def test_task_to_token_matches_module_function(self, postgres, hash_function):
         """Verify Job.task_to_token() matches module-level function.
         """
-        coord_config = CoordinationConfig(total_tokens=100)
+        coord_config = CoordinationConfig(total_tokens=100, hash_function=hash_function)
         job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
 
         for task_id in [0, 1, 99, 'string-task', 'another-task']:
             job_result = job.task_to_token(task_id)
-            module_result = task_to_token(task_id, job.tokens.total_tokens)
-            assert job_result == module_result, f'Results should match for task {task_id}'
+            module_result = task_to_token(task_id, job.tokens.total_tokens, hash_function)
+            assert job_result == module_result, f'Results should match for task {task_id} ({hash_function})'
+
+    @pytest.mark.parametrize('hash_function', ['md5', 'sha256', 'double_sha256'])
+    def test_distribution_quality_with_clustered_ids(self, postgres, hash_function):
+        """Verify even distribution with clustered sequential task IDs.
+        """
+        coord_config = CoordinationConfig(total_tokens=10000, hash_function=hash_function)
+        job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
+
+        task_ids = range(20001, 21001)
+        tokens = [job.task_to_token(tid) for tid in task_ids]
+
+        unique_tokens = len(set(tokens))
+        assert unique_tokens >= 950, f'1000 clustered tasks should use ≥950 unique tokens, got {unique_tokens} ({hash_function})'
+
+    @pytest.mark.parametrize('hash_function', ['md5', 'sha256', 'double_sha256'])
+    def test_distribution_quality_across_token_space(self, postgres, hash_function):
+        """Verify tokens spread evenly across the full token range.
+        """
+        coord_config = CoordinationConfig(total_tokens=10000, hash_function=hash_function)
+        job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
+
+        task_ids = range(0, 5000, 5)
+        tokens = [job.task_to_token(tid) for tid in task_ids]
+
+        buckets = [0] * 10
+        bucket_size = coord_config.total_tokens // 10
+        for token in tokens:
+            bucket_idx = min(token // bucket_size, 9)
+            buckets[bucket_idx] += 1
+
+        max_bucket = max(buckets)
+        min_bucket = min(buckets)
+        imbalance = max_bucket - min_bucket
+        expected_per_bucket = len(tokens) / 10
+
+        logger.debug(f'Token bucket distribution ({hash_function}): {buckets}')
+        logger.debug(f'Expected per bucket: {expected_per_bucket:.1f}, imbalance: {imbalance}')
+
+        assert imbalance <= expected_per_bucket * 0.40, \
+            f'Bucket imbalance {imbalance} exceeds 40% of expected {expected_per_bucket:.1f} ({hash_function})'
+
+    @pytest.mark.parametrize('hash_function', ['md5', 'sha256', 'double_sha256'])
+    def test_distribution_quality_simulated_cluster(self, postgres, hash_function):
+        """Verify even task distribution across simulated 8-node cluster.
+        """
+        coord_config = CoordinationConfig(total_tokens=10000, hash_function=hash_function)
+        job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
+
+        task_ids = range(20001, 21001)
+        node_task_counts = {}
+
+        for task_id in task_ids:
+            token_id = job.task_to_token(task_id)
+            node_id = token_id % 8
+            node_task_counts[node_id] = node_task_counts.get(node_id, 0) + 1
+
+        counts = list(node_task_counts.values())
+        expected_per_node = 1000 / 8
+        max_count = max(counts)
+        min_count = min(counts)
+        imbalance = max_count - min_count
+
+        logger.debug(f'Tasks per node ({hash_function}): {sorted(counts)}')
+        logger.debug(f'Expected per node: {expected_per_node:.1f}, imbalance: {imbalance}')
+
+        assert imbalance <= expected_per_node * 0.35, \
+            f'Node imbalance {imbalance} exceeds 35% of expected {expected_per_node:.1f} ({hash_function})'
+
+    @pytest.mark.parametrize('hash_function', ['md5', 'sha256', 'double_sha256'])
+    def test_distribution_with_string_ids(self, postgres, hash_function):
+        """Verify distribution quality with string task IDs.
+        """
+        coord_config = CoordinationConfig(total_tokens=10000, hash_function=hash_function)
+        job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
+
+        task_ids = [f'task-{i:05d}' for i in range(500)]
+        tokens = [job.task_to_token(tid) for tid in task_ids]
+
+        unique_tokens = len(set(tokens))
+        assert unique_tokens >= 450, f'500 string tasks should use ≥450 unique tokens, got {unique_tokens} ({hash_function})'
+
+        buckets = [0] * 5
+        bucket_size = coord_config.total_tokens // 5
+        for token in tokens:
+            bucket_idx = min(token // bucket_size, 4)
+            buckets[bucket_idx] += 1
+
+        max_bucket = max(buckets)
+        min_bucket = min(buckets)
+        imbalance = max_bucket - min_bucket
+        expected_per_bucket = len(tokens) / 5
+
+        assert imbalance <= expected_per_bucket * 0.3, \
+            f'String ID bucket imbalance {imbalance} exceeds 30% threshold ({hash_function})'
+
+    @pytest.mark.parametrize('hash_function', ['md5', 'sha256', 'double_sha256'])
+    def test_edge_case_task_ids(self, postgres, hash_function):
+        """Verify edge case task IDs are handled correctly.
+        """
+        coord_config = CoordinationConfig(total_tokens=10000, hash_function=hash_function)
+        job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
+
+        edge_cases = [
+            (0, 'zero'),
+            (-1, 'negative'),
+            (-999999, 'large negative'),
+            (999999999, 'large positive'),
+            ('', 'empty string'),
+            ('unicode-τεστ-日本', 'unicode'),
+            (None, 'none'),
+            ((1, 2, 3), 'tuple'),
+        ]
+
+        results = {}
+        for task_id, label in edge_cases:
+            token = job.task_to_token(task_id)
+            results[label] = token
+            assert 0 <= token < 10000, f'{label} task_id={task_id} produced invalid token {token} ({hash_function})'
+
+        logger.debug(f'Edge case tokens ({hash_function}): {results}')
+
+        repeated_tokens = []
+        for task_id, label in edge_cases:
+            token1 = job.task_to_token(task_id)
+            token2 = job.task_to_token(task_id)
+            assert token1 == token2, f'{label} should hash consistently ({hash_function})'
+            repeated_tokens.append(token1)
+
+        assert repeated_tokens == list(results.values()), f'Repeated hashing should be deterministic ({hash_function})'
 
 
 class TestCoordinationConfig:
@@ -2421,127 +2552,6 @@ class TestTaskHashableValidation:
         """
         task = Task(None, 'none-task')
         assert task.id is None, 'None should be accepted (it is hashable)'
-
-    def test_returns_tasks_matching_token(self, postgres):
-        """Verify method returns only tasks that hash to given token.
-        """
-        coord_config = CoordinationConfig(total_tokens=100)
-        job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
-
-        all_task_ids = list(range(100))
-        token_id = 5
-
-        matching_tasks = job.get_task_ids_for_token(token_id, all_task_ids)
-
-        for task_id in matching_tasks:
-            actual_token = job.task_to_token(task_id)
-            assert actual_token == token_id, f'Task {task_id} should map to token {token_id}, got {actual_token}'
-
-    def test_empty_task_list_returns_empty(self, postgres):
-        """Verify empty task list returns empty result.
-        """
-        coord_config = CoordinationConfig(total_tokens=100)
-        job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
-
-        result = job.get_task_ids_for_token(0, [])
-        assert result == [], 'Empty task list should return empty result'
-
-    def test_works_with_string_task_ids(self, postgres):
-        """Verify method works with string task IDs.
-        """
-        coord_config = CoordinationConfig(total_tokens=100)
-        job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
-
-        all_task_ids = [f'task-{i}' for i in range(50)]
-        token_id = 10
-
-        matching_tasks = job.get_task_ids_for_token(token_id, all_task_ids)
-
-        for task_id in matching_tasks:
-            assert job.task_to_token(task_id) == token_id
-
-    def test_no_duplicates_in_result(self, postgres):
-        """Verify result contains no duplicate task IDs.
-        """
-        coord_config = CoordinationConfig(total_tokens=100)
-        job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
-
-        all_task_ids = list(range(200))
-        token_id = 15
-
-        matching_tasks = job.get_task_ids_for_token(token_id, all_task_ids)
-
-        assert len(matching_tasks) == len(set(matching_tasks)), 'Should have no duplicates'
-
-    def test_returns_only_owned_tasks(self, postgres):
-        """Verify method returns only tasks for tokens owned by node.
-        """
-        coord_config = CoordinationConfig(total_tokens=100)
-        job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
-
-        job.tokens.my_tokens = {5, 10, 15}
-
-        all_task_ids = list(range(100))
-        my_tasks = job.get_my_task_ids(all_task_ids)
-
-        for task_id in my_tasks:
-            token_id = job.task_to_token(task_id)
-            assert token_id in job.tokens.my_tokens, f'Task {task_id} token {token_id} should be owned'
-
-    def test_empty_tokens_returns_empty(self, postgres):
-        """Verify empty token set returns empty result.
-        """
-        coord_config = CoordinationConfig(total_tokens=100)
-        job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
-
-        job.tokens.my_tokens = set()
-
-        all_task_ids = list(range(100))
-        my_tasks = job.get_my_task_ids(all_task_ids)
-
-        assert my_tasks == [], 'No owned tokens should return empty list'
-
-    def test_all_tokens_owned_returns_all_tasks(self, postgres):
-        """Verify owning all tokens returns all tasks.
-        """
-        coord_config = CoordinationConfig(total_tokens=100)
-        job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
-
-        job.tokens.my_tokens = set(range(100))
-
-        all_task_ids = list(range(100))
-        my_tasks = job.get_my_task_ids(all_task_ids)
-
-        assert len(my_tasks) == 100, 'All tokens owned should return all tasks'
-
-    def test_mixed_task_id_types(self, postgres):
-        """Verify method works with mixed numeric and string task IDs.
-        """
-        coord_config = CoordinationConfig(total_tokens=100)
-        job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
-
-        job.tokens.my_tokens = {0, 1, 2, 3, 4}
-
-        all_task_ids = list(range(20)) + [f'task-{i}' for i in range(20, 40)]
-        my_tasks = job.get_my_task_ids(all_task_ids)
-
-        for task_id in my_tasks:
-            token_id = job.task_to_token(task_id)
-            assert token_id in job.tokens.my_tokens
-
-    def test_result_preserves_input_order(self, postgres):
-        """Verify result preserves order of input task list.
-        """
-        coord_config = CoordinationConfig(total_tokens=100)
-        job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
-
-        job.tokens.my_tokens = set(range(100))
-
-        all_task_ids = [99, 50, 25, 10, 5, 1]
-        my_tasks = job.get_my_task_ids(all_task_ids)
-
-        expected_order = [tid for tid in all_task_ids if job.task_to_token(tid) in job.tokens.my_tokens]
-        assert my_tasks == expected_order, 'Should preserve input order'
 
 
 class TestSetClaimEdgeCases:

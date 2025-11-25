@@ -162,6 +162,29 @@ Always use 10,000+ tokens for:
 - **Default (10,000)** handles up to 10 nodes with excellent distribution
 - **Maximum (1,000,000)** for very large deployments (20+ nodes, 100,000+ tasks)
 
+### Hash Function Selection
+
+JobSync uses consistent hashing to map tasks to tokens. Three algorithms are available:
+
+```python
+coord_config = CoordinationConfig(
+    # ... other parameters
+    hash_function='double_sha256'  # Options: 'md5', 'sha256', 'double_sha256'
+)
+```
+
+**Available Options:**
+- **`double_sha256`** (default): Best distribution quality, recommended for production
+- **`sha256`**: Good distribution, moderate variance
+- **`md5`**: Fastest but higher variance, not recommended for production
+
+**When to Change:**
+- Default (`double_sha256`) is recommended for all production workloads
+- Only change if you have specific performance requirements or constraints
+- See docstrings in `src/jobsync/client.py` for detailed performance characteristics
+
+**Impact:** Hash function determines which token owns each task. Changing this after locks are registered will invalidate existing lock mappings, as task IDs will hash to different tokens.
+
 ## Task Locking
 
 Lock specific tasks to specific nodes using pattern matching with ordered fallback support.
@@ -237,42 +260,30 @@ with Job('worker-01', coordination_config=coord_config,
 
 ## Long-Running Tasks
 
-For WebSockets, subscriptions, or continuous processing, use callbacks:
+For WebSockets, subscriptions, or continuous processing, use the `on_rebalance` callback:
 
 ```python
-active_subscriptions = {}
-
-def on_tokens_added(token_ids: set[int]):
-    """Start subscriptions for new tokens.
+def on_rebalance():
+    """Called when cluster membership changes or tokens are rebalanced.
+    
+    Re-evaluate which tasks this node should be processing and update
+    subscriptions, connections, or other long-running resources accordingly.
     """
-    for token_id in token_ids:
-        task_ids = job.get_task_ids_for_token(token_id, all_task_ids)
-        for task_id in task_ids:
-            subscription = start_subscription(task_id)
-            active_subscriptions[task_id] = subscription
-
-def on_tokens_removed(token_ids: set[int]):
-    """Stop subscriptions for removed tokens.
-    """
-    for token_id in token_ids:
-        task_ids = job.get_task_ids_for_token(token_id, all_task_ids)
-        for task_id in task_ids:
-            if task_id in active_subscriptions:
-                active_subscriptions[task_id].close()
-                del active_subscriptions[task_id]
+    current_tokens = job.my_tokens
+    # Update your subscriptions/connections based on new token ownership
+    logger.info(f'Rebalance: now own {len(current_tokens)} tokens')
 
 with Job('worker-01', coordination_config=coord_config,
-         on_tokens_added=on_tokens_added,
-         on_tokens_removed=on_tokens_removed) as job:
+         on_rebalance=on_rebalance) as job:
     while not shutdown:
         time.sleep(1)
 ```
 
 **Callback rules:**
-- Must complete in <1 second or delegate to background threads
-- Always handle exceptions
-- Use thread synchronization for shared state
-- `on_tokens_removed` called before `on_tokens_added` during rebalancing
+- Called on initial token assignment and whenever cluster membership changes
+- Must complete quickly (<1 second) or delegate work to background threads
+- Always handle exceptions - don't let callback failures crash the node
+- Use `job.my_tokens` to determine current token ownership
 
 ## Monitoring
 
@@ -318,8 +329,8 @@ ORDER BY created_on LIMIT 1;
 4. **Use descriptive node names** - Include region, hostname, or instance ID
 5. **Document lock reasons** - Explain why tasks are pinned
 6. **Use clear_existing_locks=True for dynamic locks** - Prevents stale locks
-7. **Keep callbacks fast** - Delegate heavy work to background threads
-8. **Handle callback exceptions** - Don't let one failure stop others
+7. **Keep on_rebalance callback fast** - Delegate heavy work to background threads
+8. **Handle callback exceptions** - Don't let callback failures crash the node
 9. **Monitor rebalance frequency** - >5/hour indicates instability
 10. **Test in staging first** - Use same node count and timing as production
 

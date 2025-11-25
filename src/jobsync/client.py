@@ -11,6 +11,8 @@ import threading
 import time
 from collections import deque
 from collections.abc import Hashable, Iterable
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as futures_wait
 from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
@@ -118,6 +120,7 @@ class CoordinationConfig:
     health_check_interval_sec: int = 30
     stale_leader_lock_age_sec: int = 300
     stale_rebalance_lock_age_sec: int = 300
+    hash_function: str = 'double_sha256'
 
     host: str = 'localhost'
     port: int = 5432
@@ -208,14 +211,73 @@ def ensure_timezone_aware(dt: datetime.datetime, name: str = 'datetime') -> date
     return dt
 
 
-def task_to_token(task_id: Hashable, total_tokens: int) -> int:
-    """Hash task_id to token_id using consistent hashing.
+def task_to_token_md5(task_id: Hashable, total_tokens: int) -> int:
+    """Hash task_id to token_id using MD5.
+
+    Distribution quality: Acceptable but shows higher variance in tests
+    (imbalance ~38-39 in distribution tests). Fast but not recommended
+    for production use due to weaker distribution properties.
     """
     task_str = str(task_id)
     hash_obj = hashlib.md5(task_str.encode())
     hash_int = int(hash_obj.hexdigest(), 16)
     token_id = hash_int % total_tokens
     return token_id
+
+
+def task_to_token_sha256(task_id: Hashable, total_tokens: int) -> int:
+    """Hash task_id to token_id using single SHA256.
+
+    Distribution quality: Good with moderate variance (imbalance ~28-38
+    in distribution tests). Better than MD5 but still shows some
+    clustering with sequential task IDs.
+    """
+    task_str = str(task_id)
+    hash_obj = hashlib.sha256(task_str.encode())
+    hash_bytes = hash_obj.digest()[:8]
+    hash_int = int.from_bytes(hash_bytes, byteorder='big')
+    token_id = hash_int % total_tokens
+    return token_id
+
+
+def task_to_token_double_sha256(task_id: Hashable, total_tokens: int) -> int:
+    """Hash task_id to token_id using double SHA256 for better distribution.
+
+    Distribution quality: Best across all tests (imbalance ~26-32). The
+    double hashing provides excellent avalanche effect, minimizing
+    clustering even with sequential task IDs. Recommended default for
+    production use.
+    """
+    task_str = str(task_id)
+    hash_obj = hashlib.sha256(task_str.encode())
+    hash_obj = hashlib.sha256(hash_obj.digest())
+    hash_bytes = hash_obj.digest()[:8]
+    hash_int = int.from_bytes(hash_bytes, byteorder='big')
+    token_id = hash_int % total_tokens
+    return token_id
+
+
+HASH_FUNCTIONS = {
+    'md5': task_to_token_md5,
+    'sha256': task_to_token_sha256,
+    'double_sha256': task_to_token_double_sha256,
+}
+
+
+def task_to_token(task_id: Hashable, total_tokens: int, hash_function: str = 'md5') -> int:
+    """Hash task_id to token_id using specified hash function.
+
+    Args:
+        task_id: Task identifier to hash
+        total_tokens: Total number of tokens
+        hash_function: Hash function name ('md5', 'sha256', 'double_sha256')
+
+    Returns
+        Token ID (0 to total_tokens-1)
+    """
+    if hash_function not in HASH_FUNCTIONS:
+        raise ValueError(f'Unknown hash function: {hash_function}. Valid options: {list(HASH_FUNCTIONS.keys())}')
+    return HASH_FUNCTIONS[hash_function](task_id, total_tokens)
 
 
 def matches_pattern(node_name: str, pattern: str) -> bool:
@@ -699,7 +761,7 @@ class ClusterCoordinator:
         SELECT name, created_on, last_heartbeat
         FROM {self.db.tables["Node"]}
         WHERE last_heartbeat > NOW() - INTERVAL '{self.heartbeat_timeout} seconds'
-        ORDER BY created_on ASC, name ASC
+        ORDER BY name ASC
         """
 
     @retry_with_backoff()
@@ -806,8 +868,10 @@ class TokenDistributor:
         self.heartbeat_timeout = coord_config.heartbeat_timeout_sec
         self.my_tokens = set()
         self.token_version = 0
-        self.on_tokens_added = None
-        self.on_tokens_removed = None
+        self.on_rebalance = None
+        self._callback_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='rebalance-callback')
+        self._pending_callbacks = []
+        self._executor_shutdown = False
 
     def distribute(self, lock_manager: 'LockManager', cluster: ClusterCoordinator) -> None:
         """Distribute tokens using minimal-move algorithm.
@@ -938,21 +1002,54 @@ class TokenDistributor:
 
         raise TimeoutError(f'Token distribution did not complete for {self.node_name} within {timeout_sec}s')
 
-    def invoke_callback(self, callback: callable, token_ids: set[int], callback_name: str) -> None:
-        """Invoke token callback with timing and error handling.
+    def invoke_callback(self, callback: callable) -> None:
+        """Invoke rebalance callback asynchronously with timing and error handling.
+
+        Callbacks run in a bounded thread pool to avoid blocking coordination logic
+        while preventing unlimited thread creation. This allows slow user callbacks
+        to not impact leadership detection, token refresh, or other critical
+        coordination operations.
 
         Args:
             callback: Callback function to invoke
-            token_ids: Set of token IDs to pass to callback
-            callback_name: Name for logging
         """
-        try:
-            start = time.time()
-            callback(token_ids)
-            duration_ms = int((time.time() - start) * 1000)
-            logger.info(f'{callback_name} completed in {duration_ms}ms for {len(token_ids)} tokens')
-        except Exception as e:
-            logger.error(f'{callback_name} callback failed: {e}')
+        if self._executor_shutdown:
+            logger.warning('on_rebalance not invoked - executor already shutdown')
+            return
+
+        def _run_callback():
+            try:
+                start = time.time()
+                callback()
+                duration_ms = int((time.time() - start) * 1000)
+                logger.info(f'on_rebalance completed in {duration_ms}ms')
+            except Exception as e:
+                logger.error(f'on_rebalance callback failed: {e}')
+
+        future = self._callback_executor.submit(_run_callback)
+        self._pending_callbacks.append(future)
+
+    def shutdown_callbacks(self, wait: bool = True, timeout: int = 10) -> None:
+        """Shutdown callback executor and wait for pending callbacks.
+
+        Args:
+            wait: If True, wait for callbacks to complete
+            timeout: Maximum seconds to wait for callbacks
+        """
+        self._executor_shutdown = True
+
+        pending_count = len(self._pending_callbacks)
+        if pending_count > 0:
+            logger.info(f'Waiting for {pending_count} pending callbacks to complete (timeout: {timeout}s)...')
+
+        if wait and self._pending_callbacks:
+            futures_wait(self._pending_callbacks, timeout=timeout)
+
+            completed = sum(1 for f in self._pending_callbacks if f.done())
+            logger.debug(f'Callback shutdown complete: {completed}/{pending_count} callbacks completed')
+
+        self._callback_executor.shutdown(wait=wait)
+        self._pending_callbacks.clear()
 
     def _log_rebalance(self, reason: str, nodes_before: int, nodes_after: int, tokens_moved: int, duration_ms: int) -> None:
         """Log rebalance event to audit table.
@@ -994,6 +1091,7 @@ class LockManager:
         self.node_name = node_name
         self.db = db
         self.total_tokens = coord_config.total_tokens
+        self.hash_function = coord_config.hash_function
         self.leader_lock_timeout = coord_config.leader_lock_timeout_sec
         self.stale_leader_lock_age = coord_config.stale_leader_lock_age_sec
         self.stale_rebalance_lock_age = coord_config.stale_rebalance_lock_age_sec
@@ -1155,7 +1253,7 @@ class LockManager:
                     if not isinstance(patterns, list):
                         logger.warning(f'Invalid lock pattern for task {row["task_id"]}: expected list, got {type(patterns).__name__}')
                         continue
-                    token_id = task_to_token(row['task_id'], self.total_tokens)
+                    token_id = task_to_token(row['task_id'], self.total_tokens, self.hash_function)
                     locked_tokens[token_id] = patterns
                 except (json.JSONDecodeError, TypeError, KeyError) as e:
                     logger.warning(f'Failed to parse lock pattern for task {row["task_id"]}: {e}')
@@ -1345,7 +1443,7 @@ class TaskManager:
     """Handles task claiming and audit logging.
     """
 
-    def __init__(self, node_name: str, db: DatabaseContext, date: datetime.date, total_tokens: int):
+    def __init__(self, node_name: str, db: DatabaseContext, date: datetime.date, total_tokens: int, hash_function: str):
         """Initialize task manager.
 
         Args:
@@ -1353,11 +1451,13 @@ class TaskManager:
             db: Database context
             date: Processing date
             total_tokens: Total token count for hashing
+            hash_function: Hash function name for task-to-token mapping
         """
         self.node_name = node_name
         self.db = db
         self.date = date
         self.total_tokens = total_tokens
+        self.hash_function = hash_function
         self._tasks = []
 
     def can_claim(self, task: Task, my_tokens: set[int]) -> bool:
@@ -1370,7 +1470,7 @@ class TaskManager:
         Returns
             True if claimable, False otherwise
         """
-        token_id = task_to_token(task.id, self.total_tokens)
+        token_id = task_to_token(task.id, self.total_tokens, self.hash_function)
         can_claim = token_id in my_tokens
 
         if not can_claim:
@@ -1642,8 +1742,8 @@ class TokenRefreshMonitor(Monitor):
                 logger.info(f'Initial token assignment: {len(new_tokens)} tokens, v{new_version}')
                 self.tokens.my_tokens = new_tokens
                 self.tokens.token_version = new_version
-                if self.tokens.on_tokens_added:
-                    self.tokens.invoke_callback(self.tokens.on_tokens_added, new_tokens.copy(), 'on_tokens_added')
+                if self.tokens.on_rebalance:
+                    self.tokens.invoke_callback(self.tokens.on_rebalance)
                 self.initial_callback_sent = True
                 self.start_time = time.time()
             elif new_version != self.tokens.token_version:
@@ -1656,11 +1756,8 @@ class TokenRefreshMonitor(Monitor):
                 self.tokens.my_tokens = new_tokens
                 self.tokens.token_version = new_version
 
-                if removed and self.tokens.on_tokens_removed:
-                    self.tokens.invoke_callback(self.tokens.on_tokens_removed, removed, 'on_tokens_removed')
-
-                if added and self.tokens.on_tokens_added:
-                    self.tokens.invoke_callback(self.tokens.on_tokens_added, added, 'on_tokens_added')
+                if self.tokens.on_rebalance:
+                    self.tokens.invoke_callback(self.tokens.on_rebalance)
 
                 self.start_time = time.time()
 
@@ -1826,8 +1923,7 @@ class Job:
         wait_on_exit: int = 0,
         lock_provider: callable = None,
         clear_existing_locks: bool = False,
-        on_tokens_added: callable = None,
-        on_tokens_removed: callable = None,
+        on_rebalance: callable = None,
     ):
         """Initialize job synchronization manager.
 
@@ -1839,8 +1935,7 @@ class Job:
             wait_on_exit: Seconds to wait before cleanup (default 0)
             lock_provider: Callback(job) to register task locks during __enter__
             clear_existing_locks: If True, clear locks created by this node before invoking lock_provider
-            on_tokens_added: Callback(token_ids: set[int]) invoked when tokens assigned
-            on_tokens_removed: Callback(token_ids: set[int]) invoked when tokens removed
+            on_rebalance: Callback() invoked when cluster membership changes (initial assignment, node joins/leaves, rebalancing)
         """
         self.node_name = node_name
         self._wait_on_enter = int(abs(wait_on_enter))
@@ -1868,10 +1963,9 @@ class Job:
             self.cluster = ClusterCoordinator(node_name, self.db, coord_cfg, self._created_on)
             self.tokens = TokenDistributor(node_name, self.db, coord_cfg)
             self.locks = LockManager(node_name, self.db, coord_cfg)
-            self.tasks = TaskManager(node_name, self.db, date, coord_cfg.total_tokens)
+            self.tasks = TaskManager(node_name, self.db, date, coord_cfg.total_tokens, coord_cfg.hash_function)
 
-            self.tokens.on_tokens_added = on_tokens_added
-            self.tokens.on_tokens_removed = on_tokens_removed
+            self.tokens.on_rebalance = on_rebalance
 
             ensure_database_ready(self.db.engine, coord_cfg.appname)
         else:
@@ -1899,8 +1993,8 @@ class Job:
             coord_monitor = CoordinationMonitor(self, interval=1.0)
             self._start_monitor('coordination', coord_monitor)
 
-        if not self._coordination_enabled and (on_tokens_added or on_tokens_removed):
-            logger.warning('Token callbacks provided but coordination_enabled=False - callbacks will never fire')
+        if not self._coordination_enabled and on_rebalance:
+            logger.warning('on_rebalance callback provided but coordination_enabled=False - callback will never fire')
 
     def _start_monitor(self, name: str, monitor) -> None:
         """Start a monitor if not already running.
@@ -2205,6 +2299,9 @@ class Job:
                     if monitor.thread.is_alive():
                         logger.warning(f'{name} thread did not stop within timeout')
 
+            if self.tokens:
+                self.tokens.shutdown_callbacks(wait=True, timeout=10)
+
             if self._wait_on_exit:
                 logger.debug(f'Sleeping {self._wait_on_exit} seconds...')
                 time.sleep(self._wait_on_exit)
@@ -2305,36 +2402,9 @@ class Job:
         Returns
             Token ID
         """
-        if self.tokens is None:
+        if self.tokens is None or self.tasks is None:
             return 0
-        return task_to_token(task_id, self.tokens.total_tokens)
-
-    def get_task_ids_for_token(self, token_id: int, all_task_ids: list[Hashable]) -> list[Hashable]:
-        """Get task IDs that hash to the given token.
-
-        Args:
-            token_id: Token ID to match
-            all_task_ids: Complete list of possible task IDs
-
-        Returns
-            List of task IDs that hash to this token
-        """
-        if self.tokens is None:
-            return []
-        return [task_id for task_id in all_task_ids if task_to_token(task_id, self.tokens.total_tokens) == token_id]
-
-    def get_my_task_ids(self, all_task_ids: list[Hashable]) -> list[Hashable]:
-        """Get all task IDs owned by this node.
-
-        Args:
-            all_task_ids: Complete list of possible task IDs
-
-        Returns
-            List of task IDs this node currently owns
-        """
-        if self.tokens is None:
-            return []
-        return [task_id for task_id in all_task_ids if task_to_token(task_id, self.tokens.total_tokens) in self.tokens.my_tokens]
+        return task_to_token(task_id, self.tokens.total_tokens, self.tasks.hash_function)
 
     def register_lock(self, task_id: Hashable, node_patterns: str | list[str], reason: str = None,
                       expires_in_days: int = None) -> None:

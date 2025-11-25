@@ -51,24 +51,15 @@ with Job('worker-01', coordination_config=coord_config) as job:
 from jobsync import Job, CoordinationConfig
 
 # For subscriptions, WebSockets, or continuous processing
-active_subscriptions = {}
-
-def on_tokens_added(token_ids: set[int]):
-    """Start subscriptions for newly assigned tokens."""
-    for token_id in token_ids:
-        task_ids = job.get_task_ids_for_token(token_id, all_task_ids)
-        for task_id in task_ids:
-            subscription = start_websocket_subscription(task_id)
-            active_subscriptions[task_id] = subscription
-
-def on_tokens_removed(token_ids: set[int]):
-    """Stop subscriptions for removed tokens."""
-    for token_id in token_ids:
-        task_ids = job.get_task_ids_for_token(token_id, all_task_ids)
-        for task_id in task_ids:
-            if task_id in active_subscriptions:
-                active_subscriptions[task_id].close()
-                del active_subscriptions[task_id]
+def on_rebalance():
+    """Called when cluster membership changes.
+    
+    Re-evaluate which tasks this node should process and update
+    long-running connections or subscriptions accordingly.
+    """
+    current_tokens = job.my_tokens
+    # Update your subscriptions/connections based on token ownership
+    logger.info(f'Rebalance: now own {len(current_tokens)} tokens')
 
 coord_config = CoordinationConfig(
     host='localhost',
@@ -79,9 +70,8 @@ coord_config = CoordinationConfig(
 )
 
 with Job('worker-01', coordination_config=coord_config,
-         on_tokens_added=on_tokens_added,
-         on_tokens_removed=on_tokens_removed) as job:
-    # Callbacks handle starting/stopping subscriptions
+         on_rebalance=on_rebalance) as job:
+    # Callback notifies you of cluster changes
     while not shutdown:
         time.sleep(1)
 ```
@@ -130,8 +120,9 @@ coord_config = CoordinationConfig(
     dbname='jobsync',
     user='postgres',
     password='postgres',
-    appname='myapp_',  # Prefix for database tables (e.g., myapp_node, myapp_token)
-    total_tokens=10000  # Optional: customize token pool size
+    appname='myapp_',      # Prefix for database tables (e.g., myapp_node, myapp_token)
+    total_tokens=10000,    # Optional: customize token pool size
+    hash_function='double_sha256'  # Optional: 'md5', 'sha256', or 'double_sha256' (default, recommended)
 )
 ```
 

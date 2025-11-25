@@ -137,14 +137,14 @@ def get_test_connection_string() -> str:
     return 'postgresql+psycopg://postgres:postgres@localhost:5432/jobsync'
 
 
-def find_task_ids_covering_all_tokens(total_tokens: int, max_search: int = 10000) -> list[Hashable]:
-    """Find task IDs that hash to all token IDs.
+def find_task_ids_covering_all_tokens(config: CoordinationConfig, max_search: int = 10000) -> list[Hashable]:
+    """Find task IDs that hash to all token IDs using given coordination config.
 
     Searches for task IDs that collectively cover all token_ids from 0 to total_tokens-1.
-    Useful for tests that need to lock all tokens.
+    Ensures hash function and total_tokens always match the config being tested.
 
     Args:
-        total_tokens: Total number of tokens to cover
+        config: CoordinationConfig to get total_tokens and hash_function from
         max_search: Maximum candidate task IDs to search
 
     Returns
@@ -154,15 +154,19 @@ def find_task_ids_covering_all_tokens(total_tokens: int, max_search: int = 10000
         RuntimeError: If cannot find covering set within max_search
 
     Usage:
-        task_ids = find_task_ids_covering_all_tokens(20)
+        coord_config = get_coordination_config(total_tokens=20)
+        task_ids = find_task_ids_covering_all_tokens(coord_config)
         for task_id in task_ids:
             insert_lock(postgres, tables, task_id, ['pattern'], created_by='test')
     """
     from jobsync.client import task_to_token
 
+    total_tokens = config.total_tokens
+    hash_function = config.hash_function
+
     token_to_task = {}
     for candidate in range(max_search):
-        token_id = task_to_token(candidate, total_tokens)
+        token_id = task_to_token(candidate, total_tokens, hash_function)
         if token_id not in token_to_task:
             token_to_task[token_id] = candidate
         if len(token_to_task) == total_tokens:
@@ -210,64 +214,31 @@ def simulate_node_crash(node: Job, cleanup: bool = False) -> None:
 
 
 class CallbackTracker:
-    """Thread-safe callback tracker for testing token ownership callbacks.
+    """Thread-safe callback tracker for testing rebalance notifications.
 
     Usage:
         tracker = CallbackTracker()
-        job = create_job('node1', postgres,
-                        on_tokens_added=tracker.on_tokens_added,
-                        on_tokens_removed=tracker.on_tokens_removed)
+        job = create_job('node1', postgres, on_rebalance=tracker.on_rebalance)
         with job:
-            assert wait_for(lambda: len(tracker.added_calls) >= 1)
+            assert wait_for(lambda: len(tracker.rebalance_calls) >= 1)
     """
 
     def __init__(self):
-        self.added_calls = []
-        self.removed_calls = []
-        self.call_order = []
+        self.rebalance_calls = []
         self.lock = threading.Lock()
 
-    def on_tokens_added(self, token_ids: set[int]):
-        """Track on_tokens_added calls.
+    def on_rebalance(self):
+        """Track on_rebalance calls.
         """
         with self.lock:
-            self.added_calls.append(token_ids.copy())
-            self.call_order.append(('added', token_ids.copy()))
-            logger.info(f'on_tokens_added called with {len(token_ids)} tokens')
-
-    def on_tokens_removed(self, token_ids: set[int]):
-        """Track on_tokens_removed calls.
-        """
-        with self.lock:
-            self.removed_calls.append(token_ids.copy())
-            self.call_order.append(('removed', token_ids.copy()))
-            logger.info(f'on_tokens_removed called with {len(token_ids)} tokens')
-
-    def get_total_added(self) -> set[int]:
-        """Get all tokens ever added.
-        """
-        with self.lock:
-            result = set()
-            for tokens in self.added_calls:
-                result.update(tokens)
-            return result
-
-    def get_total_removed(self) -> set[int]:
-        """Get all tokens ever removed.
-        """
-        with self.lock:
-            result = set()
-            for tokens in self.removed_calls:
-                result.update(tokens)
-            return result
+            self.rebalance_calls.append(time.time())
+            logger.info('on_rebalance called')
 
     def reset(self):
         """Reset all tracking.
         """
         with self.lock:
-            self.added_calls.clear()
-            self.removed_calls.clear()
-            self.call_order.clear()
+            self.rebalance_calls.clear()
 
 
 # ============================================================================
@@ -292,8 +263,7 @@ def callback_tracker():
 
     Usage:
         def test_callbacks(postgres, callback_tracker):
-            job = create_job('node1', postgres,
-                           on_tokens_added=callback_tracker.on_tokens_added)
+            job = create_job('node1', postgres, on_rebalance=callback_tracker.on_rebalance)
     """
     return CallbackTracker()
 

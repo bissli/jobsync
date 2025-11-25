@@ -50,6 +50,10 @@ def test_3node_cluster_formation(postgres):
                 f'{node.node_name} should receive tokens'
             print(f'{node.node_name}: {len(node.my_tokens)} tokens, version {node.token_version}')
 
+        # Wait for all nodes to sync their token caches with database
+        assert wait_for_cached_tokens_sync(nodes, expected_total=100, timeout_sec=10), \
+            'All nodes should sync their token caches after rebalancing'
+
         # Verify balanced distribution
         assert_token_distribution_balanced(nodes, total_tokens=100, tolerance=0.2)
 
@@ -110,6 +114,10 @@ def test_fresh_cluster_rebalances_stale_tokens(postgres):
         total_redistributed = sum(r['count'] for r in distribution)
         assert total_redistributed == 100, 'All 100 tokens should be redistributed'
 
+        # Wait for all nodes to sync their token caches with database
+        assert wait_for_cached_tokens_sync(nodes, expected_total=100, timeout_sec=10), \
+            'All nodes should sync their token caches after rebalancing'
+
         # Verify balanced distribution
         assert_token_distribution_balanced(nodes, total_tokens=100, tolerance=0.2)
 
@@ -133,6 +141,10 @@ def test_token_based_task_claiming(postgres):
         # Wait for all nodes to receive tokens
         for node in nodes:
             assert wait_for(lambda n=node: len(n.my_tokens) >= 1, timeout_sec=10)
+
+        # Wait for all nodes to sync their token caches with database
+        assert wait_for_cached_tokens_sync(nodes, expected_total=100, timeout_sec=10), \
+            'All nodes should sync their token caches after cluster formation'
 
         # Each node claims tasks it owns
         claimed_by_node = {}
@@ -182,6 +194,10 @@ def test_node_death_and_rebalancing(postgres):
         for node in nodes:
             expected_state = JobState.RUNNING_LEADER if node.node_name == 'node1' else JobState.RUNNING_FOLLOWER
             assert wait_for_state(node, expected_state, timeout_sec=10)
+
+        # Wait for all nodes to sync their token caches with database
+        assert wait_for_cached_tokens_sync(nodes, expected_total=100, timeout_sec=10), \
+            'All nodes should sync their token caches after cluster formation'
 
         # Record initial token distribution
         initial_tokens = {node.node_name: len(node.my_tokens) for node in nodes}
@@ -476,93 +492,6 @@ def test_follower_promotion_starts_leader_duties(postgres):
                 node.__exit__(None, None, None)
             except Exception:
                 pass
-
-
-def test_node_rejoin_restores_original_allocation(postgres):
-    """Test that when a dead node rejoins, it gets back its original token allocation."""
-    print('\n=== Testing node rejoin restores original allocation ===')
-
-    config = get_coordination_config(total_tokens=100)
-    tables = schema.get_table_names(config.appname)
-
-    # Phase 1: Start all 4 nodes and record initial state
-    print('Phase 1: Starting 4 nodes...')
-    with cluster(postgres, 'nodeA', 'nodeB', 'nodeC', 'nodeD', total_tokens=100) as nodes:
-        # Wait for cluster to stabilize
-        for node in nodes:
-            expected_state = JobState.RUNNING_LEADER if node.node_name == 'nodeA' else JobState.RUNNING_FOLLOWER
-            assert wait_for_state(node, expected_state, timeout_sec=10)
-            assert wait_for(lambda n=node: len(n.my_tokens) >= 20, timeout_sec=10)
-
-        # Record initial token allocations
-        original_tokens = {}
-        for node in nodes:
-            tokens = node.my_tokens
-            original_tokens[node.node_name] = tokens.copy()
-            print(f'{node.node_name}: {len(tokens)} tokens initially')
-
-        # Verify all 100 tokens are distributed
-        total_initial = sum(len(tokens) for tokens in original_tokens.values())
-        assert total_initial == 100, 'All 100 tokens should be distributed initially'
-
-        # Phase 2: Kill nodeD
-        print('\nPhase 2: Killing nodeD...')
-        nodeD = nodes[3]
-        simulate_node_crash(nodeD)
-
-        # Wait for dead node detection and rebalancing
-        assert wait_for_dead_node_removal(postgres, tables, 'nodeD', timeout_sec=20)
-        assert wait_for_rebalance(postgres, tables, min_count=1, timeout_sec=20)
-
-        # Wait for surviving nodes to sync after nodeD death
-        assert wait_for_all_nodes_token_sync(nodes[:3], expected_total=100, timeout_sec=10)
-
-        # Verify nodeD's tokens were redistributed to A, B, C
-        print('Verifying redistribution after nodeD death:')
-        surviving_nodes = nodes[:3]
-        for node in surviving_nodes:
-            new_token_count = get_fresh_token_count(node)
-            print(f'{node.node_name}: {len(original_tokens[node.node_name])} -> {new_token_count} tokens')
-            assert new_token_count > len(original_tokens[node.node_name]), \
-                f'{node.node_name} should have gained tokens after nodeD died'
-
-        # Phase 3: Rejoin nodeD
-        print('\nPhase 3: Rejoining nodeD...')
-        nodeD_rejoined = create_job('nodeD', postgres, coordination_config=config, wait_on_enter=15)
-        nodeD_rejoined.__enter__()
-        nodes[3] = nodeD_rejoined
-
-        # Wait for second rebalance to complete (nodeD should receive tokens)
-        assert wait_for(lambda: len(nodeD_rejoined.my_tokens) >= 20, timeout_sec=20), \
-            'nodeD should receive tokens after rejoining (rebalance should occur)'
-
-        # Wait for all nodes to sync their token caches with new distribution
-        assert wait_for_all_nodes_token_sync(nodes, expected_total=100, timeout_sec=20)
-
-        # Phase 4: Verify original allocations are restored
-        print('\nPhase 4: Verifying original allocations restored:')
-        all_restored = True
-        for node in nodes:
-            current_tokens, _ = node.tokens.get_my_tokens_versioned()
-            original = original_tokens[node.node_name]
-
-            print(f'{node.node_name}: original={len(original)}, current={len(current_tokens)}, '
-                  f'match={current_tokens == original}')
-
-            if current_tokens != original:
-                all_restored = False
-                missing = original - current_tokens
-                extra = current_tokens - original
-                print(f'  Missing {len(missing)} tokens: {sorted(missing)[:10]}...')
-                print(f'  Extra {len(extra)} tokens: {sorted(extra)[:10]}...')
-
-        assert all_restored, 'All nodes should have their original token allocations restored'
-
-        # Verify total is still 100
-        total_final = sum(get_fresh_token_count(node) for node in nodes)
-        assert total_final == 100, 'All 100 tokens should be distributed after rejoin'
-
-        print('✓ Node rejoin successfully restored original allocation')
 
 
 class TestCleanupFailureScenarios:
@@ -1254,11 +1183,11 @@ class TestTokenDistributionUnderContention:
         insert_active_node(postgres, tables, 'node1', created_on=now)
         insert_active_node(postgres, tables, 'node2', created_on=now + datetime.timedelta(seconds=1))
 
-        task_ids = find_task_ids_covering_all_tokens(20)
+        coord_config = CoordinationConfig(total_tokens=20)
+        task_ids = find_task_ids_covering_all_tokens(coord_config)
         for task_id in task_ids:
             insert_lock(postgres, tables, task_id, ['nonexistent-%'], created_by='test')
 
-        coord_config = CoordinationConfig(total_tokens=20)
         job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
 
         job.tokens.distribute(job.locks, job.cluster)
@@ -1904,10 +1833,10 @@ class TestMinimumNodesRequirement:
                 # because len(nodes) = 2 > 1. With fixed code, it should still be waiting.
                 assert node1.state_machine.state == JobState.CLUSTER_FORMING, \
                     f'node1 should still be in CLUSTER_FORMING with 2/3 nodes, got {node1.state_machine.state.value}'
-                
+
                 assert node2.state_machine.state == JobState.CLUSTER_FORMING, \
                     f'node2 should be in CLUSTER_FORMING with 2/3 nodes, got {node2.state_machine.state.value}'
-                
+
                 print('✓ Both nodes correctly waiting with 2/3 nodes')
 
                 # Start node3 - NOW it should proceed
@@ -2172,8 +2101,8 @@ class TestLateNodeJoining:
                 expected_state = JobState.RUNNING_LEADER if node.node_name == 'node1' else JobState.RUNNING_FOLLOWER
                 assert wait_for_state(node, expected_state, timeout_sec=10)
 
-            # Verify tokens distributed
-            assert wait_for_all_nodes_token_sync(nodes, expected_total=100, timeout_sec=10)
+            # Verify tokens distributed and caches synced
+            assert wait_for_cached_tokens_sync(nodes, expected_total=100, timeout_sec=10)
 
             initial_distribution = {node.node_name: len(node.my_tokens) for node in nodes}
             print(f'Initial distribution: {initial_distribution}')
