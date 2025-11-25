@@ -493,7 +493,7 @@ class TestLockFallbackPatterns:
         job.__enter__()
 
         try:
-            time.sleep(2)
+            assert wait_for_running_state(job, timeout_sec=5)
 
             token_id = job.task_to_token('task-1')
 
@@ -531,7 +531,7 @@ class TestLockFallbackPatterns:
         job.__enter__()
 
         try:
-            time.sleep(2)
+            assert wait_for_running_state(job, timeout_sec=5)
 
             token_id = job.task_to_token('task-1')
 
@@ -569,7 +569,7 @@ class TestLockFallbackPatterns:
         job.__enter__()
 
         try:
-            time.sleep(2)
+            assert wait_for_running_state(job, timeout_sec=5)
 
             token_id = job.task_to_token('task-1')
 
@@ -606,7 +606,7 @@ class TestLockFallbackPatterns:
         job.__enter__()
 
         try:
-            time.sleep(2)
+            assert wait_for_running_state(job, timeout_sec=5)
 
             token_id = job.task_to_token('task-1')
 
@@ -639,13 +639,31 @@ class TestLockFallbackPatterns:
         def register_failover_locks(job) -> None:
             job.register_lock('task-1', ['primary-%', 'backup-%'], 'failover test')
 
+        keep_alive = threading.Event()
+
+        def maintain_backup_heartbeat():
+            """Keep backup-node alive with periodic heartbeat updates.
+            """
+            while not keep_alive.is_set():
+                with postgres.connect() as conn:
+                    conn.execute(text(f"""
+                        UPDATE {tables["Node"]}
+                        SET last_heartbeat = NOW()
+                        WHERE name = 'backup-node'
+                    """))
+                    conn.commit()
+                keep_alive.wait(timeout=2)
+
+        heartbeat_thread = threading.Thread(target=maintain_backup_heartbeat, daemon=True)
+        heartbeat_thread.start()
+
         coord_config = CoordinationConfig(total_tokens=30, dead_node_check_interval_sec=1)
-        leader = create_job('leader', postgres, wait_on_enter=8,
+        leader = create_job('leader', postgres, wait_on_enter=10,
                            coordination_config=coord_config, lock_provider=register_failover_locks)
         leader.__enter__()
 
         try:
-            time.sleep(2)
+            assert wait_for_running_state(leader, timeout_sec=5)
 
             token_id = leader.task_to_token('task-1')
 
@@ -681,6 +699,8 @@ class TestLockFallbackPatterns:
             logger.info('✓ Fallback pattern used after primary node died')
 
         finally:
+            keep_alive.set()
+            heartbeat_thread.join(timeout=1)
             leader.__exit__(None, None, None)
 
     @clean_tables('Node', 'Lock', 'Token')
@@ -706,7 +726,7 @@ class TestLockFallbackPatterns:
         job.__enter__()
 
         try:
-            time.sleep(2)
+            assert wait_for_running_state(job, timeout_sec=5)
 
             assignments = {}
             for task_id in ['task-1', 'task-2', 'task-3']:

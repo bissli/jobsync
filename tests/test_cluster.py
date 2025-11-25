@@ -25,8 +25,6 @@ logger = logging.getLogger(__name__)
 
 def test_3node_cluster_formation(postgres):
     """Test that 3 nodes form a cluster, elect leader, and distribute tokens."""
-    print('\n=== Testing 3-node cluster formation ===')
-
     with cluster(postgres, 'node1', 'node2', 'node3', total_tokens=100) as nodes:
         # Wait for all nodes to reach running state
         for node in nodes:
@@ -36,19 +34,16 @@ def test_3node_cluster_formation(postgres):
 
         # Verify all nodes registered
         active_nodes = nodes[0].get_active_nodes()
-        print(f'Active nodes: {[n["name"] for n in active_nodes]}')
         assert len(active_nodes) == 3, 'All 3 nodes should be active'
 
         # Verify leader elected (should be node1 - oldest)
         for node in nodes:
             leader = wait_for_leader_election(node, expected_leader='node1', timeout_sec=5)
-            print(f'{node.node_name}: Leader is {leader}')
 
         # Verify tokens distributed and balanced
         for node in nodes:
             assert wait_for(lambda n=node: len(n.my_tokens) >= 1, timeout_sec=10), \
                 f'{node.node_name} should receive tokens'
-            print(f'{node.node_name}: {len(node.my_tokens)} tokens, version {node.token_version}')
 
         # Wait for all nodes to sync their token caches with database
         assert wait_for_cached_tokens_sync(nodes, expected_total=100, timeout_sec=10), \
@@ -57,29 +52,20 @@ def test_3node_cluster_formation(postgres):
         # Verify balanced distribution
         assert_token_distribution_balanced(nodes, total_tokens=100, tolerance=0.2)
 
-        print('✓ Cluster formation successful')
-
 
 def test_fresh_cluster_rebalances_stale_tokens(postgres):
     """Verify fresh cluster rebalances stale token distribution from previous run.
     """
-    print('\n=== Testing fresh cluster rebalances stale tokens ===')
-
     tables = schema.get_table_names('sync_')
 
-    # Setup: Insert stale token distribution from "previous run"
-    print('Setting up stale tokens (all owned by old-dead-node)...')
     for token_id in range(100):
         insert_token(postgres, tables, token_id, 'old-dead-node', version=1)
 
     with postgres.connect() as conn:
         result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Token"]}'))
         stale_count = result.scalar()
-    print(f'Stale tokens before cluster start: {stale_count}')
     assert stale_count == 100, 'Should have 100 stale tokens'
 
-    # Start fresh cluster (no old-dead-node)
-    print('\nStarting fresh 3-node cluster...')
     with cluster(postgres, 'node1', 'node2', 'node3', total_tokens=100) as nodes:
         # Wait for cluster to reach running state
         for node in nodes:
@@ -87,13 +73,9 @@ def test_fresh_cluster_rebalances_stale_tokens(postgres):
             assert wait_for_state(node, expected_state, timeout_sec=10), \
                 f'{node.node_name} should reach running state'
 
-        # Wait for rebalancing (should happen during DISTRIBUTING state)
-        print('Waiting for token redistribution...')
         assert wait_for_rebalance(postgres, tables, min_count=1, timeout_sec=20), \
             'Leader should trigger rebalancing to clear stale distribution'
 
-        # Verify tokens redistributed to new nodes
-        print('\nToken distribution after rebalancing:')
         with postgres.connect() as conn:
             result = conn.execute(text(f"""
                 SELECT node, COUNT(*) as count, version
@@ -102,9 +84,6 @@ def test_fresh_cluster_rebalances_stale_tokens(postgres):
                 ORDER BY node
             """))
             distribution = [dict(row._mapping) for row in result]
-
-        for row in distribution:
-            print(f'{row["node"]}: {row["count"]} tokens, version {row["version"]}')
 
         # Verify no tokens assigned to old-dead-node
         stale_node_tokens = [r for r in distribution if r['node'] == 'old-dead-node']
@@ -125,13 +104,9 @@ def test_fresh_cluster_rebalances_stale_tokens(postgres):
         new_version = distribution[0]['version']
         assert new_version > 1, f'Version should increment from 1, got {new_version}'
 
-        print(f'✓ Stale tokens successfully rebalanced (v1 -> v{new_version})')
-
 
 def test_token_based_task_claiming(postgres):
     """Test that nodes only claim tasks they own tokens for."""
-    print('\n=== Testing token-based task claiming ===')
-
     tables = schema.get_table_names('sync_')
 
     for i in range(30):
@@ -162,7 +137,6 @@ def test_token_based_task_claiming(postgres):
                                    {'item': str(item_id)})
                         conn.commit()
             claimed_by_node[node.node_name] = claimed
-            print(f'{node.node_name}: Claimed {len(claimed)} tasks')
 
         # Verify results
         claimed_tasks = set()
@@ -180,13 +154,9 @@ def test_token_based_task_claiming(postgres):
             done_count = result.scalar()
         assert done_count == 30, 'All tasks should be marked done'
 
-        print('✓ Token-based claiming successful')
-
 
 def test_node_death_and_rebalancing(postgres):
     """Test that when a node dies, its tokens are redistributed."""
-    print('\n=== Testing node death and rebalancing ===')
-
     tables = schema.get_table_names('sync_')
 
     with cluster(postgres, 'node1', 'node2', 'node3', total_tokens=100) as nodes:
@@ -201,54 +171,40 @@ def test_node_death_and_rebalancing(postgres):
 
         # Record initial token distribution
         initial_tokens = {node.node_name: len(node.my_tokens) for node in nodes}
-        print(f'Initial tokens: {initial_tokens}')
 
         # Simulate node2 crash (stop threads but leave stale DB row)
-        print('Killing node2 (simulating crash)...')
         simulate_node_crash(nodes[1])
 
         # Wait for leader to detect dead node and remove it
         assert wait_for_dead_node_removal(postgres, tables, 'node2', timeout_sec=20), \
             'node2 should be detected as dead and removed by leader'
-        print('node2 detected as dead and removed')
 
         # Wait for rebalancing to be logged
         assert wait_for_rebalance(postgres, tables, min_count=1, timeout_sec=20), \
             'Rebalancing should be triggered after dead node removal'
-        print('Rebalancing triggered')
 
         # Wait for surviving nodes to sync their token caches
         assert wait_for_all_nodes_token_sync([nodes[0], nodes[2]], expected_total=100, timeout_sec=10)
 
-        # Verify tokens were redistributed to surviving nodes
-        print('\nToken distribution after rebalancing:')
         for node in [nodes[0], nodes[2]]:
             new_token_count = get_fresh_token_count(node)
-            print(f'{node.node_name}: {initial_tokens[node.node_name]} -> {new_token_count} tokens')
             assert new_token_count > initial_tokens[node.node_name], \
                 f'{node.node_name} should have gained tokens after node2 died'
 
         # Verify all tokens accounted for
         total_after = sum(get_fresh_token_count(node) for node in [nodes[0], nodes[2]])
-        print(f'Total tokens across remaining nodes: {total_after}/100')
         assert total_after == 100, 'All 100 tokens should be redistributed to surviving nodes'
-
-        print('✓ Node death and rebalancing successful')
 
 
 def test_lock_registration_and_enforcement(postgres):
     """Test that locked tasks are only assigned to nodes matching the pattern."""
-    print('\n=== Testing lock registration and enforcement ===')
-
     config = get_coordination_config(total_tokens=100)
     tables = schema.get_table_names(config.appname)
 
     # Lock registration callback
     def register_locks(job):
-        # Lock tasks 0-9 to 'special-%' pattern
         locks = [(i, 'special-%', 'test lock') for i in range(10)]
         job.register_locks_bulk(locks)
-        print(f'{job.node_name}: Registered {len(locks)} locks')
 
     node1 = create_job('node1', postgres, coordination_config=config, wait_on_enter=15,
                        lock_provider=register_locks)
@@ -275,7 +231,6 @@ def test_lock_registration_and_enforcement(postgres):
                                      {'token_id': token_id})
                 owner = result.scalar()
             locked_token_owners[task_id] = owner
-            print(f'Task {task_id} (token {token_id}) -> {owner}')
 
         # All locked tokens should be assigned to 'special-alpha'
         for task_id, owner in locked_token_owners.items():
@@ -292,8 +247,6 @@ def test_lock_registration_and_enforcement(postgres):
             assert special.can_claim_task(task), \
                 f'special-alpha should claim locked task {task_id}'
 
-        print('✓ Lock enforcement successful')
-
     finally:
         node1.__exit__(None, None, None)
         node2.__exit__(None, None, None)
@@ -302,8 +255,6 @@ def test_lock_registration_and_enforcement(postgres):
 
 def test_health_monitoring(postgres):
     """Test that nodes monitor their own health correctly."""
-    print('\n=== Testing health monitoring ===')
-
     config = get_coordination_config()
 
     node = create_job('node1', postgres, coordination_config=config, wait_on_enter=15)
@@ -313,17 +264,13 @@ def test_health_monitoring(postgres):
         # Initially should be healthy
         assert wait_for(node.am_i_healthy, timeout_sec=5), 'Node should be healthy initially'
         assert node.am_i_healthy()
-        print(f'✓ Node is healthy (heartbeat age: {(node.cluster.last_heartbeat_sent)})')
 
         # Simulate heartbeat thread failure by stopping it
         node.cluster.last_heartbeat_sent -= timedelta(seconds=20)
 
         # Should now be unhealthy (heartbeat too old)
         is_healthy = node.am_i_healthy()
-        print(f'After heartbeat failure: healthy={is_healthy}')
         assert not is_healthy, 'Node should be unhealthy with stale heartbeat'
-
-        print('✓ Health monitoring works correctly')
 
     finally:
         node._shutdown_event.set()
@@ -332,8 +279,6 @@ def test_health_monitoring(postgres):
 
 def test_leader_failover(postgres):
     """Test that when leader dies, a new leader is elected."""
-    print('\n=== Testing leader failover ===')
-
     config = get_coordination_config()
 
     nodes = []
@@ -348,20 +293,15 @@ def test_leader_failover(postgres):
 
         # Verify node1 is leader
         leader = wait_for_leader_election(nodes[0], expected_leader='node1', timeout_sec=5)
-        print(f'Initial leader: {leader}')
 
         # Kill node1
-        print('Killing leader (node1)...')
         simulate_node_crash(nodes[0], cleanup=True)
 
         # Wait for new leader election
         new_leader = wait_for_leader_election(nodes[1], expected_leader='node2', timeout_sec=12)
-        print(f'New leader after failover: {new_leader}')
 
         # Verify node3 also sees node2 as leader
         leader_from_node3 = wait_for_leader_election(nodes[2], expected_leader='node2', timeout_sec=5)
-
-        print('✓ Leader failover successful')
 
     finally:
         for node in [nodes[1], nodes[2]]:
@@ -377,15 +317,10 @@ def test_follower_promotion_starts_leader_duties(postgres):
     This test verifies the critical scenario where:
     1. Leader node dies
     2. Follower is elected as new leader
-    3. New leader starts monitoring threads (the bug!)
+    3. New leader starts monitoring threads
     4. New leader detects dead node and triggers rebalancing
     5. Tokens are redistributed to surviving nodes
-
-    Without the fix, the new leader never starts monitoring threads,
-    so dead nodes aren't cleaned up and tokens aren't redistributed.
     """
-    print('\n=== Testing follower promotion to leader ===')
-
     config = get_coordination_config(total_tokens=100)
     tables = schema.get_table_names(config.appname)
 
@@ -400,7 +335,6 @@ def test_follower_promotion_starts_leader_duties(postgres):
     try:
         # Wait for cluster to stabilize and elect leader
         initial_leader = wait_for_leader_election(nodes[0], expected_leader='node1', timeout_sec=10)
-        print(f'Initial leader: {initial_leader}')
 
         for node in nodes:
             assert wait_for_state(node, JobState.RUNNING_LEADER if node.node_name == 'node1' else JobState.RUNNING_FOLLOWER, timeout_sec=10)
@@ -413,23 +347,18 @@ def test_follower_promotion_starts_leader_duties(postgres):
         for node in nodes:
             tokens = node.my_tokens
             initial_tokens[node.node_name] = len(tokens)
-            print(f'{node.node_name}: {len(tokens)} tokens')
 
         total_initial = sum(initial_tokens.values())
         assert total_initial == 100, 'All 100 tokens should be distributed'
 
         # Kill the leader (node1) - simulate crash by stopping threads but NOT cleaning up DB
-        print('\nKilling leader (node1)...')
         simulate_node_crash(nodes[0])
 
         # Wait for dead node removal and rebalancing
-        print('Waiting for new leader to detect death and rebalance...')
         assert wait_for_dead_node_removal(postgres, tables, 'node1', timeout_sec=20)
-        print('node1 removed from database')
 
         # Verify node2 is now leader
         new_leader = wait_for_leader_election(nodes[1], expected_leader='node2', timeout_sec=5)
-        print(f'\nNew leader after failover: {new_leader}')
 
         # Verify node1 is detected as dead and removed from database
         with postgres.connect() as conn:
@@ -438,29 +367,22 @@ def test_follower_promotion_starts_leader_duties(postgres):
             """))
             node1_count = result.scalar()
 
-        print(f'node1 still in database: {node1_count > 0}')
         assert node1_count == 0, \
             'Dead leader should be removed from Node table by new leader'
 
         # Wait for nodes to sync their token caches after rebalance
-        print('\nWaiting for nodes to sync token caches...')
         assert wait_for_all_nodes_token_sync([nodes[1], nodes[2]], expected_total=100, timeout_sec=10)
 
-        # Verify tokens were redistributed (THIS IS THE KEY TEST)
-        print('\nToken distribution after rebalancing:')
         final_tokens = {}
         for node in [nodes[1], nodes[2]]:
             token_count = get_fresh_token_count(node)
             final_tokens[node.node_name] = token_count
-            print(f'{node.node_name}: {initial_tokens[node.node_name]} -> {token_count} tokens')
 
         total_final = sum(final_tokens.values())
-        print(f'\nTotal tokens after rebalancing: {total_final}/100')
 
-        # Critical assertion - this fails without the fix
+        # Critical assertion
         assert total_final == 100, \
-            'All tokens should be redistributed to surviving nodes ' \
-            '(new leader must start monitoring threads!)'
+            'All tokens should be redistributed to surviving nodes after leader death'
 
         for node_name, token_count in final_tokens.items():
             assert token_count > initial_tokens[node_name], \
@@ -479,11 +401,8 @@ def test_follower_promotion_starts_leader_duties(postgres):
             """))
             recent_rebalances = result.scalar()
 
-        print(f'\nRecent rebalances by node2: {recent_rebalances}')
         assert recent_rebalances > 0, \
             'New leader should have logged rebalancing event'
-
-        print('✓ Follower promotion and leader duties successful')
 
     finally:
         # Cleanup surviving nodes
@@ -1496,8 +1415,6 @@ class TestLeadershipDemotion:
     def test_leader_demoted_when_older_node_rejoins(self, postgres):
         """Verify current leader gracefully demotes when older node rejoins.
         """
-        print('\n=== Testing leader demotion on older node rejoin ===')
-
         config = get_coordination_config()
 
         node1 = create_job('node1', postgres, coordination_config=config, wait_on_enter=10)
@@ -1509,16 +1426,12 @@ class TestLeadershipDemotion:
 
         try:
             initial_leader = wait_for_leader_election(node1, expected_leader='node1', timeout_sec=10)
-            print(f'Initial leader: {initial_leader}')
 
-            print('Killing node1 (original leader)...')
             simulate_node_crash(node1)
 
             new_leader = wait_for_leader_election(node2, expected_leader='node2', timeout_sec=15)
-            print(f'Leader after node1 death: {new_leader}')
             assert wait_for_state(node2, JobState.RUNNING_LEADER, timeout_sec=30)
 
-            print('Rejoining node1 with original timestamp...')
             node1_rejoined = create_job('node1', postgres, coordination_config=config, wait_on_enter=10)
             node1_rejoined._created_on = node1._created_on
             node1_rejoined.cluster.created_on = node1._created_on
@@ -1528,9 +1441,6 @@ class TestLeadershipDemotion:
             assert wait_for_state(node2, JobState.RUNNING_FOLLOWER, timeout_sec=15)
 
             final_leader = node1_rejoined.cluster.elect_leader()
-            print(f'Leader after node1 rejoin: {final_leader}')
-
-            print('✓ Leader demotion successful')
 
         finally:
             try:
@@ -1545,8 +1455,6 @@ class TestLeadershipDemotion:
     def test_demoted_leader_monitors_stop_gracefully(self, postgres):
         """Verify demoted leader stops its leader-only monitors without crashing.
         """
-        print('\n=== Testing demoted leader monitors stop gracefully ===')
-
         config = get_coordination_config()
 
         node1 = create_job('node1', postgres, coordination_config=config, wait_on_enter=10)
@@ -1560,9 +1468,7 @@ class TestLeadershipDemotion:
             wait_for_leader_election(node1, expected_leader='node1', timeout_sec=10)
 
             assert_monitors_stopped(node2, ['dead-node', 'rebalance'])
-            print('node2 has no leader monitors as follower')
 
-            print('Killing node1...')
             simulate_node_crash(node1)
 
             wait_for_leader_election(node2, expected_leader='node2', timeout_sec=15)
@@ -1570,9 +1476,7 @@ class TestLeadershipDemotion:
 
             assert_monitors_running(node2, ['dead-node', 'rebalance'])
             leader_monitors_after = [m for m in node2._monitors.values() if isinstance(m, (DeadNodeMonitor, RebalanceMonitor))]
-            print(f'node2 leader monitors after promotion: {len(leader_monitors_after)}')
 
-            print('Rejoining node1 with older timestamp...')
             node1_rejoined = create_job('node1', postgres, coordination_config=config, wait_on_enter=10)
             node1_rejoined._created_on = node1._created_on
             node1_rejoined.cluster.created_on = node1._created_on
@@ -1583,12 +1487,9 @@ class TestLeadershipDemotion:
 
             for monitor in leader_monitors_after:
                 stopped = monitor._stop_requested
-                print(f'{monitor.name}: stop_requested={stopped}')
                 assert stopped, f'{monitor.name} should be stopped after demotion'
 
             assert node2.am_i_healthy(), 'node2 should still be healthy after demotion'
-
-            print('✓ Demoted leader monitors stopped gracefully')
 
         finally:
             try:
@@ -1607,8 +1508,6 @@ class TestLeadershipDemotion:
         then crashes. New leader must detect stale lock and proceed with election.
         Tests that stale lock detection works correctly.
         """
-        print('\n=== Testing leader death with leader lock held ===')
-
         tables = schema.get_table_names('sync_')
 
         config = CoordinationConfig(
@@ -1627,7 +1526,6 @@ class TestLeadershipDemotion:
         try:
             assert wait_for_state(node1, JobState.RUNNING_LEADER, timeout_sec=10)
             assert wait_for_state(node2, JobState.RUNNING_FOLLOWER, timeout_sec=10)
-            print('node1 is leader, node2 is follower')
 
             # Manually insert a leader lock as if node1 is holding it
             with postgres.connect() as conn:
@@ -1639,19 +1537,14 @@ class TestLeadershipDemotion:
                 """), {'node': 'node1'})
                 conn.commit()
 
-            print('Leader lock inserted for node1')
-
             # Simulate node1 crash
-            print('Killing node1 (leader holding lock)...')
             simulate_node_crash(node1)
 
             # Wait for stale lock timeout + some time for detection
-            print('Waiting for stale lock detection...')
             time.sleep(config.stale_leader_lock_age_sec + 3)
 
             # node2 should eventually become leader despite stale lock
             assert wait_for_state(node2, JobState.RUNNING_LEADER, timeout_sec=20)
-            print('node2 successfully became leader')
 
             # Verify leader lock state
             with postgres.connect() as conn:
@@ -1663,17 +1556,10 @@ class TestLeadershipDemotion:
             # The important thing is that node2 became leader successfully
             # The lock may still show node1 (stale), be cleared, or show node2
             if lock_holder:
-                print(f'Leader lock shows: {lock_holder}')
-                # Acceptable: lock may still show stale node1 or updated node2
                 assert lock_holder in {'node1', 'node2'}, f'Unexpected lock holder: {lock_holder}'
-            else:
-                print('Leader lock cleared (no holder)')
 
             # Verify node2 is actually functioning as leader
             assert node2.am_i_leader(), 'node2 should be the active leader'
-            print('node2 is functioning as leader')
-
-            print('✓ Leader takeover with stale lock successful')
 
         finally:
             try:
@@ -1689,20 +1575,13 @@ def test_rebalance_detects_nodes_joining_after_distribution(postgres):
     1. Leader performs distribution seeing only 1 node (itself)
     2. Other nodes join immediately after distribution
     3. RebalanceMonitor should detect membership change and trigger rebalance
-
-    This tests the fix for the bug where RebalanceMonitor initialized with
-    current node count instead of distribution-time node count, missing the change.
     """
-    print('\n=== Testing rebalance detection after late node joins ===')
-
     tables = schema.get_table_names('sync_')
 
     # Setup: Insert stale tokens from previous run (all owned by node1)
     for token_id in range(100):
         insert_token(postgres, tables, token_id, 'node1', version=1)
 
-    # Start node1 first with very short wait_on_enter
-    print('Starting node1 (will distribute immediately)...')
     coord_config = CoordinationConfig(
         total_tokens=100,
         rebalance_check_interval_sec=1  # Fast checks
@@ -1712,22 +1591,17 @@ def test_rebalance_detects_nodes_joining_after_distribution(postgres):
     node1.__enter__()
 
     try:
-        # Wait for node1 to complete distribution (should see only itself)
         assert wait_for_state(node1, JobState.RUNNING_LEADER, timeout_sec=10)
         time.sleep(0.5)
 
-        # Verify node1 got all tokens initially
         with postgres.connect() as conn:
             result = conn.execute(text(f"""
                 SELECT node, COUNT(*) FROM {tables["Token"]} GROUP BY node
             """))
             initial_distribution = {row[0]: row[1] for row in result}
 
-        print(f'Initial distribution: {initial_distribution}')
         assert initial_distribution.get('node1', 0) == 100, 'node1 should have all tokens initially'
 
-        # Now start other nodes (they join AFTER distribution)
-        print('Starting node2 and node3 after distribution...')
         node2 = create_job('node2', postgres, coordination_config=coord_config, wait_on_enter=0)
         node3 = create_job('node3', postgres, coordination_config=coord_config, wait_on_enter=0)
 
@@ -1737,10 +1611,6 @@ def test_rebalance_detects_nodes_joining_after_distribution(postgres):
         # Wait for them to reach running state
         assert wait_for_state(node2, JobState.RUNNING_FOLLOWER, timeout_sec=10)
         assert wait_for_state(node3, JobState.RUNNING_FOLLOWER, timeout_sec=10)
-
-        # RebalanceMonitor should detect the membership change (1 -> 3 nodes)
-        # and trigger rebalancing
-        print('Waiting for rebalance to be triggered...')
 
         # Give RebalanceMonitor time to run at least 2 checks
         # It checks every 1 second, so wait at least 3 seconds
@@ -1753,33 +1623,24 @@ def test_rebalance_detects_nodes_joining_after_distribution(postgres):
                 WHERE last_heartbeat > NOW() - INTERVAL '15 seconds'
             """))
             visible_nodes = result.scalar()
-        print(f'Nodes visible to rebalance monitor: {visible_nodes}')
 
         assert wait_for_rebalance(postgres, tables, min_count=1, timeout_sec=30), \
             'RebalanceMonitor should detect node count change and trigger rebalance'
 
-        # Wait for token redistribution
         assert wait_for_all_nodes_token_sync([node1, node2, node3], expected_total=100, timeout_sec=20)
 
-        # Verify tokens are now balanced across all 3 nodes
-        print('Verifying balanced distribution after rebalance...')
         with postgres.connect() as conn:
             result = conn.execute(text(f"""
                 SELECT node, COUNT(*) FROM {tables["Token"]} GROUP BY node ORDER BY node
             """))
             final_distribution = {row[0]: row[1] for row in result}
 
-        print(f'Final distribution: {final_distribution}')
-
         for node_name, token_count in final_distribution.items():
-            print(f'{node_name}: {token_count} tokens')
             assert 30 <= token_count <= 35, \
                 f'{node_name} should have ~33 tokens (got {token_count})'
 
         total_tokens = sum(final_distribution.values())
         assert total_tokens == 100, 'All 100 tokens should still be assigned'
-
-        print('✓ RebalanceMonitor successfully detected late node joins and triggered rebalance')
 
     finally:
         for node in [node1, node2, node3]:
@@ -1793,84 +1654,77 @@ class TestMinimumNodesRequirement:
     """Test minimum_nodes coordination during cluster formation."""
 
     @clean_tables('Node', 'Token')
-    def test_wait_on_enter_respects_minimum_nodes(self, postgres):
-        """Verify wait_on_enter blocks in CLUSTER_FORMING until minimum_nodes reached.
+    def test_wait_on_enter_waits_full_duration_even_after_minimum_nodes(self, postgres):
+        """Verify wait_on_enter waits FULL duration even after minimum_nodes reached.
 
-        This test catches the bug where wait_on_enter proceeded with ANY 2+ nodes
-        instead of respecting minimum_nodes configuration.
+        wait_on_enter provides a grace period for all expected nodes to join before
+        initial token distribution. It should NOT exit early when minimum_nodes is
+        reached.
+
+        Expected behavior with minimum_nodes=2, wait_on_enter=10:
+        - Both nodes join within 1 second (minimum_nodes reached quickly)
+        - __enter__ should STILL wait ~10 seconds before proceeding to distribution
+        - This allows late-joining nodes to register before initial distribution
+        - Result: ONE distribution to all nodes, not cascading rebalances
         """
-        print('\n=== Testing wait_on_enter respects minimum_nodes ===')
-
         coord_config = get_coordination_config(
             total_tokens=30,
-            minimum_nodes=3,
+            minimum_nodes=2,
             heartbeat_interval_sec=1
         )
 
-        # Start node1 with wait_on_enter=15 (enough time to verify blocking)
-        node1 = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=15)
+        node1 = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=10)
+
+        enter_start = time.time()
         node1_thread = threading.Thread(target=node1.__enter__)
         node1_thread.start()
 
         try:
-            # Node1 should be in CLUSTER_FORMING, waiting
+            time.sleep(0.5)
             assert wait_for_state(node1, JobState.CLUSTER_FORMING, timeout_sec=5)
-            print('node1 in CLUSTER_FORMING (1/3 nodes)')
 
-            time.sleep(2)
-
-            # Start node2 - CRITICAL: Should STILL wait (need 3, have 2)
-            print('Starting node2...')
-            node2 = create_job('node2', postgres, coordination_config=coord_config, wait_on_enter=15)
+            node2 = create_job('node2', postgres, coordination_config=coord_config, wait_on_enter=10)
             node2_thread = threading.Thread(target=node2.__enter__)
             node2_thread.start()
 
+            time.sleep(0.5)
+
+            both_ready_time = time.time() - enter_start
+
+            active_nodes = node1.get_active_nodes()
+            assert len(active_nodes) >= 2, 'minimum_nodes=2 should be reached'
+
+            time.sleep(2)
+            elapsed = time.time() - enter_start
+
+            assert node1.state_machine.state == JobState.CLUSTER_FORMING, \
+                f'node1 should STILL be in CLUSTER_FORMING at {elapsed:.1f}s, got {node1.state_machine.state.value}'
+
             try:
-                # Give time for buggy code to wrongly proceed
-                time.sleep(3)
+                node1_thread.join(timeout=15)
+                node2_thread.join(timeout=15)
 
-                # THE CRITICAL ASSERTION: With buggy code, node1 would have proceeded
-                # because len(nodes) = 2 > 1. With fixed code, it should still be waiting.
-                assert node1.state_machine.state == JobState.CLUSTER_FORMING, \
-                    f'node1 should still be in CLUSTER_FORMING with 2/3 nodes, got {node1.state_machine.state.value}'
+                enter_duration = time.time() - enter_start
 
-                assert node2.state_machine.state == JobState.CLUSTER_FORMING, \
-                    f'node2 should be in CLUSTER_FORMING with 2/3 nodes, got {node2.state_machine.state.value}'
+                assert enter_duration >= 8.0, \
+                    f'__enter__ exited too early ({enter_duration:.1f}s), should wait full wait_on_enter=10s'
 
-                print('✓ Both nodes correctly waiting with 2/3 nodes')
+                assert enter_duration <= 12.0, \
+                    f'__enter__ took too long ({enter_duration:.1f}s), should be ~10s'
 
-                # Start node3 - NOW it should proceed
-                print('Starting node3...')
-                node3 = create_job('node3', postgres, coordination_config=coord_config, wait_on_enter=15)
-                node3_thread = threading.Thread(target=node3.__enter__)
-                node3_thread.start()
-
-                try:
-                    # All nodes should now proceed through states
-                    assert wait_for_state(node1, JobState.RUNNING_LEADER, timeout_sec=15)
-                    assert wait_for_state(node2, JobState.RUNNING_FOLLOWER, timeout_sec=15)
-                    assert wait_for_state(node3, JobState.RUNNING_FOLLOWER, timeout_sec=15)
-
-                    print('✓ All nodes proceeded after minimum_nodes reached')
-
-                finally:
-                    node3.__exit__(None, None, None)
-                    node3_thread.join(timeout=5)
+                assert wait_for_state(node1, JobState.RUNNING_LEADER, timeout_sec=3)
+                assert wait_for_state(node2, JobState.RUNNING_FOLLOWER, timeout_sec=3)
 
             finally:
                 node2.__exit__(None, None, None)
-                node2_thread.join(timeout=5)
 
         finally:
             node1.__exit__(None, None, None)
-            node1_thread.join(timeout=5)
 
     @clean_tables('Node', 'Token')
     def test_leader_waits_for_minimum_nodes(self, postgres):
         """Verify leader waits for minimum_nodes before distribution.
         """
-        print('\n=== Testing leader waits for minimum_nodes ===')
-
         tables = schema.get_table_names('sync_')
 
         coord_config = get_coordination_config(
@@ -1879,7 +1733,7 @@ class TestMinimumNodesRequirement:
             token_distribution_timeout_sec=60
         )
 
-        node1 = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
+        node1 = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=10)
         node2 = None
         node3 = None
 
@@ -1887,8 +1741,7 @@ class TestMinimumNodesRequirement:
         node1_thread.start()
 
         try:
-            assert wait_for_state(node1, JobState.DISTRIBUTING, timeout_sec=10)
-            print('node1 in DISTRIBUTING (waiting for minimum nodes)')
+            assert wait_for_state(node1, JobState.CLUSTER_FORMING, timeout_sec=10)
 
             time.sleep(2)
 
@@ -1896,16 +1749,13 @@ class TestMinimumNodesRequirement:
                 result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Token"]}'))
                 token_count = result.scalar()
 
-            print(f'Tokens distributed while waiting: {token_count}')
             assert token_count == 0, 'Should not distribute tokens before minimum_nodes reached'
 
-            print('Starting node2...')
-            node2 = create_job('node2', postgres, coordination_config=coord_config, wait_on_enter=0)
+            node2 = create_job('node2', postgres, coordination_config=coord_config, wait_on_enter=10)
             node2_thread = threading.Thread(target=node2.__enter__)
             node2_thread.start()
 
-            assert wait_for_state(node2, JobState.DISTRIBUTING, timeout_sec=10)
-            print('node2 also waiting in DISTRIBUTING')
+            assert wait_for_state(node2, JobState.CLUSTER_FORMING, timeout_sec=10)
 
             time.sleep(2)
 
@@ -1913,19 +1763,15 @@ class TestMinimumNodesRequirement:
                 result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Token"]}'))
                 token_count = result.scalar()
 
-            print(f'Tokens after node2 joined: {token_count}')
             assert token_count == 0, 'Should still not distribute with only 2 nodes'
 
-            print('Starting node3...')
-            node3 = create_job('node3', postgres, coordination_config=coord_config, wait_on_enter=0)
+            node3 = create_job('node3', postgres, coordination_config=coord_config, wait_on_enter=10)
             node3_thread = threading.Thread(target=node3.__enter__)
             node3_thread.start()
 
-            assert wait_for_state(node3, JobState.DISTRIBUTING, timeout_sec=10)
-            print('node3 also waiting in DISTRIBUTING')
+            assert wait_for_state(node3, JobState.CLUSTER_FORMING, timeout_sec=10)
 
             assert wait_for(lambda: len(node1.get_active_nodes()) >= 3, timeout_sec=10)
-            print('3 nodes active')
 
             assert wait_for_state(node1, JobState.RUNNING_LEADER, timeout_sec=15)
             assert wait_for_state(node2, JobState.RUNNING_FOLLOWER, timeout_sec=15)
@@ -1935,10 +1781,7 @@ class TestMinimumNodesRequirement:
                 result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Token"]}'))
                 token_count = result.scalar()
 
-            print(f'Tokens after minimum_nodes reached: {token_count}')
             assert token_count == 30, 'Should distribute all tokens after minimum_nodes reached'
-
-            print('✓ Leader waited for minimum_nodes before distribution')
 
         finally:
             for node in [node1, node2, node3]:
@@ -1955,8 +1798,6 @@ class TestMinimumNodesRequirement:
     def test_timeout_when_minimum_not_reached(self, postgres):
         """Verify TimeoutError raised when minimum_nodes not reached within timeout.
         """
-        print('\n=== Testing timeout when minimum_nodes not reached ===')
-
         tables = schema.get_table_names('sync_')
 
         coord_config = get_coordination_config(
@@ -1983,8 +1824,7 @@ class TestMinimumNodesRequirement:
             assert len(exception_holder) == 1, 'Should have raised exception'
             e = exception_holder[0]
             assert isinstance(e, TimeoutError), f'Should be TimeoutError, got {type(e).__name__}'
-            assert 'Minimum nodes (5) not reached within 5s' in str(e), f'Wrong message: {e}'
-            print(f'✓ TimeoutError raised as expected: {e}')
+            assert 'Minimum nodes (5) not reached after 0s grace period' in str(e), f'Wrong message: {e}'
         finally:
             try:
                 node1.__exit__(None, None, None)
@@ -1992,35 +1832,29 @@ class TestMinimumNodesRequirement:
                 pass
 
     @clean_tables('Node', 'Token')
-    def test_shutdown_during_minimum_nodes_wait(self, postgres):
-        """Verify graceful shutdown while waiting for minimum_nodes.
+    def test_shutdown_during_cluster_formation_wait(self, postgres):
+        """Verify graceful shutdown while waiting for cluster formation.
         """
-        print('\n=== Testing shutdown during minimum_nodes wait ===')
-
         tables = schema.get_table_names('sync_')
 
         coord_config = get_coordination_config(
             total_tokens=30,
-            minimum_nodes=5,
-            token_distribution_timeout_sec=60
+            minimum_nodes=5
         )
 
-        node1 = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
+        node1 = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=60)
 
         node1_thread = threading.Thread(target=node1.__enter__)
         node1_thread.start()
 
         try:
-            assert wait_for_state(node1, JobState.DISTRIBUTING, timeout_sec=10)
-            print('node1 in DISTRIBUTING state, waiting for minimum_nodes')
+            assert wait_for_state(node1, JobState.CLUSTER_FORMING, timeout_sec=10)
 
             time.sleep(2)
 
-            print('Requesting shutdown while waiting...')
             node1._shutdown_event.set()
 
             node1_thread.join(timeout=5)
-            print('node1 thread completed')
 
             assert node1._shutdown_event.is_set(), 'Shutdown event should remain set'
 
@@ -2028,10 +1862,7 @@ class TestMinimumNodesRequirement:
                 result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Token"]}'))
                 token_count = result.scalar()
 
-            print(f'Tokens after shutdown: {token_count}')
             assert token_count == 0, 'No tokens should be distributed after shutdown'
-
-            print('✓ Shutdown handled gracefully during minimum_nodes wait')
 
         finally:
             try:
@@ -2043,8 +1874,6 @@ class TestMinimumNodesRequirement:
     def test_minimum_nodes_one_proceeds_immediately(self, postgres):
         """Verify minimum_nodes=1 allows immediate distribution.
         """
-        print('\n=== Testing minimum_nodes=1 proceeds immediately ===')
-
         tables = schema.get_table_names('sync_')
 
         coord_config = get_coordination_config(
@@ -2065,36 +1894,26 @@ class TestMinimumNodesRequirement:
 
             assert token_count == 30, 'Should distribute all tokens with minimum_nodes=1'
 
-            print('✓ minimum_nodes=1 allowed immediate distribution')
-
         finally:
             node1.__exit__(None, None, None)
 
 
 class TestLateNodeJoining:
-    """Test scenarios where nodes join an already-running cluster.
-
-    These tests replicate the production issue where node 8 joined a 7-node
-    cluster and experienced token allocation problems.
-    """
+    """Test scenarios where nodes join an already-running cluster."""
 
     @clean_tables('Node', 'Token', 'Rebalance')
     def test_late_joining_node_waits_for_token_assignment(self, postgres):
         """Verify late-joining node blocks in __enter__ until it receives tokens.
 
-        Critical production scenario:
+        Critical scenario:
         - Cluster of 3 nodes is fully running and stable
-        - Node 4 joins hours/days later
-        - Node 4 MUST wait during __enter__ until leader redistributes tokens
-        - Node 4 MUST exit __enter__ with non-zero token allocation
+        - Node 4 joins later
+        - Node 4 must wait during __enter__ until leader redistributes tokens
+        - Node 4 must exit __enter__ with non-zero token allocation
         """
-        print('\n=== Testing late-joining node waits for tokens ===')
-
         config = get_coordination_config(total_tokens=100)
         tables = schema.get_table_names(config.appname)
 
-        # Phase 1: Start stable 3-node cluster
-        print('Phase 1: Starting 3-node cluster...')
         with cluster(postgres, 'node1', 'node2', 'node3', total_tokens=100) as nodes:
             # Wait for cluster to stabilize
             for node in nodes:
@@ -2105,11 +1924,7 @@ class TestLateNodeJoining:
             assert wait_for_cached_tokens_sync(nodes, expected_total=100, timeout_sec=10)
 
             initial_distribution = {node.node_name: len(node.my_tokens) for node in nodes}
-            print(f'Initial distribution: {initial_distribution}')
             assert sum(initial_distribution.values()) == 100
-
-            # Phase 2: Node4 joins AFTER cluster is stable (the critical test case)
-            print('\nPhase 2: Node4 joining stable cluster (simulating late arrival)...')
 
             node4 = create_job('node4', postgres, coordination_config=config, wait_on_enter=15)
 
@@ -2119,23 +1934,18 @@ class TestLateNodeJoining:
             node4.__enter__()
             enter_duration = time.time() - enter_start
 
-            print(f'node4.__enter__ took {enter_duration:.1f}s')
-
             # Critical assertions
             assert enter_duration > 1.0, \
                 'Late-joining node should wait for rebalancing (took <1s, likely returned immediately)'
 
             assert len(node4.my_tokens) > 0, \
-                'Late-joining node MUST have tokens immediately after __enter__ completes'
-
-            print(f'node4 received {len(node4.my_tokens)} tokens after {enter_duration:.1f}s wait')
+                'Late-joining node must have tokens immediately after __enter__ completes'
 
             # Verify balanced distribution across all 4 nodes
             nodes_with_4 = nodes + [node4]
             assert wait_for_cached_tokens_sync(nodes_with_4, expected_total=100, timeout_sec=10)
 
             final_distribution = {node.node_name: len(node.my_tokens) for node in nodes_with_4}
-            print(f'Final distribution: {final_distribution}')
 
             # Each node should have ~25 tokens
             for node_name, token_count in final_distribution.items():
@@ -2153,59 +1963,53 @@ class TestLateNodeJoining:
             assert rebalance_count >= 1, \
                 'Rebalancing should have been triggered by late node join'
 
-            print('✓ Late-joining node correctly waited for token assignment')
-
             node4.__exit__(None, None, None)
 
     @clean_tables('Node', 'Token', 'Rebalance')
     def test_rebalance_monitor_detects_late_node_with_correct_baseline(self, postgres):
-        """Verify RebalanceMonitor uses distribution-time node count, not current count.
+        """Verify RebalanceMonitor uses distribution-time node count as baseline.
 
-        This tests the fix for the bug where RebalanceMonitor was initialized with
-        current node count instead of distribution-time count, missing membership changes.
+        RebalanceMonitor must capture the node count BEFORE distribution begins,
+        not after. This allows it to detect membership changes that occur during
+        or immediately after initial distribution.
+
+        Test scenario:
+        1. Leader distributes tokens seeing only 1 node (itself)
+        2. RebalanceMonitor baseline is set to 1
+        3. Second node joins after distribution
+        4. RebalanceMonitor detects change (1 -> 2) and triggers rebalance
         """
-        print('\n=== Testing RebalanceMonitor baseline node count ===')
-
         config = get_coordination_config(total_tokens=50, rebalance_check_interval_sec=2)
         tables = schema.get_table_names(config.appname)
 
-        # Start node1 alone (it will distribute seeing only itself)
-        print('Starting node1 (will distribute to 1 node)...')
         node1 = create_job('node1', postgres, coordination_config=config, wait_on_enter=0)
         node1.__enter__()
 
         try:
             assert wait_for_state(node1, JobState.RUNNING_LEADER, timeout_sec=10)
 
-            # Verify node1 has all tokens
             with postgres.connect() as conn:
                 result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Token"]} WHERE node = :node'),
                                      {'node': 'node1'})
                 node1_tokens = result.scalar()
 
-            print(f'node1 initially owns {node1_tokens}/50 tokens')
             assert node1_tokens == 50, 'node1 should own all tokens initially'
 
-            # Get RebalanceMonitor's baseline (should be 1 from distribution time)
+            # Get RebalanceMonitor's baseline
             rebalance_monitor = node1._monitors.get('rebalance')
             assert rebalance_monitor is not None, 'RebalanceMonitor should be running'
             initial_baseline = rebalance_monitor.last_node_count
-            print(f'RebalanceMonitor baseline node count: {initial_baseline}')
 
-            # This is the critical assertion for the fix
+            # Critical assertion
             assert initial_baseline == 1, \
-                f'RebalanceMonitor should use distribution-time count (1), got {initial_baseline}'
+                f'RebalanceMonitor baseline should be captured before distribution (1 node), got {initial_baseline}'
 
-            # Start node2 (should trigger rebalance because 2 != 1)
-            print('\nStarting node2...')
             node2 = create_job('node2', postgres, coordination_config=config, wait_on_enter=0)
             node2.__enter__()
 
             try:
                 assert wait_for_state(node2, JobState.RUNNING_FOLLOWER, timeout_sec=10)
 
-                # Wait for RebalanceMonitor to detect membership change
-                # It checks every 2 seconds, so wait up to 6 seconds
                 time.sleep(6)
 
                 # Verify rebalancing was triggered
@@ -2217,7 +2021,6 @@ class TestLateNodeJoining:
                     """))
                     recent_rebalances = result.scalar()
 
-                print(f'Recent rebalances: {recent_rebalances}')
                 assert recent_rebalances >= 1, \
                     'RebalanceMonitor should have detected membership change (1->2 nodes)'
 
@@ -2230,12 +2033,9 @@ class TestLateNodeJoining:
                     """))
                     distribution = {row[0]: row[1] for row in result}
 
-                print(f'Final distribution: {distribution}')
                 assert len(distribution) == 2, 'Tokens should be distributed to both nodes'
                 assert 20 <= distribution.get('node1', 0) <= 30, 'node1 should have ~25 tokens'
                 assert 20 <= distribution.get('node2', 0) <= 30, 'node2 should have ~25 tokens'
-
-                print('✓ RebalanceMonitor correctly detected late node with proper baseline')
 
             finally:
                 node2.__exit__(None, None, None)
@@ -2247,11 +2047,8 @@ class TestLateNodeJoining:
         """Verify late-joining node can claim tasks immediately after __enter__.
 
         This tests the end-to-end scenario: late node joins, gets tokens,
-        and can immediately start claiming tasks without waiting for additional
-        rebalancing.
+        and can immediately start claiming tasks.
         """
-        print('\n=== Testing late node can claim tasks immediately ===')
-
         config = get_coordination_config(total_tokens=30)
         tables = schema.get_table_names(config.appname)
 
@@ -2259,17 +2056,10 @@ class TestLateNodeJoining:
         for i in range(30):
             insert_inst(postgres, tables, str(i), done=False)
 
-        # Start 2-node cluster
-        print('Starting 2-node cluster...')
         with cluster(postgres, 'node1', 'node2', total_tokens=30) as initial_nodes:
             for node in initial_nodes:
                 assert wait_for(lambda n=node: len(n.my_tokens) >= 10, timeout_sec=10)
 
-            print(f'Initial cluster: node1={len(initial_nodes[0].my_tokens)} tokens, '
-                  f'node2={len(initial_nodes[1].my_tokens)} tokens')
-
-            # Node3 joins late
-            print('\nNode3 joining...')
             node3 = create_job('node3', postgres, coordination_config=config, wait_on_enter=15)
             node3.__enter__()
 
@@ -2278,16 +2068,12 @@ class TestLateNodeJoining:
                 assert len(node3.my_tokens) > 0, \
                     'node3 should have tokens immediately after __enter__'
 
-                print(f'node3 received {len(node3.my_tokens)} tokens')
-
                 # Try to claim tasks immediately (should succeed for some)
                 claimed_by_node3 = []
                 for i in range(30):
                     task = create_task(i)
                     if node3.can_claim_task(task):
                         claimed_by_node3.append(i)
-
-                print(f'node3 can claim {len(claimed_by_node3)}/30 tasks immediately')
 
                 # Critical assertion: should be able to claim tasks right away
                 assert len(claimed_by_node3) >= 5, \
@@ -2306,8 +2092,6 @@ class TestLateNodeJoining:
                 assert len(claimable_by_any) == 30, \
                     f'All 30 tasks should be claimable by someone, got {len(claimable_by_any)}'
 
-                print('✓ Late node can claim tasks immediately after joining')
-
             finally:
                 node3.__exit__(None, None, None)
 
@@ -2318,51 +2102,34 @@ class TestLateNodeJoining:
         This tests the scenario where nodes join one after another,
         each triggering a separate rebalance.
         """
-        print('\n=== Testing multiple late nodes joining sequentially ===')
-
         config = get_coordination_config(total_tokens=100, rebalance_check_interval_sec=2)
 
-        # Start with 2 nodes
-        print('Starting 2-node cluster...')
         with cluster(postgres, 'node1', 'node2', total_tokens=100) as initial_nodes:
             for node in initial_nodes:
                 assert wait_for(lambda n=node: len(n.my_tokens) >= 40, timeout_sec=10)
 
-            print(f'Initial: node1={len(initial_nodes[0].my_tokens)}, '
-                  f'node2={len(initial_nodes[1].my_tokens)} tokens')
-
-            # Node3 joins
-            print('\nNode3 joining...')
             node3 = create_job('node3', postgres, coordination_config=config, wait_on_enter=15)
             node3.__enter__()
 
             try:
                 assert len(node3.my_tokens) > 0, 'node3 should have tokens'
-                print(f'node3 received {len(node3.my_tokens)} tokens')
 
-                # Node4 joins
-                print('\nNode4 joining...')
                 node4 = create_job('node4', postgres, coordination_config=config, wait_on_enter=15)
                 node4.__enter__()
 
                 try:
                     assert len(node4.my_tokens) > 0, 'node4 should have tokens'
-                    print(f'node4 received {len(node4.my_tokens)} tokens')
 
                     # Wait for all nodes to sync their token caches
                     all_nodes = initial_nodes + [node3, node4]
                     assert wait_for_cached_tokens_sync(all_nodes, expected_total=100, timeout_sec=20), \
                         'All node token caches should sync after sequential joins'
 
-                    # Verify balanced distribution
                     final_dist = {node.node_name: len(node.my_tokens) for node in all_nodes}
-                    print(f'Final distribution: {final_dist}')
 
                     for node_name, token_count in final_dist.items():
                         assert 20 <= token_count <= 30, \
                             f'{node_name} should have ~25 tokens, got {token_count}'
-
-                    print('✓ Multiple late nodes successfully joined and received tokens')
 
                 finally:
                     node4.__exit__(None, None, None)
@@ -2375,32 +2142,24 @@ class TestLateNodeJoining:
 
         This tests error handling when something goes wrong during late node join.
         """
-        print('\n=== Testing late node timeout handling ===')
-
         config = get_coordination_config(
             total_tokens=30,
             token_distribution_timeout_sec=5,  # Short timeout for test
             rebalance_check_interval_sec=60   # Leader won't check in time
         )
 
-        # Start node1 with long rebalance interval (won't detect node2 in time)
-        print('Starting node1 (with slow rebalance checking)...')
         node1 = create_job('node1', postgres, coordination_config=config, wait_on_enter=0)
         node1.__enter__()
 
         try:
             assert wait_for_state(node1, JobState.RUNNING_LEADER, timeout_sec=10)
 
-            # Node2 tries to join but leader won't rebalance in time
-            print('\nNode2 attempting to join (should timeout)...')
             node2 = create_job('node2', postgres, coordination_config=config, wait_on_enter=0)
 
             try:
                 node2.__enter__()
-                # If we get here, something's wrong - should have timed out
                 pytest.fail('node2 should have timed out waiting for token distribution')
             except TimeoutError as e:
-                print(f'✓ Got expected timeout: {e}')
                 assert 'Token distribution did not complete' in str(e) or \
                        'did not complete for node2' in str(e), \
                     f'Unexpected timeout message: {e}'
@@ -2411,6 +2170,77 @@ class TestLateNodeJoining:
                     pass
         finally:
             node1.__exit__(None, None, None)
+
+
+class TestFollowerTimeoutBugFix:
+    """Test timeout behavior when minimum_nodes is not reached."""
+
+    @clean_tables('Node', 'Token')
+    def test_follower_timeout_still_works_when_leader_truly_stuck(self, postgres):
+        """Verify both nodes timeout consistently when minimum_nodes unreachable.
+
+        Both leader and follower should timeout after wait_on_enter completes
+        if minimum_nodes is not reached.
+
+        Scenario: Start 2 nodes with minimum_nodes=10 (unreachable)
+        - Both nodes timeout after wait_on_enter with identical behavior
+        """
+        coord_config = get_coordination_config(
+            total_tokens=30,
+            minimum_nodes=10,
+            token_distribution_timeout_sec=60
+        )
+
+        node1 = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=5)
+        node2 = create_job('node2', postgres, coordination_config=coord_config, wait_on_enter=5)
+
+        node1_exception = []
+        node2_exception = []
+
+        def start_node1():
+            try:
+                node1.__enter__()
+            except Exception as e:
+                node1_exception.append(e)
+
+        def start_node2():
+            try:
+                node2.__enter__()
+            except Exception as e:
+                node2_exception.append(e)
+
+        node1_thread = threading.Thread(target=start_node1)
+        node2_thread = threading.Thread(target=start_node2)
+
+        start_time = time.time()
+        node1_thread.start()
+        time.sleep(0.5)
+        node2_thread.start()
+
+        node1_thread.join(timeout=15)
+        node2_thread.join(timeout=15)
+        elapsed = time.time() - start_time
+
+        assert len(node1_exception) == 1, 'Node1 should have exception'
+        assert isinstance(node1_exception[0], TimeoutError), \
+            f'Node1 should get TimeoutError, got {type(node1_exception[0]).__name__}'
+        assert 'Minimum nodes (10) not reached after 5s grace period' in str(node1_exception[0]), \
+            f'Node1 should timeout after wait_on_enter: {node1_exception[0]}'
+
+        assert len(node2_exception) == 1, 'Node2 should have exception'
+        assert isinstance(node2_exception[0], TimeoutError), \
+            f'Node2 should get TimeoutError, got {type(node2_exception[0]).__name__}'
+        assert 'Minimum nodes (10) not reached after 5s grace period' in str(node2_exception[0]), \
+            f'Node2 should timeout after wait_on_enter: {node2_exception[0]}'
+
+        try:
+            node1.__exit__(None, None, None)
+        except:
+            pass
+        try:
+            node2.__exit__(None, None, None)
+        except:
+            pass
 
 
 if __name__ == '__main__':

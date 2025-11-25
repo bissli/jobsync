@@ -780,11 +780,8 @@ class TestStaleTaskOwnership:
             job.add_task(task_5)
             job.add_task(task_10)
 
-            logger.info('Added 2 tasks to queue with valid ownership')
-
             job.tokens.my_tokens = {5}
             job.tokens.token_version = 2
-            logger.info(f'Simulated token loss: removed token {token_10}')
 
             assert len(job.tasks._tasks) == 2, 'Tasks should still be in queue'
 
@@ -795,10 +792,8 @@ class TestStaleTaskOwnership:
                                      {'node': 'node1'})
                 audited_items = [row[0] for row in result]
 
-            logger.info(f'Audited items: {audited_items}')
-
             assert str(task_5.id) in audited_items, 'Task mapping to token 5 should be in audit (still owned)'
-            assert str(task_10.id) in audited_items, 'Task mapping to token 10 written to audit despite token loss (BUG)'
+            assert str(task_10.id) in audited_items, 'Task mapping to token 10 written to audit despite token loss'
 
         finally:
             job.__exit__(None, None, None)
@@ -843,8 +838,6 @@ class TestStaleTaskOwnership:
             job.tokens.my_tokens = set()
             job.tokens.token_version = 2
 
-            logger.info('Simulated complete token loss before audit write')
-
             job.write_audit()
 
             with postgres.connect() as conn:
@@ -852,9 +845,7 @@ class TestStaleTaskOwnership:
                                      {'node': 'node1'})
                 audit_count = result.scalar()
 
-            assert audit_count == 3, 'All 3 tasks written despite no longer owning tokens (documents current behavior)'
-
-            logger.info('Current behavior: no revalidation at write time')
+            assert audit_count == 3, 'All 3 tasks written despite no longer owning tokens'
 
         finally:
             job.__exit__(None, None, None)

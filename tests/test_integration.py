@@ -1610,7 +1610,7 @@ class TestCallbackThreadPoolExecution:
 
         def blocking_callback():
             callback_active.set()
-            time.sleep(2)
+            time.sleep(5)
 
         job = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
                 on_rebalance=blocking_callback)
@@ -1619,6 +1619,9 @@ class TestCallbackThreadPoolExecution:
         try:
             assert wait_for(lambda: len(job.my_tokens) >= 1, timeout_sec=15)
             assert callback_active.wait(timeout=5), 'Callback should start'
+
+            assert wait_for(lambda: len(job.tokens._pending_callbacks) >= 1, timeout_sec=2), \
+                'Future should be tracked in pending callbacks list'
 
             pending_count = len(job.tokens._pending_callbacks)
 

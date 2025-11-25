@@ -22,9 +22,9 @@ JobSync is a Python library for coordinating task processing. Workers automatica
 
 ### Initial Deployment
 
-For **batch workloads** (all tasks known upfront), start all nodes together within the `wait_on_enter` timeout window to ensure fair task distribution.
+For **batch workloads** (all tasks known upfront), start all nodes together within the `wait_on_enter` grace period to ensure fair task distribution.
 
-1. **Start all nodes simultaneously** (or within 60 seconds):
+1. **Start all nodes simultaneously** (or within the grace period):
 ```bash
 # Terminal 1
 python worker.py --node-name worker-01

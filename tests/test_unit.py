@@ -1469,6 +1469,68 @@ class TestBasicDistribution:
             assert actual_counts == expected_counts
             assert moved == total_tokens
 
+    def test_remainder_tokens_distributed_alphabetically(self):
+        """Verify remainder tokens are assigned to first N nodes alphabetically.
+
+        This is Bug #2: The algorithm should give remainder tokens to the first
+        nodes alphabetically, but was comparing against global average instead
+        of per-node targets.
+        """
+        nodes = ['node-c', 'node-a', 'node-b', 'node-d', 'node-e']
+
+        assignments, moved = compute_minimal_move_distribution(
+            total_tokens=103,
+            active_nodes=nodes,
+            current_assignments={},
+            locked_tokens={},
+            pattern_matcher=exact_match
+        )
+
+        counts = {node: 0 for node in nodes}
+        for node in assignments.values():
+            counts[node] += 1
+
+        sorted_nodes = sorted(nodes)
+        logger.debug(f'Token counts by node: {[(n, counts[n]) for n in sorted_nodes]}')
+
+        assert counts['node-a'] == 21, 'First alphabetically should get 21 tokens (20 + 1 remainder)'
+        assert counts['node-b'] == 21, 'Second alphabetically should get 21 tokens (20 + 1 remainder)'
+        assert counts['node-c'] == 21, 'Third alphabetically should get 21 tokens (20 + 1 remainder)'
+        assert counts['node-d'] == 20, 'Fourth alphabetically should get 20 tokens (base amount)'
+        assert counts['node-e'] == 20, 'Fifth alphabetically should get 20 tokens (base amount)'
+
+    def test_remainder_distribution_minimizes_moves_from_correct_nodes(self):
+        """Verify algorithm correctly identifies which nodes are over-target when rebalancing.
+
+        This test specifically checks that the algorithm uses per-node targets (not global
+        average) when deciding whether to move tokens away from current owner.
+        """
+        current = {
+            **dict.fromkeys(range(0, 55), 'node-a'),
+            **dict.fromkeys(range(55, 111), 'node-b'),
+            **dict.fromkeys(range(111, 166), 'node-c'),
+        }
+
+        nodes = ['node-a', 'node-b', 'node-c']
+
+        assignments, moved = compute_minimal_move_distribution(
+            total_tokens=166,
+            active_nodes=nodes,
+            current_assignments=current,
+            locked_tokens={},
+            pattern_matcher=exact_match
+        )
+
+        counts = {node: 0 for node in nodes}
+        for node in assignments.values():
+            counts[node] += 1
+
+        assert counts['node-a'] == 56, 'node-a should have 56 tokens (55 + 1 remainder)'
+        assert counts['node-b'] == 55, 'node-b should have 55 tokens (base amount)'
+        assert counts['node-c'] == 55, 'node-c should have 55 tokens (base amount)'
+
+        assert moved == 1, 'Should move exactly 1 token from node-b (over-target) to node-a (under-target)'
+
 
 class TestMinimalMovement:
     """Test that algorithm minimizes token movement."""
@@ -2445,6 +2507,44 @@ class TestLargeScale:
 
         for count in counts.values():
             assert 950 <= count <= 1050
+
+    def test_large_scale_remainder_distribution(self):
+        """Verify remainder tokens distributed alphabetically at scale.
+
+        With 10,000 tokens and 9 nodes:
+        - target_per_node = 1,111
+        - remainder = 1
+        - First node alphabetically should get 1,112
+        - Other 8 nodes should get 1,111
+
+        This is the exact scenario from Bug #2 report.
+        """
+        nodes = [f'node{i}' for i in range(9)]
+
+        assignments, moved = compute_minimal_move_distribution(
+            total_tokens=10000,
+            active_nodes=nodes,
+            current_assignments={},
+            locked_tokens={},
+            pattern_matcher=exact_match
+        )
+
+        counts = {node: 0 for node in nodes}
+        for node in assignments.values():
+            counts[node] += 1
+
+        sorted_nodes = sorted(nodes)
+        logger.debug(f'Token distribution: {[(n, counts[n]) for n in sorted_nodes]}')
+
+        assert counts[sorted_nodes[0]] == 1112, \
+            f'First node ({sorted_nodes[0]}) should get 1,112 tokens (1,111 + 1 remainder), got {counts[sorted_nodes[0]]}'
+
+        for i in range(1, 9):
+            assert counts[sorted_nodes[i]] == 1111, \
+                f'Node {sorted_nodes[i]} should get 1,111 tokens (base amount), got {counts[sorted_nodes[i]]}'
+
+        assert sum(counts.values()) == 10000, 'Total should be 10,000 tokens'
+        assert moved == 10000, 'All tokens assigned from empty initial state'
 
     def test_many_nodes(self):
         """Verify distribution with many nodes.

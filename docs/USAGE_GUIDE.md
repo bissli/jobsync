@@ -43,7 +43,7 @@ coord_config = CoordinationConfig(
 )
 
 with Job('worker-01', coordination_config=coord_config, 
-         wait_on_enter=60) as job:  # 60s timeout for cluster formation
+         wait_on_enter=60) as job:  # 60s grace period for cluster formation
     for task_id in get_pending_tasks():
         task = Task(task_id)
         
@@ -55,7 +55,7 @@ with Job('worker-01', coordination_config=coord_config,
     job.write_audit()
 ```
 
-**Note for Batch Workloads**: If all tasks exist upfront (not streaming), set `minimum_nodes` to your expected cluster size and use an appropriate `wait_on_enter` timeout. This ensures fair distribution - otherwise early-starting nodes claim all tasks before late joiners arrive.
+**Note for Batch Workloads**: If all tasks exist upfront (not streaming), set `minimum_nodes` to your expected cluster size and use an appropriate `wait_on_enter` grace period. The full grace period always completes to allow all nodes time to register, ensuring fair distribution - otherwise early-starting nodes claim all tasks before late joiners arrive.
 
 ### Without Coordination
 
@@ -95,7 +95,7 @@ coord_config = CoordinationConfig(
 )
 ```
 
-**Critical for Batch Workloads**: Set `minimum_nodes` to your expected cluster size (e.g., 7 for a 7-node deployment) and use `wait_on_enter=60` (or higher for slow startups). This prevents early nodes from claiming all tasks before the cluster forms.
+**Critical for Batch Workloads**: Set `minimum_nodes` to your expected cluster size (e.g., 7 for a 7-node deployment) and use `wait_on_enter=60` (or higher for slow startups). The full grace period always completes to allow all nodes time to register, preventing early nodes from claiming all tasks before the cluster forms.
 
 **Common Tuning Scenarios:**
 

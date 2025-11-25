@@ -161,7 +161,6 @@ def retry_with_backoff(max_attempts: int = 5, base_delay: float = 1.0, operation
                 except Exception as e:
                     last_exception = e
                     if attempt == max_attempts:
-                        logger.error(f'{name} failed after {max_attempts} attempts: {e}')
                         raise
                     delay = base_delay * (2 ** (attempt - 1))
                     logger.warning(f'{name} attempt {attempt}/{max_attempts} failed: {e}, retrying in {delay:.1f}s')
@@ -395,12 +394,12 @@ def compute_minimal_move_distribution(
 
         return min(eligible_nodes, key=lambda n: (load_counts[n], n))
 
-    def assign_unlocked_token(token_id: int, receivers: deque, node_loads: dict, target: int) -> str:
+    def assign_unlocked_token(token_id: int, receivers: deque, node_loads: dict, node_targets: dict) -> str:
         """Assign unlocked token minimizing movement, respecting target distribution.
         """
         current_owner = current_assignments.get(token_id)
         is_current_active = current_owner in node_loads
-        is_over_target = is_current_active and node_loads[current_owner] > target
+        is_over_target = is_current_active and node_loads[current_owner] > node_targets[current_owner]
 
         if is_current_active and not (is_over_target and receivers):
             return current_owner
@@ -429,6 +428,11 @@ def compute_minimal_move_distribution(
     target_per_node = total_distributable // len(active_nodes)
     remainder = total_distributable % len(active_nodes)
 
+    node_targets = {}
+    for i, node in enumerate(sorted(active_nodes)):
+        target = target_per_node + (1 if i < remainder else 0)
+        node_targets[node] = target
+
     node_loads = dict.fromkeys(active_nodes, 0)
     for token_id in distributable:
         owner = current_assignments.get(token_id)
@@ -442,15 +446,15 @@ def compute_minimal_move_distribution(
         if deficit > 0:
             receivers.append((node, deficit))
 
-    needs_rebalance = any(node_loads[n] > target_per_node for n in active_nodes) and bool(receivers)
-    iteration_order = sorted(distributable, reverse=needs_rebalance)
-
     new_assignments = {}
     for token_id, eligible_nodes in locked_with_nodes.items():
         new_assignments[token_id] = assign_locked_token(token_id, eligible_nodes, new_assignments)
 
-    for token_id in iteration_order:
-        new_assignments[token_id] = assign_unlocked_token(token_id, receivers, node_loads, target_per_node)
+    needs_rebalancing = any(node_loads[node] > node_targets[node] for node in active_nodes)
+    token_order = reversed(distributable) if needs_rebalancing else distributable
+
+    for token_id in token_order:
+        new_assignments[token_id] = assign_unlocked_token(token_id, receivers, node_loads, node_targets)
 
     moves = count_assignment_changes(current_assignments, new_assignments)
 
@@ -788,7 +792,13 @@ class ClusterCoordinator:
         Returns
             Name of elected leader node
         """
-        nodes = self.db.query(self.active_nodes_sql)
+        sql = f"""
+        SELECT name, created_on, last_heartbeat
+        FROM {self.db.tables["Node"]}
+        WHERE last_heartbeat > NOW() - INTERVAL '{self.heartbeat_timeout} seconds'
+        ORDER BY created_on ASC, name ASC
+        """
+        nodes = self.db.query(sql)
 
         if not nodes:
             raise RuntimeError('No active nodes for leader election')
@@ -881,7 +891,9 @@ class TokenDistributor:
             cluster: Cluster coordinator for active nodes
         """
         start_time = time.time()
+
         active_nodes = cluster.get_active_nodes()
+
         active_node_names = [n['name'] for n in active_nodes]
         nodes_count = len(active_node_names)
 
@@ -2054,33 +2066,11 @@ class Job:
             logger.error(f'Failed to elect leader: {e}')
             self.state_machine.transition_to(JobState.ERROR)
 
-    def _wait_for_minimum_nodes(self) -> bool:
-        """Wait for minimum nodes before token distribution.
-
-        Returns
-            True if minimum nodes reached, False if shutdown requested
-
-        Raises
-            TimeoutError: If minimum nodes not reached within timeout
-        """
-        start = time.time()
-        timeout = self.tokens.token_distribution_timeout
-        while time.time() - start < timeout:
-            active_count = len(self.cluster.get_active_nodes())
-            if active_count >= self.tokens.minimum_nodes:
-                logger.info(f'Minimum nodes reached: {active_count}/{self.tokens.minimum_nodes}')
-                return True
-            if self._shutdown_event.wait(timeout=1.0):
-                logger.info('Shutdown requested during minimum nodes wait')
-                return False
-            logger.debug(f'Waiting for minimum nodes: {active_count}/{self.tokens.minimum_nodes}')
-
-        raise TimeoutError(f'Minimum nodes ({self.tokens.minimum_nodes}) not reached within {timeout}s')
-
     def _on_enter_distributing(self) -> None:
         """Entry action for DISTRIBUTING state.
 
         Uses the leader elected in ELECTING state to perform token distribution.
+        Captures node count before distribution for RebalanceMonitor baseline.
         """
         try:
             if self._elected_leader is None:
@@ -2089,17 +2079,13 @@ class Job:
             if self._elected_leader == self.node_name:
                 logger.info('This node is the leader, performing token distribution')
 
-                if not self._wait_for_minimum_nodes():
-                    return
-
-                nodes_at_distribution = self.cluster.get_active_nodes()
-                self._nodes_at_distribution = len(nodes_at_distribution)
+                nodes_before_distribution = self.cluster.get_active_nodes()
+                self._nodes_at_distribution = len(nodes_before_distribution)
                 logger.info(f'Node count at distribution: {self._nodes_at_distribution}')
                 self._distribute_tokens_safe()
             else:
                 logger.info(f'Follower node detected, waiting for leader {self._elected_leader} to distribute tokens')
-        except Exception as e:
-            logger.error(f'Failed during token distribution: {e}')
+        except Exception:
             self.state_machine.transition_to(JobState.ERROR)
             raise
 
@@ -2218,6 +2204,27 @@ class Job:
                     logger.info(f'Membership: {data.get("previous_count")} → {data.get("current_count")}')
                     self._distribute_tokens_safe()
 
+    def _wait_for_enter_time_and_minimum_nodes(self) -> bool:
+        """Wait for cluster formation grace period and verify minimum nodes reached.
+
+        Returns
+            True if minimum nodes reached, False otherwise (shutdown or insufficient nodes)
+        """
+        target_nodes = self.tokens.minimum_nodes
+        logger.info(f'Waiting {self._wait_on_enter}s for cluster formation grace period (target: {target_nodes} nodes)...')
+        start_wait = time.time()
+
+        while time.time() - start_wait < self._wait_on_enter:
+            if self._shutdown_event.wait(timeout=1.0):
+                logger.info('Shutdown requested during cluster wait')
+                return False
+
+        self._nodes = self.cluster.get_active_nodes()
+        logger.info(f'Cluster formation grace period complete after {self._wait_on_enter}s with {len(self._nodes)} node(s) (target: {target_nodes})')
+        logger.info(f'Active nodes: {[n["name"] for n in self._nodes]}')
+
+        return not len(self._nodes) < target_nodes
+
     def __enter__(self):
         """Enter context and perform coordination setup.
         """
@@ -2229,38 +2236,28 @@ class Job:
 
         try:
             if not self.state_machine.transition_to(JobState.CLUSTER_FORMING):
-                logger.error('Failed to transition to CLUSTER_FORMING')
                 raise RuntimeError('Invalid state transition to CLUSTER_FORMING')
 
-            target_nodes = self.tokens.minimum_nodes
-            logger.info(f'Waiting up to {self._wait_on_enter}s for cluster formation (target: {target_nodes} nodes)...')
-            start_wait = time.time()
-            while time.time() - start_wait < self._wait_on_enter:
-                self._nodes = self.cluster.get_active_nodes()
-                if len(self._nodes) >= target_nodes:
-                    logger.info(f'Cluster formed with {len(self._nodes)} nodes (target: {target_nodes}), proceeding')
-                    break
-                if self._shutdown_event.wait(timeout=1.0):
-                    logger.info('Shutdown requested during cluster wait')
-                    return self
-            else:
-                logger.info(f'Cluster formation wait complete after {self._wait_on_enter}s with {len(self._nodes)} node(s) (target: {target_nodes})')
-            logger.info(f'Active nodes: {[n["name"] for n in self._nodes]}')
+            if not self._wait_for_enter_time_and_minimum_nodes():
+                if not self._shutdown_event.is_set():
+                    raise TimeoutError(
+                        f'Minimum nodes ({self.tokens.minimum_nodes}) not reached after {self._wait_on_enter}s grace period '
+                        f'(only {len(self._nodes)} node(s) present)'
+                    )
+                return self
 
             if not self.state_machine.transition_to(JobState.ELECTING):
-                logger.error('Failed to transition to ELECTING')
                 raise RuntimeError('Invalid state transition to ELECTING')
 
             if not self.state_machine.transition_to(JobState.DISTRIBUTING):
-                logger.error('Failed to transition to DISTRIBUTING')
                 raise RuntimeError('Invalid state transition to DISTRIBUTING')
 
             if self.state_machine.state == JobState.ERROR:
-                logger.error('Node in ERROR state after DISTRIBUTING transition, skipping wait_for_distribution')
                 raise RuntimeError('Failed to complete token distribution')
 
-            logger.info('Waiting for token distribution...')
-            self.tokens.wait_for_distribution()
+            follower_timeout = 2 * self.tokens.token_distribution_timeout
+            logger.info(f'Waiting for token distribution (timeout: {follower_timeout}s)...')
+            self.tokens.wait_for_distribution(timeout_sec=follower_timeout)
 
             self.tokens.my_tokens, self.tokens.token_version = self.tokens.get_my_tokens_versioned()
             logger.info(f'Node {self.node_name} assigned {len(self.tokens.my_tokens)} tokens, version {self.tokens.token_version}')
@@ -2569,7 +2566,6 @@ class Job:
         except Exception as e:
             logger.error(f'Token distribution failed: {e}', exc_info=True)
             if self.state_machine.is_initializing():
-                logger.error('Distribution failed during initialization, transitioning to ERROR state')
                 self.state_machine.transition_to(JobState.ERROR)
 
     def _cleanup(self) -> None:

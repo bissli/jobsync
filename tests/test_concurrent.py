@@ -444,8 +444,12 @@ class TestConcurrentCallbackAndRebalance:
                 pass
 
     @clean_tables('Node', 'Token')
-    def test_token_version_changes_missed_during_callback(self, postgres):
-        """Document that token version changes can be missed if callback is slow.
+    def test_callbacks_queued_during_rapid_membership_changes(self, postgres):
+        """Verify callbacks are queued and executed for all membership changes.
+
+        When rapid membership changes occur while a slow callback is executing,
+        the system queues all callback invocations and executes them sequentially.
+        No callbacks are dropped - they're all eventually processed.
         """
         coord_cfg = get_coordination_config()
         tables = schema.get_table_names(coord_cfg.appname)
@@ -453,7 +457,7 @@ class TestConcurrentCallbackAndRebalance:
         version_history = []
 
         def version_tracking_callback():
-            version_history.append(('callback', 0))
+            version_history.append(('callback', time.time()))
             time.sleep(6)
 
         job1 = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
@@ -490,11 +494,17 @@ class TestConcurrentCallbackAndRebalance:
 
             assert len(rebalance_events) >= 4, 'Multiple rebalance-triggering events should occur (nodes joining and leaving)'
 
-            if len(version_history) > 0:
-                assert len(version_history) < len(rebalance_events), \
-                    'Callback invocations should be fewer than rebalance events (some missed due to blocking)'
-            else:
-                logger.warning('No callbacks fired - callback may still be blocked on initial invocation')
+            expected_callbacks = 1 + len(rebalance_events)
+            assert len(version_history) == expected_callbacks, \
+                f'Expected {expected_callbacks} callbacks (1 initial + {len(rebalance_events)} rebalances), got {len(version_history)}'
+
+            callback_timestamps = [ts for _, ts in version_history]
+            for i in range(len(callback_timestamps) - 1):
+                time_diff = callback_timestamps[i + 1] - callback_timestamps[i]
+                assert time_diff >= 5.9, \
+                    f'Callbacks should be queued and executed sequentially (gap: {time_diff:.1f}s between callbacks {i} and {i+1})'
+
+            logger.info('✓ All callbacks queued and executed sequentially despite rapid membership changes')
 
         finally:
             job1.__exit__(None, None, None)
