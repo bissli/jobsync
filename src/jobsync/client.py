@@ -511,6 +511,18 @@ class Task:
         return self.id > other.id
 
 
+def extract_task_id(task: Task | Hashable) -> Hashable:
+    """Extract task ID from Task object or return the ID directly.
+
+    Args:
+        task: Task object or task ID
+
+    Returns
+        Task ID (hashable)
+    """
+    return task.id if isinstance(task, Task) else task
+
+
 # ============================================================
 # PURE STATE MACHINE
 # ============================================================
@@ -1472,29 +1484,30 @@ class TaskManager:
         self.hash_function = hash_function
         self._tasks = []
 
-    def can_claim(self, task: Task, my_tokens: set[int]) -> bool:
+    def can_claim(self, task: Task | Hashable, my_tokens: set[int]) -> bool:
         """Check if task can be claimed based on token ownership.
 
         Args:
-            task: Task to check
+            task: Task object or task ID
             my_tokens: Set of tokens owned by this node
 
         Returns
             True if claimable, False otherwise
         """
-        token_id = task_to_token(task.id, self.total_tokens, self.hash_function)
+        task_id = extract_task_id(task)
+        token_id = task_to_token(task_id, self.total_tokens, self.hash_function)
         can_claim = token_id in my_tokens
 
         if not can_claim:
-            logger.debug(f'Cannot claim task {task.id} (token {token_id} not owned by {self.node_name})')
+            logger.debug(f'Cannot claim task {task_id} (token {token_id} not owned by {self.node_name})')
 
         return can_claim
 
-    def add_task(self, task: Task) -> None:
+    def add_task(self, task: Task | Hashable) -> None:
         """Add task to processing queue.
 
         Args:
-            task: Task to add
+            task: Task object or task ID
         """
         self._tasks.append((task, datetime.datetime.now(datetime.timezone.utc)))
 
@@ -1504,17 +1517,14 @@ class TaskManager:
         Args:
             task: Task object, task ID, or iterable of Task objects/task IDs
         """
-        def extract_id(item):
-            return item.id if isinstance(item, Task) else item
-
         with self.db.engine.connect() as conn:
             if isinstance(task, Iterable) and not isinstance(task, str):
-                rows = [{'node': self.node_name, 'created_on': datetime.datetime.now(datetime.timezone.utc), 'task_id': str(extract_id(i))} for i in task]
+                rows = [{'node': self.node_name, 'created_on': datetime.datetime.now(datetime.timezone.utc), 'task_id': str(extract_task_id(i))} for i in task]
                 for row in rows:
                     sql = f'INSERT INTO {self.db.tables["Claim"]} (node, task_id, created_on) VALUES (:node, :task_id, :created_on) ON CONFLICT DO NOTHING'
                     conn.execute(text(sql), row)
             else:
-                task_id = extract_id(task)
+                task_id = extract_task_id(task)
                 sql = f'INSERT INTO {self.db.tables["Claim"]} (node, task_id, created_on) VALUES (:node, :task_id, :created_on) ON CONFLICT DO NOTHING'
                 conn.execute(text(sql), {'node': self.node_name, 'task_id': str(task_id), 'created_on': datetime.datetime.now(datetime.timezone.utc)})
             conn.commit()
@@ -1527,11 +1537,12 @@ class TaskManager:
 
         with self.db.engine.connect() as conn:
             for task, _ in self._tasks:
+                task_id = extract_task_id(task)
                 sql = f'INSERT INTO {self.db.tables["Audit"]} (date, node, task_id, created_on) VALUES (:date, :node, :task_id, now())'
                 conn.execute(text(sql), {
                     'date': self.date,
                     'node': self.node_name,
-                    'task_id': str(task.id)
+                    'task_id': str(task_id)
                 })
             conn.commit()
 
@@ -2342,17 +2353,18 @@ class Job:
         if self.tasks is not None:
             self.tasks.set_claim(task)
 
-    def add_task(self, task: Task):
+    def add_task(self, task: Task | Hashable):
         """Add task to processing queue if claimable in coordination mode.
 
         Args:
-            task: Task to add
+            task: Task object or task ID
         """
         if self.tasks is None:
             return
 
         if self._coordination_enabled and not self.can_claim_task(task):
-            logger.debug(f'Task {task.id} rejected (token not owned)')
+            task_id = extract_task_id(task)
+            logger.debug(f'Task {task_id} rejected (token not owned)')
             return
 
         self.tasks.add_task(task)
@@ -2374,11 +2386,11 @@ class Job:
             return []
         return self.tasks.get_audit()
 
-    def can_claim_task(self, task: Task) -> bool:
+    def can_claim_task(self, task: Task | Hashable) -> bool:
         """Check if this node can claim the given task.
 
         Args:
-            task: Task to check
+            task: Task object or task ID
 
         Returns
             True if claimable, False otherwise
@@ -2387,7 +2399,8 @@ class Job:
             return True
 
         if not self.state_machine.can_claim_task():
-            logger.debug(f'Cannot claim task {task.id} in state {self.state_machine.state.value}')
+            task_id = extract_task_id(task)
+            logger.debug(f'Cannot claim task {task_id} in state {self.state_machine.state.value}')
             return False
 
         return self.tasks.can_claim(task, self.tokens.my_tokens)

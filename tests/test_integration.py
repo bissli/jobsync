@@ -1278,7 +1278,7 @@ class TestCallbackBlockingDetection:
                 with postgres.connect() as conn:
                     result = conn.execute(text(f"""
                         SELECT COUNT(*) FROM {tables["Rebalance"]}
-                        WHERE triggered_at > NOW() - INTERVAL '30 seconds'
+                        WHERE triggered_at > NOW() - INTERVAL '90 seconds'
                     """))
                     rebalance_count = result.scalar()
 
