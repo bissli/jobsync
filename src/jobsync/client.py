@@ -1491,29 +1491,32 @@ class TaskManager:
         return can_claim
 
     def add_task(self, task: Task) -> None:
-        """Add task to processing queue and set claim.
+        """Add task to processing queue.
 
         Args:
             task: Task to add
         """
         self._tasks.append((task, datetime.datetime.now(datetime.timezone.utc)))
-        self.set_claim(task.id)
 
-    def set_claim(self, item) -> None:
-        """Claim an item or items and publish to database.
+    def set_claim(self, task: Task | Hashable) -> None:
+        """Claim a task or multiple tasks and publish to database.
 
         Args:
-            item: Item ID or iterable of item IDs
+            task: Task object, task ID, or iterable of Task objects/task IDs
         """
+        def extract_id(item):
+            return item.id if isinstance(item, Task) else item
+
         with self.db.engine.connect() as conn:
-            if isinstance(item, Iterable) and not isinstance(item, str):
-                rows = [{'node': self.node_name, 'created_on': datetime.datetime.now(datetime.timezone.utc), 'item': str(i)} for i in item]
+            if isinstance(task, Iterable) and not isinstance(task, str):
+                rows = [{'node': self.node_name, 'created_on': datetime.datetime.now(datetime.timezone.utc), 'task_id': str(extract_id(i))} for i in task]
                 for row in rows:
-                    sql = f'INSERT INTO {self.db.tables["Claim"]} (node, item, created_on) VALUES (:node, :item, :created_on) ON CONFLICT DO NOTHING'
+                    sql = f'INSERT INTO {self.db.tables["Claim"]} (node, task_id, created_on) VALUES (:node, :task_id, :created_on) ON CONFLICT DO NOTHING'
                     conn.execute(text(sql), row)
             else:
-                sql = f'INSERT INTO {self.db.tables["Claim"]} (node, item, created_on) VALUES (:node, :item, :created_on) ON CONFLICT DO NOTHING'
-                conn.execute(text(sql), {'node': self.node_name, 'item': str(item), 'created_on': datetime.datetime.now(datetime.timezone.utc)})
+                task_id = extract_id(task)
+                sql = f'INSERT INTO {self.db.tables["Claim"]} (node, task_id, created_on) VALUES (:node, :task_id, :created_on) ON CONFLICT DO NOTHING'
+                conn.execute(text(sql), {'node': self.node_name, 'task_id': str(task_id), 'created_on': datetime.datetime.now(datetime.timezone.utc)})
             conn.commit()
 
     def write_audit(self) -> None:
@@ -1524,11 +1527,11 @@ class TaskManager:
 
         with self.db.engine.connect() as conn:
             for task, _ in self._tasks:
-                sql = f'INSERT INTO {self.db.tables["Audit"]} (date, node, item, created_on) VALUES (:date, :node, :item, now())'
+                sql = f'INSERT INTO {self.db.tables["Audit"]} (date, node, task_id, created_on) VALUES (:date, :node, :task_id, now())'
                 conn.execute(text(sql), {
                     'date': self.date,
                     'node': self.node_name,
-                    'item': str(task.id)
+                    'task_id': str(task.id)
                 })
             conn.commit()
 
@@ -1541,9 +1544,9 @@ class TaskManager:
         Returns
             List of audit records
         """
-        sql = f'SELECT node, item FROM {self.db.tables["Audit"]} WHERE date = :date'
+        sql = f'SELECT node, task_id FROM {self.db.tables["Audit"]} WHERE date = :date'
         result = self.db.query(sql, {'date': self.date})
-        return [{'node': row[0], 'item': row[1]} for row in result]
+        return [{'node': row[0], 'task_id': row[1]} for row in result]
 
     def cleanup(self) -> None:
         """Cleanup Check and Claim tables.
@@ -2330,14 +2333,14 @@ class Job:
             return self.tokens.token_version
         return 0
 
-    def set_claim(self, item):
-        """Claim an item or items and publish to database.
+    def set_claim(self, task: Task | Hashable):
+        """Claim a task or multiple tasks and publish to database.
 
         Args:
-            item: Item ID or iterable of item IDs
+            task: Task object, task ID, or iterable of Task objects/task IDs
         """
         if self.tasks is not None:
-            self.tasks.set_claim(item)
+            self.tasks.set_claim(task)
 
     def add_task(self, task: Task):
         """Add task to processing queue if claimable in coordination mode.
@@ -2353,6 +2356,7 @@ class Job:
             return
 
         self.tasks.add_task(task)
+        self.set_claim(task)
 
     def write_audit(self) -> None:
         """Write accumulated tasks to audit table.

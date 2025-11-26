@@ -1486,7 +1486,7 @@ class TestBasicDistribution:
             pattern_matcher=exact_match
         )
 
-        counts = {node: 0 for node in nodes}
+        counts = dict.fromkeys(nodes, 0)
         for node in assignments.values():
             counts[node] += 1
 
@@ -1506,7 +1506,7 @@ class TestBasicDistribution:
         average) when deciding whether to move tokens away from current owner.
         """
         current = {
-            **dict.fromkeys(range(0, 55), 'node-a'),
+            **dict.fromkeys(range(55), 'node-a'),
             **dict.fromkeys(range(55, 111), 'node-b'),
             **dict.fromkeys(range(111, 166), 'node-c'),
         }
@@ -1521,7 +1521,7 @@ class TestBasicDistribution:
             pattern_matcher=exact_match
         )
 
-        counts = {node: 0 for node in nodes}
+        counts = dict.fromkeys(nodes, 0)
         for node in assignments.values():
             counts[node] += 1
 
@@ -2529,7 +2529,7 @@ class TestLargeScale:
             pattern_matcher=exact_match
         )
 
-        counts = {node: 0 for node in nodes}
+        counts = dict.fromkeys(nodes, 0)
         for node in assignments.values():
             counts[node] += 1
 
@@ -2745,7 +2745,7 @@ class TestSetClaimEdgeCases:
 
             with postgres.connect() as conn:
                 result = conn.execute(text(f"""
-                    SELECT item FROM {tables["Claim"]} WHERE node = :node ORDER BY item
+                    SELECT task_id FROM {tables["Claim"]} WHERE node = :node ORDER BY task_id
                 """), {'node': 'node1'})
                 items = [row[0] for row in result]
 
@@ -2774,7 +2774,7 @@ class TestSetClaimEdgeCases:
 
             with postgres.connect() as conn:
                 result = conn.execute(text(f"""
-                    SELECT item FROM {tables["Claim"]} WHERE node = :node
+                    SELECT task_id FROM {tables["Claim"]} WHERE node = :node
                 """), {'node': 'node1'})
                 items = [row[0] for row in result]
 
@@ -2801,7 +2801,7 @@ class TestSetClaimEdgeCases:
 
             with postgres.connect() as conn:
                 result = conn.execute(text(f"""
-                    SELECT item FROM {tables["Claim"]} WHERE node = :node
+                    SELECT task_id FROM {tables["Claim"]} WHERE node = :node
                 """), {'node': 'node1'})
                 items = [row[0] for row in result]
 
@@ -2874,7 +2874,7 @@ class TestSetClaimEdgeCases:
 
             with postgres.connect() as conn:
                 result = conn.execute(text(f"""
-                    SELECT item FROM {tables["Claim"]} WHERE node = :node ORDER BY item
+                    SELECT task_id FROM {tables["Claim"]} WHERE node = :node ORDER BY task_id
                 """), {'node': 'node1'})
                 items = [row[0] for row in result]
 
@@ -2899,7 +2899,7 @@ class TestSetClaimEdgeCases:
 
             with postgres.connect() as conn:
                 result = conn.execute(text(f"""
-                    SELECT item FROM {tables["Claim"]} WHERE node = :node ORDER BY item
+                    SELECT task_id FROM {tables["Claim"]} WHERE node = :node ORDER BY task_id
                 """), {'node': 'node1'})
                 items = [row[0] for row in result]
 

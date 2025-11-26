@@ -123,18 +123,18 @@ def test_token_based_task_claiming(postgres):
 
         # Each node claims tasks it owns
         claimed_by_node = {}
-        items = list(range(30))
+        task_ids = list(range(30))
 
         for node in nodes:
             claimed = []
-            for item_id in items:
-                task = create_task(item_id)
+            for task_id in task_ids:
+                task = create_task(task_id)
                 if node.can_claim_task(task):
                     node.add_task(task)
-                    claimed.append(item_id)
+                    claimed.append(task_id)
                     with postgres.connect() as conn:
                         conn.execute(text(f'UPDATE {tables["Inst"]} SET done=TRUE WHERE item=:item'),
-                                   {'item': str(item_id)})
+                                   {'item': str(task_id)})
                         conn.commit()
             claimed_by_node[node.node_name] = claimed
 
@@ -1358,11 +1358,11 @@ class TestDeadNodeTokenRedistribution:
                 'Survivor nodes should sync token caches after rebalancing'
 
             processable_tasks = set()
-            for i in range(30):
-                task = create_task(i)
+            for task_id in range(30):
+                task = create_task(task_id)
                 for node in survivor_nodes:
                     if node.can_claim_task(task):
-                        processable_tasks.add(i)
+                        processable_tasks.add(task_id)
                         break
 
             print(f'Processable tasks: {len(processable_tasks)}/30')
@@ -1372,15 +1372,15 @@ class TestDeadNodeTokenRedistribution:
 
             # Try to actually process all tasks
             processed_by_survivors = set()
-            for i in range(30):
-                task = create_task(i)
+            for task_id in range(30):
+                task = create_task(task_id)
                 for node in survivor_nodes:
                     if node.can_claim_task(task):
                         node.add_task(task)
-                        processed_by_survivors.add(i)
+                        processed_by_survivors.add(task_id)
                         with postgres.connect() as conn:
                             conn.execute(text(f'UPDATE {tables["Inst"]} SET done=TRUE WHERE item=:item'),
-                                        {'item': str(i)})
+                                        {'item': str(task_id)})
                             conn.commit()
                         break
 
@@ -2070,10 +2070,10 @@ class TestLateNodeJoining:
 
                 # Try to claim tasks immediately (should succeed for some)
                 claimed_by_node3 = []
-                for i in range(30):
-                    task = create_task(i)
+                for task_id in range(30):
+                    task = create_task(task_id)
                     if node3.can_claim_task(task):
-                        claimed_by_node3.append(i)
+                        claimed_by_node3.append(task_id)
 
                 # Critical assertion: should be able to claim tasks right away
                 assert len(claimed_by_node3) >= 5, \
@@ -2082,11 +2082,11 @@ class TestLateNodeJoining:
                 # Verify all tasks are claimable by someone
                 all_nodes = initial_nodes + [node3]
                 claimable_by_any = set()
-                for i in range(30):
-                    task = create_task(i)
+                for task_id in range(30):
+                    task = create_task(task_id)
                     for node in all_nodes:
                         if node.can_claim_task(task):
-                            claimable_by_any.add(i)
+                            claimable_by_any.add(task_id)
                             break
 
                 assert len(claimable_by_any) == 30, \

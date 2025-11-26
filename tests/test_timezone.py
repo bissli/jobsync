@@ -376,10 +376,10 @@ class TestDatabaseTimezoneConsistency:
 
             with postgres.connect() as conn:
                 result = conn.execute(text(f"""
-                    SELECT item, created_on
+                    SELECT task_id, created_on
                     FROM {tables["Audit"]}
                     WHERE node = 'audit-tz-test'
-                    ORDER BY item
+                    ORDER BY task_id
                 """))
                 audit_records = [dict(row._mapping) for row in result]
 
@@ -387,7 +387,7 @@ class TestDatabaseTimezoneConsistency:
 
             for record in audit_records:
                 stored_time = record['created_on']
-                logger.info(f"Task {record['item']}: stored as {stored_time}")
+                logger.info(f"Task {record['task_id']}: stored as {stored_time}")
 
                 age_seconds = abs((datetime.datetime.now(datetime.timezone.utc) - stored_time).total_seconds())
                 assert age_seconds < 30, f'Audit timestamp should be recent (age: {age_seconds}s)'
@@ -462,7 +462,7 @@ class TestDatetimeParameterTimezones:
 
                 with postgres.connect() as conn:
                     result = conn.execute(text(f"""
-                        SELECT date, node, item, created_on
+                        SELECT date, node, task_id, created_on
                         FROM {tables["Audit"]}
                         WHERE node = :node
                     """), {'node': f'audit-{label}'})

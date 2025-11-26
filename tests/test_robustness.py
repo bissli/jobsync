@@ -788,7 +788,7 @@ class TestStaleTaskOwnership:
             job.write_audit()
 
             with postgres.connect() as conn:
-                result = conn.execute(text(f'SELECT item FROM {tables["Audit"]} WHERE node = :node'),
+                result = conn.execute(text(f'SELECT task_id FROM {tables["Audit"]} WHERE node = :node'),
                                      {'node': 'node1'})
                 audited_items = [row[0] for row in result]
 

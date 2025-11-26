@@ -32,192 +32,103 @@
 --   sync_rebalance      - Token rebalancing audit log
 --
 -- ============================================================================
-
-\set ON_ERROR_STOP on
-
-\echo ''
-\echo '╔══════════════════════════════════════════════════════════╗'
-\echo '║          JobSync Database Schema Creation                ║'
-\echo '╚══════════════════════════════════════════════════════════╝'
-\echo ''
-
--- ============================================================================
+ \set
+on_error_stop on \echo '' \echo '╔══════════════════════════════════════════════════════════╗' \echo '║          JobSync Database Schema Creation                ║' \echo '╚══════════════════════════════════════════════════════════╝' \echo '' -- ============================================================================
 -- CORE TABLES
 -- ============================================================================
 -- These tables support basic job tracking regardless of coordination mode
-
-\echo 'Creating core tables...'
-\echo ''
-
--- Node registration and heartbeat tracking
+ \echo 'Creating core tables...' \echo '' -- Node registration and heartbeat tracking
 \echo '  → sync_node (worker registration and heartbeat)'
-CREATE TABLE IF NOT EXISTS sync_node (
-    name varchar NOT NULL,
-    created_on timestamp with time zone NOT NULL,
-    last_heartbeat timestamp with time zone,
-    PRIMARY KEY (name)
-);
+create table if not exists sync_node (name varchar not null, created_on timestamp with time zone not null, last_heartbeat timestamp with time zone, primary key (name));
 
-CREATE INDEX IF NOT EXISTS idx_sync_node_heartbeat 
-    ON sync_node(last_heartbeat);
+
+create index if not exists idx_sync_node_heartbeat on sync_node(last_heartbeat);
 
 -- Job execution checkpoints
 \echo '  → sync_checkpoint (job execution checkpoints)'
-CREATE TABLE IF NOT EXISTS sync_checkpoint (
-    node varchar NOT NULL,
-    created_on timestamp with time zone NOT NULL,
-    PRIMARY KEY (node, created_on)
-);
+create table if not exists sync_checkpoint (node varchar not null, created_on timestamp with time zone not null, primary key (node, created_on));
 
 -- Completed task audit log
 \echo '  → sync_audit (completed task tracking)'
-CREATE TABLE IF NOT EXISTS sync_audit (
-    created_on timestamp with time zone NOT NULL,
-    node varchar NOT NULL,
-    item varchar NOT NULL,
-    date date NOT NULL
-);
+create table if not exists sync_audit (created_on timestamp with time zone not null, node varchar not null, task_id varchar not null, date date not null);
 
-CREATE INDEX IF NOT EXISTS idx_sync_audit_date_item 
-    ON sync_audit(date, item);
+
+create index if not exists idx_sync_audit_date_task_id on sync_audit(date, task_id);
 
 -- Task claim tracking
 \echo '  → sync_claim (tasks claimed by workers)'
-CREATE TABLE IF NOT EXISTS sync_claim (
-    node varchar NOT NULL,
-    item varchar NOT NULL,
-    created_on timestamp with time zone NOT NULL,
-    PRIMARY KEY (node, item)
-);
+create table if not exists sync_claim (node varchar not null, task_id varchar not null, created_on timestamp with time zone not null, primary key (node, task_id));
 
-\echo ''
-\echo 'Core tables created successfully.'
-\echo ''
-
--- ============================================================================
+\echo '' \echo 'Core tables created successfully.' \echo '' -- ============================================================================
 -- COORDINATION TABLES
 -- ============================================================================
 -- These tables enable distributed coordination and load balancing
-
-\echo 'Creating coordination tables...'
-\echo ''
-
--- Token ownership for task distribution
+ \echo 'Creating coordination tables...' \echo '' -- Token ownership for task distribution
 \echo '  → sync_token (token ownership assignments)'
-CREATE TABLE IF NOT EXISTS sync_token (
-    token_id integer NOT NULL,
-    node varchar NOT NULL,
-    assigned_at timestamp with time zone NOT NULL,
-    version integer NOT NULL DEFAULT 1,
-    PRIMARY KEY (token_id)
-);
+create table if not exists sync_token (token_id integer not null, node varchar not null, assigned_at timestamp with time zone not null, version integer not null default 1, primary key (token_id));
 
-CREATE INDEX IF NOT EXISTS idx_sync_token_node 
-    ON sync_token(node);
 
-CREATE INDEX IF NOT EXISTS idx_sync_token_assigned 
-    ON sync_token(assigned_at);
+create index if not exists idx_sync_token_node on sync_token(node);
 
-CREATE INDEX IF NOT EXISTS idx_sync_token_version 
-    ON sync_token(version);
+
+create index if not exists idx_sync_token_assigned on sync_token(assigned_at);
+
+
+create index if not exists idx_sync_token_version on sync_token(version);
 
 -- Task locking to specific node patterns
 \echo '  → sync_lock (task pinning to specific nodes)'
-CREATE TABLE IF NOT EXISTS sync_lock (
-    task_id varchar NOT NULL,
-    node_patterns jsonb NOT NULL,
-    reason varchar,
-    created_at timestamp with time zone NOT NULL,
-    created_by varchar NOT NULL,
-    expires_at timestamp with time zone,
-    PRIMARY KEY (task_id)
-);
+create table if not exists sync_lock (task_id varchar not null, node_patterns jsonb not null, reason varchar, created_at timestamp with time zone not null, created_by varchar not null, expires_at timestamp with time zone, primary key (task_id));
 
-CREATE INDEX IF NOT EXISTS idx_sync_lock_created_by 
-    ON sync_lock(created_by);
 
-CREATE INDEX IF NOT EXISTS idx_sync_lock_expires 
-    ON sync_lock(expires_at) 
-    WHERE expires_at IS NOT NULL;
+create index if not exists idx_sync_lock_created_by on sync_lock(created_by);
+
+
+create index if not exists idx_sync_lock_expires on sync_lock(expires_at)
+where expires_at is not null;
 
 -- Leader election lock (singleton table)
 \echo '  → sync_leader_lock (leader election lock)'
-CREATE TABLE IF NOT EXISTS sync_leader_lock (
-    singleton integer PRIMARY KEY DEFAULT 1,
-    node varchar NOT NULL,
-    acquired_at timestamp with time zone NOT NULL,
-    operation varchar NOT NULL,
-    CHECK (singleton = 1)
-);
+create table if not exists sync_leader_lock (singleton integer primary key default 1, node varchar not null, acquired_at timestamp with time zone not null, operation varchar not null, check (singleton = 1));
 
 -- Rebalancing coordination lock (singleton table)
 \echo '  → sync_rebalance_lock (rebalancing coordination lock)'
-CREATE TABLE IF NOT EXISTS sync_rebalance_lock (
-    singleton integer PRIMARY KEY DEFAULT 1,
-    in_progress boolean NOT NULL DEFAULT false,
-    started_at timestamp with time zone,
-    started_by varchar,
-    CHECK (singleton = 1)
-);
+create table if not exists sync_rebalance_lock (singleton integer primary key default 1, in_progress boolean not null default false, started_at timestamp with time zone, started_by varchar, check (singleton = 1));
 
 -- Initialize rebalance lock
 \echo '  → Initializing sync_rebalance_lock'
-INSERT INTO sync_rebalance_lock (singleton, in_progress)
-VALUES (1, false)
-ON CONFLICT (singleton) DO NOTHING;
+insert into sync_rebalance_lock (singleton, in_progress)
+values (1, false) on conflict (singleton) do nothing;
 
 -- Rebalancing audit log
 \echo '  → sync_rebalance (token rebalancing audit log)'
-CREATE TABLE IF NOT EXISTS sync_rebalance (
-    id serial PRIMARY KEY,
-    triggered_at timestamp with time zone NOT NULL,
-    trigger_reason varchar NOT NULL,
-    leader_node varchar NOT NULL,
-    nodes_before integer NOT NULL,
-    nodes_after integer NOT NULL,
-    tokens_moved integer NOT NULL,
-    duration_ms integer
-);
+create table if not exists sync_rebalance (id serial primary key, triggered_at timestamp with time zone not null, trigger_reason varchar not null, leader_node varchar not null, nodes_before integer not null, nodes_after integer not null, tokens_moved integer not null, duration_ms integer);
 
-CREATE INDEX IF NOT EXISTS idx_sync_rebalance_triggered 
-    ON sync_rebalance(triggered_at DESC);
 
-\echo ''
-\echo 'Coordination tables created successfully.'
-\echo ''
+create index if not exists idx_sync_rebalance_triggered on sync_rebalance(triggered_at desc);
 
--- ============================================================================
+\echo '' \echo 'Coordination tables created successfully.' \echo '' -- ============================================================================
 -- VERIFICATION
 -- ============================================================================
-
-\echo '╔══════════════════════════════════════════════════════════╗'
-\echo '║                Schema Verification                       ║'
-\echo '╚══════════════════════════════════════════════════════════╝'
-\echo ''
-
-\echo 'Verifying all tables exist...'
-\echo ''
-
-SELECT 
+ \echo '╔══════════════════════════════════════════════════════════╗' \echo '║                Schema Verification                       ║' \echo '╚══════════════════════════════════════════════════════════╝' \echo '' \echo 'Verifying all tables exist...' \echo ''
+select
     table_name,
-    CASE 
-        WHEN table_name IN (
-            'sync_node', 'sync_checkpoint', 'sync_audit', 'sync_claim',
-            'sync_token', 'sync_lock', 'sync_leader_lock', 
-            'sync_rebalance_lock', 'sync_rebalance'
-        ) THEN '✓'
-        ELSE '✗'
-    END as status
-FROM information_schema.tables
-WHERE table_schema = 'public'
-  AND table_name LIKE 'sync_%'
-ORDER BY table_name;
+    case
+        when table_name IN (
+                                'sync_node',
+                                'sync_checkpoint',
+                                'sync_audit',
+                                'sync_claim',
+                                'sync_token',
+                                'sync_lock',
+                                'sync_leader_lock',
+                                'sync_rebalance_lock',
+                                'sync_rebalance') then '✓'
+        else '✗'
+    end as status
+from information_schema.tables
+where table_schema = 'public'
+    and table_name LIKE 'sync_%'
+order by table_name;
 
-\echo ''
-\echo 'Schema creation complete!'
-\echo ''
-\echo 'Next steps:'
-\echo '  1. Verify tables were created: \dt sync_*'
-\echo '  2. Check indexes: \di sync_*'
-\echo '  3. Start your JobSync workers'
-\echo ''
+\echo '' \echo 'Schema creation complete!' \echo '' \echo 'Next steps:' \echo '  1. Verify tables were created: \dt sync_*' \echo '  2. Check indexes: \di sync_*' \echo '  3. Start your JobSync workers' \echo ''

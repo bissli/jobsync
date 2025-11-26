@@ -1016,18 +1016,18 @@ def insert_lock(
         conn.commit()
 
 
-def insert_inst(postgres, tables: dict, item: str, done: bool = False) -> None:
+def insert_inst(postgres, tables: dict, task_id: str, done: bool = False) -> None:
     """Insert test task record into Inst table.
 
     Args:
         postgres: postgres fixture
         tables: Table name dict
-        item: Task item identifier
+        task_id: Task identifier
         done: Task completion status
     """
     with postgres.connect() as conn:
-        conn.execute(text(f'INSERT INTO {tables["Inst"]} (item, done) VALUES (:item, :done)'),
-                    {'item': item, 'done': done})
+        conn.execute(text(f'INSERT INTO {tables["Inst"]} (item, done) VALUES (:task_id, :done)'),
+                    {'task_id': task_id, 'done': done})
         conn.commit()
 
 

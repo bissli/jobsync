@@ -96,19 +96,19 @@ CREATE TABLE IF NOT EXISTS {Check} (
 CREATE TABLE IF NOT EXISTS {Audit} (
     created_on timestamp with time zone not null,
     node varchar not null,
-    item varchar not null,
+    task_id varchar not null,
     date date not null
 );
         """))
 
-        conn.execute(text(f'CREATE INDEX IF NOT EXISTS idx_{Audit}_date_item ON {Audit}(date, item)'))
+        conn.execute(text(f'CREATE INDEX IF NOT EXISTS idx_{Audit}_date_task_id ON {Audit}(date, task_id)'))
 
         conn.execute(text(f"""
 CREATE TABLE IF NOT EXISTS {Claim} (
     node varchar not null,
-    item varchar not null,
+    task_id varchar not null,
     created_on timestamp with time zone not null,
-    primary key (node, item)
+    primary key (node, task_id)
 );
         """))
 
