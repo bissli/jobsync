@@ -8,21 +8,15 @@ USE THIS FILE FOR:
 - Simultaneous operation tests
 """
 import datetime
-import logging
 import threading
 import time
 
 import pytest
+from fixtures import *  # noqa: F401, F403
+from sqlalchemy import text
 
 from jobsync import schema
-from jobsync.client import CoordinationConfig, JobState
-
-logger = logging.getLogger(__name__)
-
-
-from fixtures import *  # noqa: F401, F403
-
-logger = logging.getLogger(__name__)
+from jobsync.client import CoordinationConfig, JobState, Task
 
 
 class TestMonitorRaceConditions:
@@ -56,8 +50,6 @@ class TestMonitorRaceConditions:
             assert wait_for_dead_node_removal(postgres, tables, 'stale-node', timeout_sec=10)
 
             assert job.am_i_healthy(), 'Leader should remain healthy'
-
-            logger.info('✓ Dead node detection worked concurrently with token refresh')
 
         finally:
             job.__exit__(None, None, None)
@@ -110,8 +102,6 @@ class TestPromotionDemotionRaceConditions:
 
             assert node2.am_i_healthy(), 'Promoted node should be healthy'
 
-            logger.info('✓ Promotion during monitoring activity successful')
-
         finally:
             try:
                 node2.__exit__(None, None, None)
@@ -145,8 +135,6 @@ class TestPromotionDemotionRaceConditions:
             for monitor in leader_monitors_before:
                 assert monitor._stop_requested, \
                     f'{monitor.name} should be stopped immediately after demotion'
-
-            logger.info('✓ Demotion stopped monitors immediately')
 
         finally:
             job.__exit__(None, None, None)
@@ -187,15 +175,13 @@ class TestConcurrentDistributionEvents:
             assert wait_for_dead_node_removal(postgres, tables, 'dead-node', timeout_sec=10)
 
             insert_active_node(postgres, tables, 'node3',
-                             created_on=now + datetime.timedelta(seconds=3))
+                               created_on=now + datetime.timedelta(seconds=3))
 
             time.sleep(3)
 
             assert distribution_count[0] >= 1, \
                 'Distribution should be called for concurrent events'
             assert job.am_i_healthy(), 'Leader should remain healthy'
-
-            logger.info('✓ Concurrent membership and dead node events handled')
 
         finally:
             job._distribute_tokens_safe = original_distribute
@@ -221,9 +207,6 @@ class TestConcurrentStateTransitions:
             assert wait_for_running_state(job, timeout_sec=10)
             initial_state = job.state_machine.state
 
-            logger.info(f'Initial state: {initial_state}')
-
-            # Attempt concurrent transitions from multiple threads
             results = []
             errors = []
 
@@ -287,9 +270,6 @@ class TestConcurrentStateTransitions:
             successful_transitions = [r for r in results if r[2]]
             assert len(successful_transitions) > 0, 'At least one transition should succeed'
 
-            logger.info(f'✓ Concurrent transitions handled safely: {initial_state} -> {final_state}')
-            logger.info(f'  Successful transitions: {len(successful_transitions)}/{len(results)}')
-
         finally:
             job.__exit__(None, None, None)
 
@@ -321,16 +301,12 @@ class TestConcurrentCallbackAndRebalance:
 
             assert wait_for(lambda: any(s[0] == 'started' for s in callback_states), timeout_sec=5)
 
-            logger.info('Initial callback started, triggering rebalance...')
-
             job2 = create_job('node2', postgres, coordination_config=coord_cfg, wait_on_enter=10)
             job2.__enter__()
 
             try:
                 assert wait_for(lambda: len(job2.my_tokens) >= 1, timeout_sec=15)
                 assert wait_for_rebalance(postgres, tables, min_count=1, timeout_sec=20)
-
-                logger.info(f'Callback states: {callback_states}')
 
                 assert len(callback_states) >= 2, 'Multiple callback invocations expected'
 
@@ -355,7 +331,7 @@ class TestConcurrentCallbackAndRebalance:
             callback_active.append(False)
 
         job1 = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
-                  on_rebalance=blocking_callback)
+                          on_rebalance=blocking_callback)
         job1.__enter__()
 
         try:
@@ -370,7 +346,6 @@ class TestConcurrentCallbackAndRebalance:
 
                 if i == 0:
                     assert wait_for(lambda: len(callback_active) >= 1, timeout_sec=5)
-                    logger.info('Callback started, continuing to add nodes...')
 
             for temp in temp_nodes:
                 temp.__exit__(None, None, None)
@@ -384,8 +359,6 @@ class TestConcurrentCallbackAndRebalance:
                     WHERE triggered_at > NOW() - INTERVAL '30 seconds'
                 """))
                 rebalance_count = result.scalar()
-
-            logger.info(f'Rebalances despite blocking callback: {rebalance_count}')
 
             assert rebalance_count >= 4, 'All membership changes should trigger rebalances'
 
@@ -412,7 +385,7 @@ class TestConcurrentCallbackAndRebalance:
 
         job1 = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=5)
         job2 = create_job('node2', postgres, coordination_config=coord_cfg, wait_on_enter=5,
-                  on_rebalance=slow_callback)
+                          on_rebalance=slow_callback)
 
         job1.__enter__()
         time.sleep(0.5)
@@ -423,9 +396,7 @@ class TestConcurrentCallbackAndRebalance:
             assert wait_for_state(job2, JobState.RUNNING_FOLLOWER, timeout_sec=10)
 
             assert wait_for(lambda: any('callback_start' in str(e) for e in callback_events),
-                          timeout_sec=5)
-
-            logger.info('Callback started on node2, killing node1...')
+                            timeout_sec=5)
 
             simulate_node_crash(job1, cleanup=True)
 
@@ -433,9 +404,6 @@ class TestConcurrentCallbackAndRebalance:
 
             assert wait_for_state(job2, JobState.RUNNING_LEADER, timeout_sec=15), \
                 'node2 should be promoted despite slow callback'
-
-            logger.info(f'Callback events: {callback_events}')
-            logger.info('Leadership change occurred during callback execution')
 
         finally:
             try:
@@ -461,15 +429,13 @@ class TestConcurrentCallbackAndRebalance:
             time.sleep(6)
 
         job1 = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
-                  on_rebalance=version_tracking_callback)
+                          on_rebalance=version_tracking_callback)
         job1.__enter__()
 
         try:
             assert wait_for_running_state(job1, timeout_sec=10)
             initial_tokens = len(job1.my_tokens)
             initial_version = job1.token_version
-
-            logger.info(f'Initial: {initial_tokens} tokens, v{initial_version}')
 
             temp_nodes = []
             for i in range(3):
@@ -487,11 +453,6 @@ class TestConcurrentCallbackAndRebalance:
             events = job1._event_queue.get_history()
             rebalance_events = [e for e in events if 'membership' in e.type or 'dead_nodes' in e.type]
 
-            logger.info(f'Coordination events: {[e.type for e in events]}')
-            logger.info(f'Rebalance-triggering events: {len(rebalance_events)}')
-            logger.info(f'Callback invocations: {len(version_history)}')
-            logger.info(f'Final job1 version: v{job1.token_version}')
-
             assert len(rebalance_events) >= 4, 'Multiple rebalance-triggering events should occur (nodes joining and leaving)'
 
             expected_callbacks = 1 + len(rebalance_events)
@@ -504,8 +465,6 @@ class TestConcurrentCallbackAndRebalance:
                 assert time_diff >= 5.9, \
                     f'Callbacks should be queued and executed sequentially (gap: {time_diff:.1f}s between callbacks {i} and {i+1})'
 
-            logger.info('✓ All callbacks queued and executed sequentially despite rapid membership changes')
-
         finally:
             job1.__exit__(None, None, None)
             for temp in temp_nodes:
@@ -513,6 +472,117 @@ class TestConcurrentCallbackAndRebalance:
                     temp.__exit__(None, None, None)
                 except:
                     pass
+
+
+class TestClaimAndAuditOperations:
+    """Test claim and audit table operations with Task objects."""
+
+    @clean_tables('Node', 'Token', 'Claim')
+    def test_set_claim_accepts_task_objects(self, postgres):
+        """Verify set_claim works with both Task objects and raw task IDs.
+        """
+        coord_cfg = get_coordination_config(total_tokens=10)
+        job = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10)
+        job.__enter__()
+
+        try:
+            assert wait_for_running_state(job, timeout_sec=10)
+
+            job.set_claim(Task('BBG123'))
+            job.set_claim('BBG456')
+
+            tables = schema.get_table_names(coord_cfg.appname)
+            with postgres.connect() as conn:
+                result = conn.execute(text(
+                    f'SELECT node, task_id FROM {tables["Claim"]} ORDER BY task_id'
+                ))
+                rows = result.fetchall()
+
+            assert len(rows) == 2, f'Expected 2 claim rows, got {len(rows)}'
+            assert rows[0][1] == 'BBG123'
+            assert rows[1][1] == 'BBG456'
+            assert all(row[0] == 'node1' for row in rows)
+
+        finally:
+            job.__exit__(None, None, None)
+
+    @clean_tables('Node', 'Token', 'Claim')
+    def test_multi_node_add_task_during_coordination(self, postgres):
+        """Verify multiple nodes can add_task concurrently without errors.
+        """
+        coord_cfg = get_coordination_config(total_tokens=20)
+
+        with cluster(postgres, 'node1', 'node2', total_tokens=20) as nodes:
+            assert wait_for_cluster_running(nodes, timeout_sec=15)
+
+            for i in range(10):
+                task = Task(i * 2)
+                if nodes[0].can_claim_task(task):
+                    nodes[0].add_task(task)
+                elif nodes[1].can_claim_task(task):
+                    nodes[1].add_task(task)
+
+            for i in range(10):
+                task = Task(i * 2 + 1)
+                if nodes[1].can_claim_task(task):
+                    nodes[1].add_task(task)
+                elif nodes[0].can_claim_task(task):
+                    nodes[0].add_task(task)
+
+            tables = schema.get_table_names(coord_cfg.appname)
+            with postgres.connect() as conn:
+                result = conn.execute(text(
+                    f'SELECT COUNT(*) FROM {tables["Claim"]}'
+                ))
+                claim_count = result.scalar()
+
+            assert claim_count > 0, 'At least some claims should be written'
+
+            assert nodes[0].am_i_healthy()
+            assert nodes[1].am_i_healthy()
+
+
+class TestCallbackTiming:
+    """Test callback timing relative to job lifecycle."""
+
+    @clean_tables('Node', 'Token')
+    def test_initial_rebalance_callback_fires_after_enter(self, postgres):
+        """Verify initial on_rebalance fires after __enter__ within expected interval.
+        """
+        tracker = CallbackTracker()
+        coord_cfg = get_coordination_config(
+            total_tokens=10,
+            token_refresh_initial_interval_sec=2,
+        )
+
+        enter_time = None
+        job = create_job(
+            'node1', postgres,
+            coordination_config=coord_cfg,
+            wait_on_enter=10,
+            on_rebalance=tracker.on_rebalance,
+        )
+
+        enter_time = time.time()
+        job.__enter__()
+
+        try:
+            assert wait_for_state(job, JobState.RUNNING_LEADER, timeout_sec=10)
+
+            timeout = coord_cfg.token_refresh_initial_interval_sec + 5
+            assert wait_for(
+                lambda: len(tracker.rebalance_calls) >= 1,
+                timeout_sec=timeout,
+            ), f'Initial rebalance callback not fired within {timeout}s'
+
+            first_callback_time = tracker.rebalance_calls[0]
+            assert first_callback_time >= enter_time, (
+                'Callback fired before __enter__ returned '
+                f'(enter={enter_time:.3f}, callback={first_callback_time:.3f})'
+            )
+
+        finally:
+            job.__exit__(None, None, None)
 
 
 if __name__ == '__main__':
