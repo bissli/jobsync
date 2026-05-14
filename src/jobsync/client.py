@@ -1126,6 +1126,35 @@ class LockManager:
         self.stale_leader_lock_age = coord_config.stale_leader_lock_age_sec
         self.stale_rebalance_lock_age = coord_config.stale_rebalance_lock_age_sec
 
+    def _lock_upsert_sql(self) -> str:
+        """Build the upsert SQL statement for the Lock table.
+        """
+        return f"""
+        INSERT INTO {self.db.tables["Lock"]}
+        (task_id, node_patterns, reason, created_at, created_by, expires_at)
+        VALUES (:task_id, :patterns, :reason, NOW(), :created_by, :expires_at)
+        ON CONFLICT (task_id) DO UPDATE
+        SET node_patterns = EXCLUDED.node_patterns,
+            reason = EXCLUDED.reason,
+            created_at = EXCLUDED.created_at,
+            created_by = EXCLUDED.created_by,
+            expires_at = EXCLUDED.expires_at
+        """
+
+    def _build_lock_row(self, task_id: Hashable, node_patterns: str | list[str],
+                        reason: str, expires_at: datetime.datetime | None) -> dict:
+        """Build a parameter row for the Lock upsert SQL.
+        """
+        if isinstance(node_patterns, str):
+            node_patterns = [node_patterns]
+        return {
+            'task_id': str(task_id),
+            'patterns': json.dumps(node_patterns),
+            'reason': reason,
+            'created_by': self.node_name,
+            'expires_at': expires_at,
+            }
+
     def register_lock(self, task_id: Hashable, node_patterns: str | list[str], reason: str = None,
                       expires_in_days: int = None) -> None:
         """Register lock to pin task to specific node patterns.
@@ -1139,33 +1168,13 @@ class LockManager:
             reason: Human-readable reason for lock
             expires_in_days: Optional expiration in days
         """
-        if isinstance(node_patterns, str):
-            node_patterns = [node_patterns]
-
         expires_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
             days=expires_in_days) if expires_in_days else None
 
-        sql = f"""
-        INSERT INTO {self.db.tables["Lock"]}
-        (task_id, node_patterns, reason, created_at, created_by, expires_at)
-        VALUES (:task_id, :patterns, :reason, NOW(), :created_by, :expires_at)
-        ON CONFLICT (task_id) DO UPDATE
-        SET node_patterns = EXCLUDED.node_patterns,
-            reason = EXCLUDED.reason,
-            created_at = EXCLUDED.created_at,
-            created_by = EXCLUDED.created_by,
-            expires_at = EXCLUDED.expires_at
-        """
+        row = self._build_lock_row(task_id, node_patterns, reason, expires_at)
+        self.db.execute(self._lock_upsert_sql(), row)
 
-        self.db.execute(sql, {
-            'task_id': str(task_id),
-            'patterns': json.dumps(node_patterns),
-            'reason': reason,
-            'created_by': self.node_name,
-            'expires_at': expires_at
-        })
-
-        logger.debug(f'Registered lock: task {task_id} -> patterns {node_patterns}')
+        logger.debug(f'Registered lock: task {task_id} -> patterns {row["patterns"]}')
 
     @log_duration('register_locks_bulk')
     def register_locks_bulk(self, locks: list[tuple[Hashable, str | list[str], str]]) -> None:
@@ -1180,31 +1189,10 @@ class LockManager:
         if not locks:
             return
 
-        rows = []
-        for task_id, node_patterns, reason in locks:
-            if isinstance(node_patterns, str):
-                node_patterns = [node_patterns]
+        rows = [self._build_lock_row(task_id, node_patterns, reason, None)
+                for task_id, node_patterns, reason in locks]
 
-            rows.append({
-                'task_id': str(task_id),
-                'patterns': json.dumps(node_patterns),
-                'reason': reason,
-                'created_by': self.node_name,
-                'expires_at': None
-            })
-
-        sql = f"""
-        INSERT INTO {self.db.tables["Lock"]}
-        (task_id, node_patterns, reason, created_at, created_by, expires_at)
-        VALUES (:task_id, :patterns, :reason, NOW(), :created_by, :expires_at)
-        ON CONFLICT (task_id) DO UPDATE
-        SET node_patterns = EXCLUDED.node_patterns,
-            reason = EXCLUDED.reason,
-            created_at = EXCLUDED.created_at,
-            created_by = EXCLUDED.created_by,
-            expires_at = EXCLUDED.expires_at
-        """
-
+        sql = self._lock_upsert_sql()
         with self.db.engine.connect() as conn:
             for row in rows:
                 conn.execute(text(sql), row)
