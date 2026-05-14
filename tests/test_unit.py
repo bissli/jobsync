@@ -9,6 +9,7 @@ USE THIS FILE FOR:
 - Edge case handling for individual methods
 """
 import logging
+import threading
 import time
 
 import pytest
@@ -475,6 +476,59 @@ class TestTransitionValidation:
             sm.state = from_state
             result = sm.transition_to(to_state)
             assert result, f'Transition {from_state.value} -> {to_state.value} should be valid'
+
+
+class TestTransitionThreadSafety:
+    """Verify transition_to is atomic across threads.
+    """
+
+    def test_concurrent_identical_transitions_fire_exit_callback_once(self):
+        """Two threads racing the same transition must only fire on_exit once.
+
+        Without a mutex around transition_to, both threads can read the
+        source state, both pass validation, and both fire the on_exit
+        callback before either updates self.state. The user-visible symptom
+        is duplicate on_exit invocations for a single logical transition.
+
+        With a mutex, the second thread either sees the new state (no-op
+        short circuit) or races to a different valid transition - but the
+        on_exit for the original state fires at most once.
+        """
+        sm = JobStateMachine()
+        sm.transition_to(JobState.CLUSTER_FORMING)
+        sm.transition_to(JobState.ELECTING)
+        sm.transition_to(JobState.DISTRIBUTING)
+
+        exit_fires = []
+        exit_lock = threading.Lock()
+        interleave_barrier = threading.Barrier(2, timeout=2.0)
+
+        def on_exit_distributing():
+            with exit_lock:
+                exit_fires.append(threading.get_ident())
+            try:
+                interleave_barrier.wait()
+            except threading.BrokenBarrierError:
+                pass
+
+        sm.on_exit(JobState.DISTRIBUTING, on_exit_distributing)
+
+        def attempt():
+            sm.transition_to(JobState.RUNNING_LEADER)
+
+        t1 = threading.Thread(target=attempt)
+        t2 = threading.Thread(target=attempt)
+        t1.start()
+        t2.start()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+
+        assert len(exit_fires) == 1, (
+            f'on_exit(DISTRIBUTING) fired {len(exit_fires)} times under '
+            f'concurrent transition_to(RUNNING_LEADER); expected exactly 1. '
+            f'Indicates check-then-act race in transition_to.'
+            )
+        assert sm.state == JobState.RUNNING_LEADER
 
 
 class TestEventQueue:

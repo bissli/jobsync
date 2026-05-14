@@ -554,6 +554,7 @@ class JobStateMachine:
         self._on_enter_callbacks = {}
         self._on_exit_callbacks = {}
         self._valid_transitions = {}
+        self._lock = threading.RLock()
         self._setup_transition_graph()
 
     def _setup_transition_graph(self) -> None:
@@ -616,25 +617,26 @@ class JobStateMachine:
         Returns
             True if transition succeeded, False if invalid
         """
-        if self.state == new_state:
+        with self._lock:
+            if self.state == new_state:
+                return True
+
+            valid_next_states = self._valid_transitions.get(self.state, set())
+            if new_state not in valid_next_states:
+                logger.error(f'Invalid transition: {self.state.value} -> {new_state.value}')
+                return False
+
+            logger.info(f'State transition: {self.state.value} -> {new_state.value}')
+
+            if self.state in self._on_exit_callbacks:
+                self._on_exit_callbacks[self.state]()
+
+            self.state = new_state
+
+            if new_state in self._on_enter_callbacks:
+                self._on_enter_callbacks[new_state]()
+
             return True
-
-        valid_next_states = self._valid_transitions.get(self.state, set())
-        if new_state not in valid_next_states:
-            logger.error(f'Invalid transition: {self.state.value} -> {new_state.value}')
-            return False
-
-        logger.info(f'State transition: {self.state.value} -> {new_state.value}')
-
-        if self.state in self._on_exit_callbacks:
-            self._on_exit_callbacks[self.state]()
-
-        self.state = new_state
-
-        if new_state in self._on_enter_callbacks:
-            self._on_enter_callbacks[new_state]()
-
-        return True
 
     def is_leader(self) -> bool:
         """Check if in leader state.
