@@ -897,12 +897,16 @@ class TokenDistributor:
         self._pending_callbacks = []
         self._executor_shutdown = False
 
-    def distribute(self, lock_manager: 'LockManager', cluster: ClusterCoordinator) -> None:
+    def distribute(self, lock_manager: 'LockManager', cluster: ClusterCoordinator,
+                   trigger_reason: str = 'distribution') -> None:
         """Distribute tokens using minimal-move algorithm.
 
         Args:
             lock_manager: Lock manager for fetching active locks
             cluster: Cluster coordinator for active nodes
+            trigger_reason: What caused this distribution (e.g.
+                'initial_distribution', 'dead_nodes', 'membership_change');
+                recorded in the rebalance audit row.
         """
         start_time = time.time()
 
@@ -972,7 +976,7 @@ class TokenDistributor:
             conn.commit()
 
         duration_ms = int((time.time() - start_time) * 1000)
-        self._log_rebalance('distribution', len(active_node_names), len(active_node_names), tokens_moved, duration_ms)
+        self._log_rebalance(trigger_reason, len(active_node_names), len(active_node_names), tokens_moved, duration_ms)
 
         logger.info(f'Token distribution complete: {len(new_assignments)} tokens across {nodes_count} nodes, '
                     f'{tokens_moved} moved, v{new_version}, {duration_ms}ms')
@@ -2098,7 +2102,7 @@ class Job:
                 nodes_before_distribution = self.cluster.get_active_nodes()
                 self._nodes_at_distribution = len(nodes_before_distribution)
                 logger.info(f'Node count at distribution: {self._nodes_at_distribution}')
-                self._distribute_tokens_safe()
+                self._distribute_tokens_safe('initial_distribution')
             else:
                 logger.info(f'Follower node detected, waiting for leader {self._elected_leader} to distribute tokens')
         except Exception:
@@ -2212,13 +2216,13 @@ class Job:
             elif event.type == 'dead_nodes_detected':
                 if self.state_machine.is_leader():
                     logger.info(f'Dead nodes: {event.data.get("nodes")}, rebalancing')
-                    self._distribute_tokens_safe()
+                    self._distribute_tokens_safe('dead_nodes')
 
             elif event.type == 'membership_changed':
                 if self.state_machine.is_leader():
                     data = event.data
                     logger.info(f'Membership: {data.get("previous_count")} → {data.get("current_count")}')
-                    self._distribute_tokens_safe()
+                    self._distribute_tokens_safe('membership_change')
 
     def _wait_for_enter_time_and_minimum_nodes(self) -> bool:
         """Wait for cluster formation grace period and verify minimum nodes reached.
@@ -2566,12 +2570,16 @@ class Job:
             JobState.RUNNING_LEADER
         }
 
-    def _distribute_tokens_safe(self) -> None:
+    def _distribute_tokens_safe(self, trigger_reason: str = 'distribution') -> None:
         """Leader distributes tokens with rebalance and leader lock protection.
 
         Acquires locks in order to prevent deadlock:
         1. rebalance_lock - coarse-grained "who's rebalancing"
         2. leader_lock - fine-grained "which leader is distributing"
+
+        Args:
+            trigger_reason: What caused this distribution, propagated to the
+                rebalance audit row.
         """
         if self.locks is None or self.tokens is None or self.cluster is None:
             return
@@ -2579,7 +2587,7 @@ class Job:
         try:
             with self.locks.acquire_rebalance_lock('token_distribution'):
                 with self.locks.acquire_leader_lock('distribute'):
-                    self.tokens.distribute(self.locks, self.cluster)
+                    self.tokens.distribute(self.locks, self.cluster, trigger_reason)
         except LockNotAcquired as e:
             logger.debug(f'Could not acquire lock for token distribution: {e}')
         except Exception as e:

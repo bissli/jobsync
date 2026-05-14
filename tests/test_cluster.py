@@ -1302,18 +1302,16 @@ class TestDeadNodeTokenRedistribution:
             assert wait_for_dead_node_removal(postgres, tables, 'node2', timeout_sec=20)
             print('node2 removed from database')
 
-            assert wait_for_rebalance(postgres, tables, min_count=1, timeout_sec=20)
+            def has_dead_nodes_rebalance() -> bool:
+                with postgres.connect() as conn:
+                    return conn.execute(text(f"""
+                        SELECT COUNT(*) FROM {tables["Rebalance"]}
+                        WHERE triggered_at > NOW() - INTERVAL '30 seconds'
+                        AND trigger_reason = 'dead_nodes'
+                    """)).scalar() >= 1
 
-            # Check if rebalancing occurred
-            with postgres.connect() as conn:
-                result = conn.execute(text(f"""
-                    SELECT COUNT(*) FROM {tables["Rebalance"]}
-                    WHERE triggered_at > NOW() - INTERVAL '20 seconds'
-                    AND trigger_reason = 'distribution'
-                """))
-                recent_rebalances = result.scalar()
-
-            print(f'Recent rebalances: {recent_rebalances}')
+            assert wait_for(has_dead_nodes_rebalance, timeout_sec=20), \
+                'Rebalance audit should record dead_nodes as trigger reason'
 
             # Wait for node2's tokens to be fully cleared from database
             start = time.time()
@@ -2012,17 +2010,17 @@ class TestLateNodeJoining:
 
                 time.sleep(6)
 
-                # Verify rebalancing was triggered
+                # Verify rebalancing was triggered with the correct reason
                 with postgres.connect() as conn:
                     result = conn.execute(text(f"""
                         SELECT COUNT(*) FROM {tables["Rebalance"]}
                         WHERE triggered_at > NOW() - INTERVAL '10 seconds'
-                        AND trigger_reason = 'distribution'
+                        AND trigger_reason = 'membership_change'
                     """))
                     recent_rebalances = result.scalar()
 
                 assert recent_rebalances >= 1, \
-                    'RebalanceMonitor should have detected membership change (1->2 nodes)'
+                    'Rebalance audit should record membership_change trigger (1->2 nodes)'
 
                 # Verify tokens were redistributed
                 with postgres.connect() as conn:
