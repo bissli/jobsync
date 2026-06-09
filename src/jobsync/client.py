@@ -1549,7 +1549,7 @@ class TaskManager:
         Returns
             List of audit records
         """
-        sql = f'SELECT node, task_id FROM {self.db.tables["Audit"]} WHERE date = :date'
+        sql = f'SELECT node, task_id FROM {self.db.tables["Audit"]} WHERE date = :date AND task_id IS NOT NULL'
         result = self.db.query(sql, {'date': self.date})
         return [{'node': row[0], 'task_id': row[1]} for row in result]
 
