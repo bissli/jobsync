@@ -2291,7 +2291,10 @@ class Job:
         logger.debug(f'Exiting {self.node_name} context')
 
         if exc_ty:
-            logger.error(exc_val)
+            if any(klass.__name__ == 'SessionError' for klass in exc_ty.__mro__):
+                logger.debug(f'{self.node_name} context exited with session error: {exc_val}')
+            else:
+                logger.error(exc_val)
 
         if self._coordination_enabled:
             if self.state_machine.state != JobState.SHUTTING_DOWN:
