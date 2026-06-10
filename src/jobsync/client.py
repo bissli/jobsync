@@ -2335,7 +2335,7 @@ class Job:
             if self.state_machine.state != JobState.SHUTTING_DOWN:
                 self.state_machine.transition_to(JobState.SHUTTING_DOWN)
 
-            for name, monitor in self._monitors.items():
+            for name, monitor in list(self._monitors.items()):
                 if monitor.thread and monitor.thread.is_alive():
                     logger.debug(f'Joining {name} thread...')
                     monitor.thread.join(timeout=10)
