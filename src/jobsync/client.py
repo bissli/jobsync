@@ -4,6 +4,7 @@ import contextlib
 import datetime
 import functools
 import hashlib
+import inspect
 import json
 import logging
 import re
@@ -24,7 +25,7 @@ from jobsync.schema import ensure_database_ready, get_table_names
 
 logger = logging.getLogger(__name__)
 
-__all__ = ['Job', 'Task', 'LockNotAcquired', 'CoordinationConfig']
+__all__ = ['Job', 'Task', 'LockNotAcquired', 'CoordinationConfig', 'RebalanceEvent']
 
 
 # ============================================================
@@ -42,6 +43,16 @@ class CoordinationEvent:
     def __post_init__(self):
         if self.timestamp is None:
             self.timestamp = time.time()
+
+
+@dataclass
+class RebalanceEvent:
+    """Token-ownership change delivered to an on_rebalance callback.
+    """
+    is_initial: bool
+    token_version: int
+    tokens_added: int
+    tokens_removed: int
 
 
 class EventQueue:
@@ -1032,7 +1043,7 @@ class TokenDistributor:
 
         raise TimeoutError(f'Token distribution did not complete for {self.node_name} within {timeout_sec}s')
 
-    def invoke_callback(self, callback: callable) -> None:
+    def invoke_callback(self, callback: callable, event: RebalanceEvent) -> None:
         """Invoke rebalance callback asynchronously with timing and error handling.
 
         Callbacks run in a bounded thread pool to avoid blocking coordination logic
@@ -1040,19 +1051,37 @@ class TokenDistributor:
         to not impact leadership detection, token refresh, or other critical
         coordination operations.
 
+        The callback receives the RebalanceEvent when it accepts a positional
+        argument; a legacy zero-argument callable is still supported.
+
         Args:
             callback: Callback function to invoke
+            event: Details of the token-ownership change
         """
         if self._executor_shutdown:
             logger.warning('on_rebalance not invoked - executor already shutdown')
             return
 
+        try:
+            params = inspect.signature(callback).parameters.values()
+            pass_event = any(
+                p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD, p.VAR_POSITIONAL)
+                for p in params)
+        except (ValueError, TypeError):
+            pass_event = False
+
         def _run_callback():
             try:
                 start = time.time()
-                callback()
+                if pass_event:
+                    callback(event)
+                else:
+                    callback()
                 duration_ms = int((time.time() - start) * 1000)
-                logger.info(f'on_rebalance completed in {duration_ms}ms')
+                logger.info(
+                    f'on_rebalance completed in {duration_ms}ms '
+                    f'(initial={event.is_initial}, +{event.tokens_added} '
+                    f'-{event.tokens_removed}, v{event.token_version})')
             except Exception as e:
                 logger.error(f'on_rebalance callback failed: {e}')
 
@@ -1763,7 +1792,10 @@ class TokenRefreshMonitor(Monitor):
                 self.tokens.my_tokens = new_tokens
                 self.tokens.token_version = new_version
                 if self.tokens.on_rebalance:
-                    self.tokens.invoke_callback(self.tokens.on_rebalance)
+                    event = RebalanceEvent(
+                        is_initial=True, token_version=new_version,
+                        tokens_added=len(new_tokens), tokens_removed=0)
+                    self.tokens.invoke_callback(self.tokens.on_rebalance, event)
                 self.initial_callback_sent = True
                 self.start_time = time.time()
             elif new_version != self.tokens.token_version:
@@ -1777,7 +1809,10 @@ class TokenRefreshMonitor(Monitor):
                 self.tokens.token_version = new_version
 
                 if self.tokens.on_rebalance:
-                    self.tokens.invoke_callback(self.tokens.on_rebalance)
+                    event = RebalanceEvent(
+                        is_initial=False, token_version=new_version,
+                        tokens_added=len(added), tokens_removed=len(removed))
+                    self.tokens.invoke_callback(self.tokens.on_rebalance, event)
 
                 self.start_time = time.time()
 
@@ -1955,7 +1990,7 @@ class Job:
             wait_on_exit: Seconds to wait before cleanup (default 0)
             lock_provider: Callback(job) to register task locks during __enter__
             clear_existing_locks: If True, clear locks created by this node before invoking lock_provider
-            on_rebalance: Callback() invoked when cluster membership changes (initial assignment, node joins/leaves, rebalancing)
+            on_rebalance: Callback invoked on token-ownership changes (initial assignment, node joins/leaves, rebalancing). Receives a RebalanceEvent (is_initial, token_version, tokens_added, tokens_removed); a zero-argument callable is also supported.
         """
         self.node_name = node_name
         self._wait_on_enter = int(abs(wait_on_enter))
