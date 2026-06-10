@@ -968,6 +968,11 @@ class TokenDistributor:
             logger.error(f'Token distribution assigned to non-active nodes: {invalid_nodes}')
             raise ValueError(f'Tokens assigned to inactive nodes: {invalid_nodes}')
 
+        missing_tokens = set(range(self.total_tokens)) - set(new_assignments)
+        if missing_tokens:
+            logger.error(f'Token distribution incomplete: {len(missing_tokens)}/{self.total_tokens} tokens unowned '
+                         f'(e.g. {sorted(missing_tokens)[:10]}) - tasks hashing to them are unprocessed until a matching node joins')
+
         with self.db.engine.connect() as conn:
             result = conn.execute(text(f'SELECT MAX(version) FROM {self.db.tables["Token"]}'))
             current_version = result.scalar() or 0
