@@ -166,9 +166,9 @@ class TestConcurrentDistributionEvents:
             distribution_count = [0]
             original_distribute = job._distribute_tokens_safe
 
-            def track_distribute():
+            def track_distribute(*args, **kwargs):
                 distribution_count[0] += 1
-                original_distribute()
+                original_distribute(*args, **kwargs)
 
             job._distribute_tokens_safe = track_distribute
 
