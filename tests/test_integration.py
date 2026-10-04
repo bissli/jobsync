@@ -1,6 +1,7 @@
 """Integration tests for coordinated workflows and state management.
 
-USE THIS FILE FOR:
+Scope
+-----
 - Integration tests requiring coordination between components
 - State machine and event bus integration
 - Callback and event handling
@@ -16,13 +17,58 @@ from collections import Counter
 
 import pytest
 from fixtures import *  # noqa: F401, F403
-from sqlalchemy import text
+from sqlalchemy import Engine, text
 
 from jobsync import schema
 from jobsync.client import CoordinationConfig, Job, JobState, Task
 from jobsync.client import TokenRefreshMonitor
 
 logger = logging.getLogger(__name__)
+
+CORE_TABLE_KEYS = ['Node', 'Check', 'Audit', 'Claim']
+COORDINATION_TABLE_KEYS = ['Token', 'Lock', 'LeaderLock', 'RebalanceLock', 'Rebalance']
+
+TABLE_EXISTS_SQL = """
+select exists (
+    select from information_schema.tables
+    where table_schema = 'public'
+    and table_name = :table_name
+)
+"""
+
+
+def drop_tables_by_key(
+    postgres: Engine,
+    tables: dict,
+    table_keys: list[str],
+    cascade: bool = False
+) -> None:
+    """Drop the tables named by key, skipping any already gone.
+
+    Parameters
+    ----------
+    postgres : Engine
+        Test database engine.
+    tables : dict
+        Table key to table name, from schema.get_table_names.
+    table_keys : list[str]
+        Keys of the tables to drop.
+    cascade : bool, default False
+        Drop with CASCADE, removing dependent objects too.
+    """
+    suffix = ' cascade' if cascade else ''
+    with postgres.connect() as conn:
+        for table in table_keys:
+            conn.execute(text(f'drop table if exists {tables[table]}{suffix}'))
+        conn.commit()
+
+
+def table_exists(postgres: Engine, table_name: str) -> bool:
+    """True when the public schema holds a table named table_name.
+    """
+    with postgres.connect() as conn:
+        result = conn.execute(text(TABLE_EXISTS_SQL), {'table_name': table_name})
+        return result.scalar()
 
 
 @pytest.fixture
@@ -40,7 +86,11 @@ def make_unentered_job(postgres):
     jobs = []
 
     def make(node_name: str, coordination_config: CoordinationConfig) -> Job:
-        job = create_job(node_name, postgres, coordination_config=coordination_config, wait_on_enter=0)
+        job = create_job(
+            node_name,
+            postgres,
+            coordination_config=coordination_config,
+            wait_on_enter=0)
         jobs.append(job)
         return job
 
@@ -72,7 +122,8 @@ def token_refresh_gate(monkeypatch):
 
 
 class TestLeaderElection:
-    """Test leader election logic."""
+    """Leader election by created_on, name, and heartbeat.
+    """
 
     @clean_tables('Node')
     def test_oldest_node_elected(self, postgres, make_unentered_job):
@@ -89,9 +140,21 @@ class TestLeaderElection:
 
         base_time = datetime.datetime.now(datetime.timezone.utc)
 
-        insert_active_node(postgres, tables, 'node1', created_on=base_time - datetime.timedelta(seconds=5))
-        insert_active_node(postgres, tables, 'node2', created_on=base_time - datetime.timedelta(seconds=10))
-        insert_active_node(postgres, tables, 'node3', created_on=base_time - datetime.timedelta(seconds=20))
+        insert_active_node(
+            postgres,
+            tables,
+            'node1',
+            created_on=base_time - datetime.timedelta(seconds=5))
+        insert_active_node(
+            postgres,
+            tables,
+            'node2',
+            created_on=base_time - datetime.timedelta(seconds=10))
+        insert_active_node(
+            postgres,
+            tables,
+            'node3',
+            created_on=base_time - datetime.timedelta(seconds=20))
 
         leader = job.cluster.elect_leader()
 
@@ -140,7 +203,8 @@ class TestLeaderElection:
 
 
 class TestCanClaimTask:
-    """Test task claiming logic."""
+    """can_claim_task against the node's own token set.
+    """
 
     def test_can_claim_owned_token(self, make_unentered_job):
         """Verify a follower can claim a task whose token it owns.
@@ -161,7 +225,8 @@ class TestCanClaimTask:
             if job.task_to_token(candidate) == token_id:
                 task_id = candidate
                 break
-        assert task_id is not None, f'Could not find task_id mapping to token {token_id}'
+        assert task_id is not None, \
+            f'Could not find task_id mapping to token {token_id}'
 
         task = create_task(task_id)
         assert job.can_claim_task(task), 'Should be able to claim task with owned token'
@@ -176,19 +241,22 @@ class TestCanClaimTask:
         coord_config = get_coordination_config()
         job = make_unentered_job('node1', coord_config)
 
-        job.tokens.my_tokens = set(range(coord_config.total_tokens)) - {job.task_to_token(123)}
+        job.tokens.my_tokens = (
+            set(range(coord_config.total_tokens)) - {job.task_to_token(123)})
         job.state_machine.state = JobState.RUNNING_FOLLOWER
 
         task = create_task(123)
-        assert not job.can_claim_task(task), 'Should not be able to claim task without token'
+        assert not job.can_claim_task(task), \
+            'Should not be able to claim task without token'
 
 
 class TestTokenDistribution:
-    """Test token distribution algorithm."""
+    """Token assignment from distribute() and from fresh clusters.
+    """
 
     @clean_tables('Node')
     def test_even_distribution(self, postgres, make_unentered_job):
-        """Verify a fresh distribution splits 99 tokens 33/33/33 across three nodes.
+        """Verify a fresh distribution splits 99 tokens 33/33/33 over 3 nodes.
 
         Mutation: a receiver's deficit computed one short, so the leftover
             tokens fall through to the first node.
@@ -230,20 +298,32 @@ class TestTokenDistribution:
         task_ids = find_task_ids_covering_all_tokens(coord_config)
 
         for token_id in range(10):
-            insert_lock(postgres, tables, task_ids[token_id], ['special-%'], created_by='test')
+            insert_lock(
+                postgres,
+                tables,
+                task_ids[token_id],
+                ['special-%'],
+                created_by='test')
 
         job = make_unentered_job('node1', coord_config)
 
         job.tokens.distribute(job.locks, job.cluster)
 
         assignments = get_token_assignments(postgres, tables)
-        locked_correct = sum(1 for token_id in range(10) if assignments.get(token_id) == 'special-alpha')
+        locked_correct = sum(
+            1 for token_id in range(10)
+            if assignments.get(token_id) == 'special-alpha')
 
-        assert locked_correct == 10, f'All 10 locked tokens should be assigned to special-alpha (got {locked_correct})'
+        assert locked_correct == 10, \
+            f'All 10 locked tokens should be assigned to special-alpha (got {locked_correct})'
 
     @clean_tables('Lock', 'Token', 'Node')
-    def test_locked_tokens_balanced_across_multiple_matching_nodes(self, postgres, make_unentered_job):
-        """Verify locked tokens split evenly between two matching nodes, and unlocked ones across all five.
+    def test_locked_tokens_balanced_across_multiple_matching_nodes(
+        self,
+        postgres,
+        make_unentered_job
+    ):
+        """Verify locked and unlocked tokens split evenly over their nodes.
 
         Mutation: assign_locked_token returns eligible_nodes[0] instead of
             the least-loaded eligible node.
@@ -262,7 +342,12 @@ class TestTokenDistribution:
 
         task_ids = find_task_ids_covering_all_tokens(coord_config)
         for token_id in range(20):
-            insert_lock(postgres, tables, task_ids[token_id], ['special-%'], created_by='test')
+            insert_lock(
+                postgres,
+                tables,
+                task_ids[token_id],
+                ['special-%'],
+                created_by='test')
 
         job = make_unentered_job('node1', coord_config)
 
@@ -277,7 +362,7 @@ class TestTokenDistribution:
 
     @clean_tables('Node', 'Token')
     def test_same_nodes_always_get_same_tokens(self, postgres):
-        """Verify a fresh cluster with the same node names gets the same token assignment.
+        """Verify a fresh cluster of the same names gets the same tokens.
 
         Mutation: compute_minimal_move_distribution shuffles the
             distributable tokens (random.shuffle) before assigning them.
@@ -286,29 +371,51 @@ class TestTokenDistribution:
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
 
-        with cluster(postgres, 'alpha', 'beta', 'gamma', total_tokens=100) as nodes_run1:
+        with cluster(
+            postgres,
+            'alpha',
+            'beta',
+            'gamma',
+            total_tokens=100) as nodes_run1:
             for node in nodes_run1:
                 assert wait_for(lambda n=node: len(n.my_tokens) >= 20, timeout_sec=10)
 
-            assert wait_for_cached_tokens_sync(nodes_run1, expected_total=100, timeout_sec=10)
+            assert wait_for_cached_tokens_sync(
+                nodes_run1,
+                expected_total=100,
+                timeout_sec=10)
 
-            distribution_run1 = {node.node_name: sorted(node.my_tokens) for node in nodes_run1}
+            distribution_run1 = {
+                node.node_name: sorted(node.my_tokens) for node in nodes_run1
+                }
 
         clear_tables(postgres, tables, ['Node', 'Token', 'Rebalance'])
 
-        with cluster(postgres, 'alpha', 'beta', 'gamma', total_tokens=100) as nodes_run2:
+        with cluster(
+            postgres,
+            'alpha',
+            'beta',
+            'gamma',
+            total_tokens=100) as nodes_run2:
             for node in nodes_run2:
                 assert wait_for(lambda n=node: len(n.my_tokens) >= 20, timeout_sec=10)
 
-            assert wait_for_cached_tokens_sync(nodes_run2, expected_total=100, timeout_sec=10)
+            assert wait_for_cached_tokens_sync(
+                nodes_run2,
+                expected_total=100,
+                timeout_sec=10)
 
-            distribution_run2 = {node.node_name: sorted(node.my_tokens) for node in nodes_run2}
+            distribution_run2 = {
+                node.node_name: sorted(node.my_tokens) for node in nodes_run2
+                }
 
-        assert distribution_run1 == distribution_run2, 'Same node names should get the same tokens'
+        assert distribution_run1 == distribution_run2, \
+            'Same node names should get the same tokens'
 
 
 class TestNodesPropertyIsolation:
-    """Test Job.nodes property deep copy behavior."""
+    """Test Job.nodes property deep copy behavior.
+    """
 
     def test_nodes_returns_copy(self):
         """Verify each read of nodes returns a new list.
@@ -321,7 +428,7 @@ class TestNodesPropertyIsolation:
         assert job.nodes is not job.nodes, 'Each call should return new copy'
 
     def test_modifying_returned_nodes_doesnt_affect_internal(self):
-        """Verify editing a value in a returned node dict leaves the job's copy alone.
+        """Verify editing a returned node dict leaves the job's copy alone.
 
         Mutation: nodes returns a shallow copy (list(self._nodes)).
         Oracle: the node name given to Job.
@@ -345,7 +452,7 @@ class TestNodesPropertyIsolation:
         assert job.nodes == [{'name': 'node1'}]
 
     def test_deep_copy_protects_nested_dicts(self):
-        """Verify a key added to a returned node dict does not reach the job's copy.
+        """Verify a key added to a returned node dict stays out of the job.
 
         Mutation: nodes returns a shallow copy (list(self._nodes)).
         Oracle: a new Job's node entry, {'name': 'node1'}.
@@ -358,10 +465,11 @@ class TestNodesPropertyIsolation:
 
 
 class TestBasicCallbackInvocation:
-    """Test basic callback invocation scenarios."""
+    """on_rebalance at startup, and its warning without coordination.
+    """
 
     def test_on_rebalance_called_on_startup(self, postgres):
-        """Verify on_rebalance runs once for the initial assignment and not again while ownership holds.
+        """Verify on_rebalance runs once until ownership changes.
 
         Mutation: TokenRefreshMonitor never sets initial_callback_sent, so
             every refresh repeats the initial callback.
@@ -372,14 +480,22 @@ class TestBasicCallbackInvocation:
 
         tracker = CallbackTracker()
 
-        with create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=0,
-                        on_rebalance=tracker.on_rebalance):
-            assert wait_for(lambda: len(tracker.rebalance_calls) >= 1, timeout_sec=10), 'Callback should be invoked'
-            assert not wait_for(lambda: len(tracker.rebalance_calls) >= 2, timeout_sec=3), \
+        with create_job(
+            'node1',
+            postgres,
+            coordination_config=coord_cfg,
+            wait_on_enter=0,
+            on_rebalance=tracker.on_rebalance):
+            assert wait_for(
+                lambda: len(tracker.rebalance_calls) >= 1,
+                timeout_sec=10), 'Callback should be invoked'
+            assert not wait_for(
+                lambda: len(tracker.rebalance_calls) >= 2,
+                timeout_sec=3), \
                 'on_rebalance should not repeat without an ownership change'
 
     def test_no_callbacks_without_coordination(self, caplog):
-        """Verify a standalone job given on_rebalance warns that it will never run it.
+        """Verify a standalone job warns that on_rebalance will never run.
 
         Mutation: the coordination check on the warning in Job.__init__
             inverted or dropped.
@@ -388,17 +504,22 @@ class TestBasicCallbackInvocation:
         """
         tracker = CallbackTracker()
 
-        with caplog.at_level(logging.WARNING), Job('node1', on_rebalance=tracker.on_rebalance):
+        with (
+            caplog.at_level(logging.WARNING),
+            Job('node1', on_rebalance=tracker.on_rebalance)):
             pass
 
-        assert any('callback will never fire' in record.getMessage() for record in caplog.records)
+        assert any(
+            'callback will never fire' in record.getMessage()
+            for record in caplog.records)
 
 
 class TestCallbackTiming:
-    """Test callback timing and ordering guarantees."""
+    """on_rebalance on the leader after a membership change.
+    """
 
     def test_rebalance_called_during_membership_change(self, postgres):
-        """Verify on_rebalance runs again on the leader when a second node joins.
+        """Verify on_rebalance runs again on the leader when a node joins.
 
         Mutation: TokenRefreshMonitor's version-change branch skips
             on_rebalance.
@@ -409,20 +530,30 @@ class TestCallbackTiming:
 
         tracker = CallbackTracker()
 
-        job1 = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
-                          on_rebalance=tracker.on_rebalance)
+        job1 = create_job(
+            'node1',
+            postgres,
+            coordination_config=coord_cfg,
+            wait_on_enter=10,
+            on_rebalance=tracker.on_rebalance)
         job1.__enter__()
 
         try:
             assert wait_for(lambda: len(job1.my_tokens) >= 30, timeout_sec=15)
             assert wait_for_running_state(job1, timeout_sec=5)
 
-            assert wait_for(lambda: len(tracker.rebalance_calls) >= 1, timeout_sec=5), 'Initial callback should fire before reset'
+            assert wait_for(
+                lambda: len(tracker.rebalance_calls) >= 1,
+                timeout_sec=5), 'Initial callback should fire before reset'
 
             initial_tokens = job1.my_tokens.copy()
             tracker.reset()
 
-            job2 = create_job('node2', postgres, coordination_config=coord_cfg, wait_on_enter=10)
+            job2 = create_job(
+                'node2',
+                postgres,
+                coordination_config=coord_cfg,
+                wait_on_enter=10)
             job2.__enter__()
 
             try:
@@ -431,10 +562,13 @@ class TestCallbackTiming:
                 for node in [job1, job2]:
                     assert wait_for_running_state(node, timeout_sec=5)
 
-                assert wait_for(lambda: len(tracker.rebalance_calls) >= 1, timeout_sec=10), \
+                assert wait_for(
+                    lambda: len(tracker.rebalance_calls) >= 1,
+                    timeout_sec=10), \
                     'on_rebalance should be called after membership change'
 
-                assert job1.my_tokens != initial_tokens, 'Tokens should have been rebalanced'
+                assert job1.my_tokens != initial_tokens, \
+                    'Tokens should have been rebalanced'
 
             finally:
                 job2.__exit__(None, None, None)
@@ -444,10 +578,11 @@ class TestCallbackTiming:
 
 
 class TestCallbackExceptionHandling:
-    """Test that callback exceptions don't break coordination."""
+    """Test that callback exceptions don't break coordination.
+    """
 
     def test_exception_in_on_rebalance(self, postgres):
-        """Verify a raising on_rebalance runs once per ownership change and leaves the node running.
+        """Verify a raising on_rebalance runs once and the node keeps running.
 
         Mutation: invoke_callback calls the callback inline with no
             try/except, so the raise escapes TokenRefreshMonitor.check before
@@ -463,18 +598,25 @@ class TestCallbackExceptionHandling:
             calls.append(time.time())
             raise RuntimeError('Test exception in callback')
 
-        with create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=0,
-                        on_rebalance=failing_callback) as job:
-            assert wait_for(lambda: len(calls) >= 1, timeout_sec=10), 'Callback should be invoked'
+        with create_job(
+            'node1',
+            postgres,
+            coordination_config=coord_cfg,
+            wait_on_enter=0,
+            on_rebalance=failing_callback) as job:
+            assert wait_for(lambda: len(calls) >= 1, timeout_sec=10), \
+                'Callback should be invoked'
             assert not wait_for(lambda: len(calls) >= 2, timeout_sec=3), \
                 'A raising callback should not be repeated without an ownership change'
 
             assert job.state_machine.state == JobState.RUNNING_LEADER
-            assert job.am_i_healthy(), 'Node should be healthy despite callback exception'
+            assert job.am_i_healthy(), \
+                'Node should be healthy despite callback exception'
 
 
 class TestCallbackPerformance:
-    """Test callback performance characteristics."""
+    """on_rebalance duration in the completion log line.
+    """
 
     def test_callback_timing_logged(self, postgres, caplog):
         """Verify on_rebalance's duration is logged in milliseconds.
@@ -492,25 +634,35 @@ class TestCallbackPerformance:
             time.sleep(0.1)
             callback_done.set()
 
-        with caplog.at_level(logging.INFO), create_job('node1', postgres, coordination_config=coord_cfg,
-                                                       wait_on_enter=0, on_rebalance=tracked_callback):
+        with (
+            caplog.at_level(logging.INFO),
+            create_job(
+                'node1',
+                postgres,
+                coordination_config=coord_cfg,
+                wait_on_enter=0,
+                on_rebalance=tracked_callback)):
             assert callback_done.wait(timeout=15), 'Callback should be invoked'
 
         durations_ms = [
             int(match.group(1)) for record in caplog.records
-            if (match := re.match(r'on_rebalance completed in (\d+)ms', record.getMessage()))
+            if (match := re.match(
+                r'on_rebalance completed in (\d+)ms',
+                record.getMessage()))
             ]
 
-        assert len(durations_ms) == 1, f'Expected one on_rebalance timing line, got {durations_ms}'
+        assert len(durations_ms) == 1, \
+            f'Expected one on_rebalance timing line, got {durations_ms}'
         assert durations_ms[0] >= 100
 
 
 class TestMonitorLifecycleManagement:
-    """Test monitor lifecycle controlled by state callbacks."""
+    """Test monitor lifecycle controlled by state callbacks.
+    """
 
     @clean_tables('Node')
     def test_leader_exit_callback_stops_leader_monitors(self, postgres):
-        """Verify demotion from RUNNING_LEADER stops DeadNodeMonitor and RebalanceMonitor.
+        """Verify demotion stops DeadNodeMonitor and RebalanceMonitor.
 
         Mutation: _on_exit_running_leader drops the _stop_monitor call for
             dead_node or rebalance.
@@ -529,8 +681,12 @@ class TestMonitorLifecycleManagement:
         try:
             assert wait_for_state(job, JobState.RUNNING_LEADER, timeout_sec=10)
 
-            dead_node_monitor = next((m for m in job._monitors.values() if 'dead-node' in m.name), None)
-            rebalance_monitor = next((m for m in job._monitors.values() if 'rebalance' in m.name), None)
+            dead_node_monitor = next(
+                (m for m in job._monitors.values() if 'dead-node' in m.name),
+                None)
+            rebalance_monitor = next(
+                (m for m in job._monitors.values() if 'rebalance' in m.name),
+                None)
 
             assert dead_node_monitor is not None, 'Should have dead node monitor'
             assert rebalance_monitor is not None, 'Should have rebalance monitor'
@@ -539,18 +695,21 @@ class TestMonitorLifecycleManagement:
 
             job.state_machine.transition_to(JobState.RUNNING_FOLLOWER)
 
-            assert dead_node_monitor._stop_requested, 'Dead node monitor should be stopped by exit callback'
-            assert rebalance_monitor._stop_requested, 'Rebalance monitor should be stopped by exit callback'
+            assert dead_node_monitor._stop_requested, \
+                'Dead node monitor should be stopped by exit callback'
+            assert rebalance_monitor._stop_requested, \
+                'Rebalance monitor should be stopped by exit callback'
 
         finally:
             job.__exit__(None, None, None)
 
 
 class TestTableVerification:
-    """Test table existence verification."""
+    """verify_tables_exist results per table key.
+    """
 
     def test_verify_tables_exist_all_present(self, postgres):
-        """Verify verify_tables_exist reports True for each of the nine tables once created.
+        """Verify verify_tables_exist reports all nine tables once created.
 
         Mutation: the existence query is bound to the table key ('Node')
             instead of the prefixed table name.
@@ -562,14 +721,11 @@ class TestTableVerification:
 
         status = schema.verify_tables_exist(postgres, config.appname)
 
-        expected_tables = ['Node', 'Check', 'Audit', 'Claim', 'Token', 'Lock',
-                           'LeaderLock', 'RebalanceLock', 'Rebalance']
-
-        for table_key in expected_tables:
+        for table_key in CORE_TABLE_KEYS + COORDINATION_TABLE_KEYS:
             assert status[table_key], f'{table_key} should exist'
 
     def test_verify_tables_exist_missing_coordination_tables(self, postgres):
-        """Verify verify_tables_exist reports dropped coordination tables as missing.
+        """Verify verify_tables_exist reports dropped tables as missing.
 
         Mutation: the existence query matches any table in the schema
             instead of the named one, so every key reads True.
@@ -579,18 +735,16 @@ class TestTableVerification:
         config = get_structure_test_config()
         tables = schema.get_table_names(config.appname)
 
-        with postgres.connect() as conn:
-            for table in ['Token', 'Lock', 'LeaderLock', 'RebalanceLock', 'Rebalance']:
-                conn.execute(text(f'DROP TABLE IF EXISTS {tables[table]}'))
-            conn.commit()
+        drop_tables_by_key(postgres, tables, COORDINATION_TABLE_KEYS)
 
         status = schema.verify_tables_exist(postgres, config.appname)
 
-        for table_key in ['Node', 'Check', 'Audit', 'Claim']:
+        for table_key in CORE_TABLE_KEYS:
             assert status[table_key], f'Core table {table_key} should exist'
 
-        for table_key in ['Token', 'Lock', 'LeaderLock', 'RebalanceLock', 'Rebalance']:
-            assert status[table_key] is False, f'Coordination table {table_key} should not exist'
+        for table_key in COORDINATION_TABLE_KEYS:
+            assert status[table_key] is False, \
+                f'Coordination table {table_key} should not exist'
 
     def test_verify_tables_only_checks_requested_tables(self, postgres):
         """Verify verify_tables_exist reports exactly the nine jobsync tables.
@@ -604,11 +758,12 @@ class TestTableVerification:
 
         status = schema.verify_tables_exist(postgres, config.appname)
 
-        assert set(status) == {'Node', 'Check', 'Audit', 'Claim', 'Token', 'Lock', 'LeaderLock', 'RebalanceLock', 'Rebalance'}
+        assert set(status) == set(CORE_TABLE_KEYS + COORDINATION_TABLE_KEYS)
 
 
 class TestCoreTableCreation:
-    """Test core table creation."""
+    """Core tables and their index from ensure_database_ready.
+    """
 
     def test_core_tables_created_when_missing(self, postgres):
         """Verify ensure_database_ready recreates dropped core tables.
@@ -619,24 +774,12 @@ class TestCoreTableCreation:
         config = get_structure_test_config()
         tables = schema.get_table_names(config.appname)
 
-        with postgres.connect() as conn:
-            for table in ['Node', 'Check', 'Audit', 'Claim']:
-                conn.execute(text(f'DROP TABLE IF EXISTS {tables[table]}'))
-            conn.commit()
+        drop_tables_by_key(postgres, tables, CORE_TABLE_KEYS)
 
         schema.ensure_database_ready(postgres, config.appname)
 
-        with postgres.connect() as conn:
-            for table in ['Node', 'Check', 'Audit', 'Claim']:
-                result = conn.execute(text("""
-                    SELECT EXISTS (
-                        SELECT FROM information_schema.tables
-                        WHERE table_schema = 'public'
-                        AND table_name = :table_name
-                    )
-                """), {'table_name': tables[table]})
-                exists = result.scalar()
-                assert exists, f'{table} should be created'
+        for table in CORE_TABLE_KEYS:
+            assert table_exists(postgres, tables[table]), f'{table} should be created'
 
     def test_core_tables_have_required_indexes(self, postgres):
         """Verify the Node table carries its last_heartbeat index.
@@ -650,12 +793,13 @@ class TestCoreTableCreation:
 
         schema.ensure_database_ready(postgres, config.appname)
 
+        indexes_sql = """
+select indexname from pg_indexes
+where tablename = :table_name
+and schemaname = 'public'
+"""
         with postgres.connect() as conn:
-            result = conn.execute(text("""
-                SELECT indexname FROM pg_indexes
-                WHERE tablename = :table_name
-                AND schemaname = 'public'
-            """), {'table_name': tables['Node']})
+            result = conn.execute(text(indexes_sql), {'table_name': tables['Node']})
             indexes = [row[0] for row in result]
 
         expected_index = f'idx_{tables["Node"]}_heartbeat'
@@ -663,7 +807,8 @@ class TestCoreTableCreation:
 
 
 class TestCoordinationTableCreation:
-    """Test coordination table creation."""
+    """Coordination tables and their indexes from ensure_database_ready.
+    """
 
     def test_coordination_tables_created_when_enabled(self, postgres):
         """Verify ensure_database_ready recreates dropped coordination tables.
@@ -674,24 +819,12 @@ class TestCoordinationTableCreation:
         config = get_structure_test_config()
         tables = schema.get_table_names(config.appname)
 
-        with postgres.connect() as conn:
-            for table in ['Token', 'Lock', 'LeaderLock', 'RebalanceLock', 'Rebalance']:
-                conn.execute(text(f'DROP TABLE IF EXISTS {tables[table]}'))
-            conn.commit()
+        drop_tables_by_key(postgres, tables, COORDINATION_TABLE_KEYS)
 
         schema.ensure_database_ready(postgres, config.appname)
 
-        with postgres.connect() as conn:
-            for table in ['Token', 'Lock', 'LeaderLock', 'RebalanceLock', 'Rebalance']:
-                result = conn.execute(text("""
-                    SELECT EXISTS (
-                        SELECT FROM information_schema.tables
-                        WHERE table_schema = 'public'
-                        AND table_name = :table_name
-                    )
-                """), {'table_name': tables[table]})
-                exists = result.scalar()
-                assert exists, f'{table} should be created'
+        for table in COORDINATION_TABLE_KEYS:
+            assert table_exists(postgres, tables[table]), f'{table} should be created'
 
     def test_coordination_tables_have_required_indexes(self, postgres):
         """Verify the Token and Lock tables carry their indexes.
@@ -705,28 +838,38 @@ class TestCoordinationTableCreation:
         schema.ensure_database_ready(postgres, config.appname)
 
         expected_indexes = {
-            tables['Token']: [f'idx_{tables["Token"]}_node', f'idx_{tables["Token"]}_assigned', f'idx_{tables["Token"]}_version'],
-            tables['Lock']: [f'idx_{tables["Lock"]}_created_by', f'idx_{tables["Lock"]}_expires'],
-        }
+            tables['Token']: [
+                f'idx_{tables["Token"]}_node',
+                f'idx_{tables["Token"]}_assigned',
+                f'idx_{tables["Token"]}_version',
+                ],
+            tables['Lock']: [
+                f'idx_{tables["Lock"]}_created_by',
+                f'idx_{tables["Lock"]}_expires',
+                ],
+            }
 
+        indexes_sql = """
+select indexname from pg_indexes
+where tablename = :table_name
+and schemaname = 'public'
+"""
         with postgres.connect() as conn:
             for table_name, expected in expected_indexes.items():
-                result = conn.execute(text("""
-                    SELECT indexname FROM pg_indexes
-                    WHERE tablename = :table_name
-                    AND schemaname = 'public'
-                """), {'table_name': table_name})
+                result = conn.execute(text(indexes_sql), {'table_name': table_name})
                 indexes = [row[0] for row in result]
 
                 for expected_index in expected:
-                    assert expected_index in indexes, f'{table_name} should have {expected_index} index'
+                    assert expected_index in indexes, \
+                        f'{table_name} should have {expected_index} index'
 
 
 class TestIdempotentInitialization:
-    """Test that database initialization is idempotent."""
+    """Repeated ensure_database_ready calls on one database.
+    """
 
     def test_ensure_database_ready_is_idempotent(self, postgres):
-        """Verify ensure_database_ready raises nothing on a database it already set up.
+        """Verify ensure_database_ready raises nothing on a ready database.
 
         Mutation: IF NOT EXISTS dropped from a CREATE TABLE or CREATE INDEX
             statement.
@@ -752,14 +895,16 @@ class TestIdempotentInitialization:
         schema.ensure_database_ready(postgres, config.appname)
 
         with postgres.connect() as conn:
-            result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["RebalanceLock"]}'))
+            result = conn.execute(
+                text(f'select count(*) from {tables["RebalanceLock"]}'))
             count = result.scalar()
 
         assert count == 1, 'RebalanceLock should have exactly one row'
 
 
 class TestJobInitialization:
-    """Test Job automatically initializes database."""
+    """Test Job automatically initializes database.
+    """
 
     def test_job_creates_core_tables_automatically(self, postgres, make_unentered_job):
         """Verify building a coordinated Job recreates dropped core tables.
@@ -770,27 +915,20 @@ class TestJobInitialization:
         config = get_structure_test_config()
         tables = schema.get_table_names(config.appname)
 
-        with postgres.connect() as conn:
-            for table in ['Node', 'Check', 'Audit', 'Claim']:
-                conn.execute(text(f'DROP TABLE IF EXISTS {tables[table]}'))
-            conn.commit()
+        drop_tables_by_key(postgres, tables, CORE_TABLE_KEYS)
 
         make_unentered_job('test-node', config)
 
-        with postgres.connect() as conn:
-            for table in ['Node', 'Check', 'Audit', 'Claim']:
-                result = conn.execute(text("""
-                    SELECT EXISTS (
-                        SELECT FROM information_schema.tables
-                        WHERE table_schema = 'public'
-                        AND table_name = :table_name
-                    )
-                """), {'table_name': tables[table]})
-                exists = result.scalar()
-                assert exists, f'{table} should be created by Job initialization'
+        for table in CORE_TABLE_KEYS:
+            assert table_exists(postgres, tables[table]), \
+                f'{table} should be created by Job initialization'
 
-    def test_job_creates_coordination_tables_when_enabled(self, postgres, make_unentered_job):
-        """Verify building a coordinated Job recreates dropped coordination tables.
+    def test_job_creates_coordination_tables_when_enabled(
+        self,
+        postgres,
+        make_unentered_job
+    ):
+        """Verify a new coordinated Job recreates dropped coordination tables.
 
         Mutation: Job.__init__ skips ensure_database_ready.
         Oracle: the five coordination tables are dropped before the Job is
@@ -799,32 +937,22 @@ class TestJobInitialization:
         config = get_structure_test_config()
         tables = schema.get_table_names(config.appname)
 
-        with postgres.connect() as conn:
-            for table in ['Token', 'Lock', 'LeaderLock', 'RebalanceLock', 'Rebalance']:
-                conn.execute(text(f'DROP TABLE IF EXISTS {tables[table]} CASCADE'))
-            conn.commit()
+        drop_tables_by_key(postgres, tables, COORDINATION_TABLE_KEYS, cascade=True)
 
         make_unentered_job('test-node', CoordinationConfig(total_tokens=100))
 
-        with postgres.connect() as conn:
-            for table in ['Token', 'Lock', 'LeaderLock', 'RebalanceLock', 'Rebalance']:
-                result = conn.execute(text("""
-                    SELECT EXISTS (
-                        SELECT FROM information_schema.tables
-                        WHERE table_schema = 'public'
-                        AND table_name = :table_name
-                    )
-                """), {'table_name': tables[table]})
-                exists = result.scalar()
-                assert exists, f'{table} should be created when coordination enabled'
+        for table in COORDINATION_TABLE_KEYS:
+            assert table_exists(postgres, tables[table]), \
+                f'{table} should be created when coordination enabled'
 
 
 class TestLeadershipDuringInitialization:
-    """Test leadership queries during initialization states."""
+    """am_i_leader() while INITIALIZING and once running.
+    """
 
     @clean_tables('Node')
     def test_am_i_leader_false_during_initialization(self, postgres):
-        """Verify am_i_leader() is False before __enter__ and True once the lone node runs.
+        """Verify am_i_leader() is False before __enter__, True once running.
 
         Mutation: the is_running guard dropped from am_i_leader, or the
             elected name compared with != node_name.
@@ -834,7 +962,11 @@ class TestLeadershipDuringInitialization:
         coord_config = get_coordination_config()
         tables = schema.get_table_names(coord_config.appname)
 
-        job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
+        job = create_job(
+            'node1',
+            postgres,
+            coordination_config=coord_config,
+            wait_on_enter=0)
 
         now = datetime.datetime.now(datetime.timezone.utc)
         insert_active_node(postgres, tables, 'node1', created_on=now)
@@ -847,7 +979,8 @@ class TestLeadershipDuringInitialization:
         try:
             assert wait_for_running_state(job, timeout_sec=10)
 
-            assert job.am_i_leader(), 'The only active node should be leader once running'
+            assert job.am_i_leader(), \
+                'The only active node should be leader once running'
 
         finally:
             job.__exit__(None, None, None)
@@ -877,10 +1010,11 @@ class TestLeadershipDuringInitialization:
 
 
 class TestCallbackBlockingDetection:
-    """Test that slow callbacks don't block coordination."""
+    """Test that slow callbacks don't block coordination.
+    """
 
     def test_slow_callback_does_not_block_token_version_detection(self, postgres):
-        """Verify the token-refresh monitor caches a new token version while on_rebalance is held.
+        """Verify a new token version is cached while on_rebalance is held.
 
         Mutation: invoke_callback runs the callback inline on the
             token-refresh thread instead of submitting it to the executor.
@@ -896,8 +1030,12 @@ class TestCallbackBlockingDetection:
             callback_started.set()
             release.wait(timeout=60)
 
-        job = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=0,
-                         on_rebalance=blocking_callback)
+        job = create_job(
+            'node1',
+            postgres,
+            coordination_config=coord_cfg,
+            wait_on_enter=0,
+            on_rebalance=blocking_callback)
         job.__enter__()
 
         try:
@@ -906,7 +1044,9 @@ class TestCallbackBlockingDetection:
             initial_version = job.token_version
             job.tokens.distribute(job.locks, job.cluster)
 
-            assert wait_for(lambda: job.token_version > initial_version, timeout_sec=10), \
+            assert wait_for(
+                lambda: job.token_version > initial_version,
+                timeout_sec=10), \
                 'New token version should be cached while the callback is still running'
 
         finally:
@@ -914,7 +1054,7 @@ class TestCallbackBlockingDetection:
             job.__exit__(None, None, None)
 
     def test_slow_callback_does_not_block_leadership_change_detection(self, postgres):
-        """Verify a follower is promoted after the leader dies while its on_rebalance is held.
+        """Verify a follower is promoted while its on_rebalance is held.
 
         Mutation: invoke_callback runs the callback inline on the
             token-refresh thread, the only thread that detects promotion.
@@ -930,9 +1070,17 @@ class TestCallbackBlockingDetection:
             callback_started.set()
             release.wait(timeout=60)
 
-        node1 = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=0)
-        node2 = create_job('node2', postgres, coordination_config=coord_cfg, wait_on_enter=0,
-                           on_rebalance=blocking_callback)
+        node1 = create_job(
+            'node1',
+            postgres,
+            coordination_config=coord_cfg,
+            wait_on_enter=0)
+        node2 = create_job(
+            'node2',
+            postgres,
+            coordination_config=coord_cfg,
+            wait_on_enter=0,
+            on_rebalance=blocking_callback)
 
         node1.__enter__()
 
@@ -941,7 +1089,8 @@ class TestCallbackBlockingDetection:
 
             try:
                 assert wait_for_state(node2, JobState.RUNNING_FOLLOWER, timeout_sec=10)
-                assert callback_started.wait(timeout=10), 'Initial callback should start'
+                assert callback_started.wait(timeout=10), \
+                    'Initial callback should start'
 
                 simulate_node_crash(node1, cleanup=True)
 
@@ -957,9 +1106,14 @@ class TestCallbackBlockingDetection:
 
 
 class TestInitialCallbackRaceCondition:
-    """Test race between __enter__ completion and initial callback."""
+    """Test race between __enter__ completion and initial callback.
+    """
 
-    def test_leader_tokens_available_before_callback(self, postgres, token_refresh_gate):
+    def test_leader_tokens_available_before_callback(
+        self,
+        postgres,
+        token_refresh_gate
+    ):
         """Verify a leader's token cache is full when __enter__ returns.
 
         Mutation: __enter__ skips loading my_tokens and leaves the cache to
@@ -974,8 +1128,12 @@ class TestInitialCallbackRaceCondition:
         def track_callback():
             callback_invoked.append(True)
 
-        with create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=0,
-                        on_rebalance=track_callback) as job:
+        with create_job(
+            'node1',
+            postgres,
+            coordination_config=coord_cfg,
+            wait_on_enter=0,
+            on_rebalance=track_callback) as job:
             assert job.my_tokens == set(range(coord_cfg.total_tokens)), \
                 'Leader should have tokens immediately after __enter__'
 
@@ -984,8 +1142,12 @@ class TestInitialCallbackRaceCondition:
             assert wait_for(lambda: len(callback_invoked) >= 1, timeout_sec=10), \
                 'Callback should fire once the refresh monitor runs'
 
-    def test_follower_tokens_available_before_callback(self, postgres, token_refresh_gate):
-        """Verify a follower's token cache matches its Token rows when __enter__ returns.
+    def test_follower_tokens_available_before_callback(
+        self,
+        postgres,
+        token_refresh_gate
+    ):
+        """Verify a follower's cache matches its Token rows after __enter__.
 
         Mutation: __enter__ skips loading my_tokens and leaves the cache to
             TokenRefreshMonitor's first pass.
@@ -1000,19 +1162,30 @@ class TestInitialCallbackRaceCondition:
         def track_callback():
             callback_invoked.append(True)
 
-        job1 = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=0)
+        job1 = create_job(
+            'node1',
+            postgres,
+            coordination_config=coord_cfg,
+            wait_on_enter=0)
         job1.__enter__()
 
         try:
             assert wait_for_running_state(job1, timeout_sec=10)
 
-            with create_job('node2', postgres, coordination_config=coord_cfg, wait_on_enter=0,
-                            on_rebalance=track_callback) as job2:
+            with create_job(
+                'node2',
+                postgres,
+                coordination_config=coord_cfg,
+                wait_on_enter=0,
+                on_rebalance=track_callback) as job2:
                 tokens_at_enter_exit = job2.my_tokens
 
-                assert len(tokens_at_enter_exit) > 0, 'Follower should have tokens after __enter__'
+                assert len(tokens_at_enter_exit) > 0, \
+                    'Follower should have tokens after __enter__'
                 assignments = get_token_assignments(postgres, tables)
-                assert tokens_at_enter_exit == {tid for tid, owner in assignments.items() if owner == 'node2'}
+                assert tokens_at_enter_exit == {
+                    tid for tid, owner in assignments.items() if owner == 'node2'
+                    }
 
                 token_refresh_gate.set()
 
@@ -1024,7 +1197,7 @@ class TestInitialCallbackRaceCondition:
 
     @pytest.mark.usefixtures('token_refresh_gate')
     def test_user_code_can_rely_on_token_cache_immediately(self, postgres):
-        """Verify a one-node cluster can claim a task as soon as __enter__ returns.
+        """Verify a lone node can claim a task as soon as __enter__ returns.
 
         Mutation: __enter__ returns before moving to a running state, or
             skips loading my_tokens.
@@ -1034,15 +1207,21 @@ class TestInitialCallbackRaceCondition:
         """
         coord_cfg = get_coordination_config()
 
-        with create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=0) as job:
-            assert job.can_claim_task(Task(42)), 'Token cache should be ready for claiming right after __enter__'
+        with create_job(
+            'node1',
+            postgres,
+            coordination_config=coord_cfg,
+            wait_on_enter=0) as job:
+            assert job.can_claim_task(Task(42)), \
+                'Token cache should be ready for claiming right after __enter__'
 
 
 class TestCallbackExceptionDoesNotStopMonitor:
-    """Test that callback exceptions don't stop the monitor thread."""
+    """Token refresh delivering later versions after on_rebalance raises.
+    """
 
     def test_monitor_continues_after_callback_exception(self, postgres):
-        """Verify a raising on_rebalance still gets exactly one call per token version, including later ones.
+        """Verify a raising on_rebalance gets one call per token version.
 
         Mutation: invoke_callback calls the callback inline with no
             try/except, so the raise escapes TokenRefreshMonitor.check and
@@ -1058,21 +1237,34 @@ class TestCallbackExceptionDoesNotStopMonitor:
             versions_seen.append(event.token_version)
             raise RuntimeError('Test callback failure')
 
-        job1 = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=0,
-                          on_rebalance=failing_callback)
+        job1 = create_job(
+            'node1',
+            postgres,
+            coordination_config=coord_cfg,
+            wait_on_enter=0,
+            on_rebalance=failing_callback)
         job1.__enter__()
 
         try:
-            assert wait_for(lambda: len(versions_seen) >= 1, timeout_sec=10), 'Initial callback should run'
+            assert wait_for(lambda: len(versions_seen) >= 1, timeout_sec=10), \
+                'Initial callback should run'
             initial_version = job1.token_version
 
-            job2 = create_job('node2', postgres, coordination_config=coord_cfg, wait_on_enter=0)
+            job2 = create_job(
+                'node2',
+                postgres,
+                coordination_config=coord_cfg,
+                wait_on_enter=0)
             job2.__enter__()
 
             try:
-                assert wait_for(lambda: job1.token_version > initial_version, timeout_sec=15), \
+                assert wait_for(
+                    lambda: job1.token_version > initial_version,
+                    timeout_sec=15), \
                     'node1 should cache the post-join token version'
-                assert wait_for(lambda: job1.token_version in versions_seen, timeout_sec=5), \
+                assert wait_for(
+                    lambda: job1.token_version in versions_seen,
+                    timeout_sec=5), \
                     'Callback should run for the post-join version after raising on the initial one'
                 assert len(versions_seen) == len(set(versions_seen)), \
                     f'Each token version should reach the callback once, got {versions_seen}'
@@ -1085,7 +1277,8 @@ class TestCallbackExceptionDoesNotStopMonitor:
 
 
 class TestCallbackThreadPoolExecution:
-    """Test ThreadPoolExecutor-based callback execution."""
+    """on_rebalance on the single-worker callback executor.
+    """
 
     def test_callbacks_run_in_thread_pool(self, postgres):
         """Verify callbacks run on the rebalance-callback executor thread.
@@ -1100,19 +1293,25 @@ class TestCallbackThreadPoolExecution:
         callback_threads = []
 
         def track_thread_callback():
-            callback_threads.append((threading.current_thread().ident, threading.current_thread().name))
+            callback_threads.append(
+                (threading.current_thread().ident, threading.current_thread().name))
 
-        with create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=0,
-                        on_rebalance=track_thread_callback):
+        with create_job(
+            'node1',
+            postgres,
+            coordination_config=coord_cfg,
+            wait_on_enter=0,
+            on_rebalance=track_thread_callback):
             assert wait_for(lambda: len(callback_threads) >= 1, timeout_sec=15)
 
             thread_id, thread_name = callback_threads[0]
 
             assert thread_id != main_thread_id, 'Callback should not run in main thread'
-            assert 'rebalance-callback' in thread_name, f'Callback should run in executor thread, got {thread_name}'
+            assert 'rebalance-callback' in thread_name, \
+                f'Callback should run in executor thread, got {thread_name}'
 
     def test_thread_pool_limits_concurrent_callbacks(self, postgres):
-        """Verify a second on_rebalance does not start while the first is still running.
+        """Verify a second on_rebalance waits for the first to finish.
 
         Mutation: the callback executor built with max_workers=2.
         Oracle: a stub callback that blocks until released and records each
@@ -1127,17 +1326,24 @@ class TestCallbackThreadPoolExecution:
             callback_starts.append(time.time())
             release.wait(timeout=60)
 
-        job = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=0,
-                         on_rebalance=blocking_callback)
+        job = create_job(
+            'node1',
+            postgres,
+            coordination_config=coord_cfg,
+            wait_on_enter=0,
+            on_rebalance=blocking_callback)
         job.__enter__()
 
         try:
-            assert wait_for(lambda: len(callback_starts) == 1, timeout_sec=10), 'Initial callback should start'
+            assert wait_for(lambda: len(callback_starts) == 1, timeout_sec=10), \
+                'Initial callback should start'
 
             initial_version = job.token_version
             job.tokens.distribute(job.locks, job.cluster)
 
-            assert wait_for(lambda: job.token_version > initial_version, timeout_sec=10), \
+            assert wait_for(
+                lambda: job.token_version > initial_version,
+                timeout_sec=10), \
                 'Second token version should be cached, queuing a second callback'
             assert not wait_for(lambda: len(callback_starts) >= 2, timeout_sec=2), \
                 'Second callback started while the first was still running'
@@ -1168,11 +1374,16 @@ class TestCallbackThreadPoolExecution:
             time.sleep(3)
             callback_completed.append(True)
 
-        with create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=0,
-                        on_rebalance=long_callback):
+        with create_job(
+            'node1',
+            postgres,
+            coordination_config=coord_cfg,
+            wait_on_enter=0,
+            on_rebalance=long_callback):
             assert callback_started.wait(timeout=15), 'Callback should start'
 
-        assert callback_completed == [True], 'Callback should complete before shutdown finishes'
+        assert callback_completed == [True], \
+            'Callback should complete before shutdown finishes'
 
     def test_pending_callbacks_tracked(self, postgres):
         """Verify a running callback's future is held in _pending_callbacks.
@@ -1190,14 +1401,20 @@ class TestCallbackThreadPoolExecution:
             callback_active.set()
             release.wait(timeout=60)
 
-        job = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=0,
-                         on_rebalance=blocking_callback)
+        job = create_job(
+            'node1',
+            postgres,
+            coordination_config=coord_cfg,
+            wait_on_enter=0,
+            on_rebalance=blocking_callback)
         job.__enter__()
 
         try:
             assert callback_active.wait(timeout=15), 'Callback should start'
 
-            assert wait_for(lambda: len(job.tokens._pending_callbacks) == 1, timeout_sec=5), \
+            assert wait_for(
+                lambda: len(job.tokens._pending_callbacks) == 1,
+                timeout_sec=5), \
                 'Future should be tracked in pending callbacks list'
 
         finally:
@@ -1219,11 +1436,19 @@ class TestCallbackThreadPoolExecution:
             callback_started.set()
             time.sleep(2)
 
-        with caplog.at_level(logging.INFO), create_job('node1', postgres, coordination_config=coord_cfg,
-                                                       wait_on_enter=0, on_rebalance=slow_callback):
+        with (
+            caplog.at_level(logging.INFO),
+            create_job(
+                'node1',
+                postgres,
+                coordination_config=coord_cfg,
+                wait_on_enter=0,
+                on_rebalance=slow_callback)):
             assert callback_started.wait(timeout=15), 'Callback should start'
 
-        assert any(record.getMessage().startswith('Waiting for 1 pending callbacks') for record in caplog.records), \
+        assert any(
+            record.getMessage().startswith('Waiting for 1 pending callbacks')
+            for record in caplog.records), \
             'Should log the pending callback count during shutdown'
 
 

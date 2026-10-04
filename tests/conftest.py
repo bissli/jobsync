@@ -1,27 +1,16 @@
-"""Pytest configuration and shared fixtures.
-
-WHAT THIS FILE PROVIDES:
-- psql_docker: PostgreSQL Docker container for tests
-- postgres: SQLAlchemy engine with test database setup
-- Helper functions for table management (drop_tables, create_extensions)
-- Database connection cleanup (terminate_postgres_connections)
-
-This file sets up the test environment with:
-- PostgreSQL 17 in Docker
-- America/New_York timezone configuration
-- Required extensions (hstore)
-- Automatic table cleanup between tests
+"""PostgreSQL 17 container and engine fixtures, in the America/New_York zone.
 """
 import logging
 import os
 import pathlib
 import socket
 import time
+from collections.abc import Iterator
 
 import docker
 import psycopg
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import Engine, create_engine, text
 
 from jobsync import schema
 
@@ -45,7 +34,7 @@ def find_free_port() -> int:
 
 
 @pytest.fixture(scope='module')
-def psql_docker():
+def psql_docker() -> Iterator[int]:
     """Start a PostgreSQL Docker container on a free host port.
 
     Yields
@@ -70,12 +59,12 @@ def psql_docker():
             'POSTGRES_USER': 'postgres',
             'POSTGRES_PASSWORD': 'postgres',
             'TZ': 'America/New_York',
-            'PGTZ': 'America/New_York'},
+            'PGTZ': 'America/New_York',
+            },
         name=f'test_postgres_{port}',
         ports={'5432/tcp': ('127.0.0.1', port)},
         detach=True,
-        remove=True,
-    )
+        remove=True)
     conninfo = f'host=127.0.0.1 port={port} dbname=jobsync user=postgres password=postgres connect_timeout=2'
     try:
         deadline = time.time() + 60
@@ -93,76 +82,78 @@ def psql_docker():
         container.stop()
 
 
-def drop_tables(engine, appname: str = 'sync_'):
-    """Drop all test tables.
-    """
-    tables = schema.get_table_names(appname)
-    with engine.connect() as conn:
-        for table in [
-            tables['Rebalance'],
-            tables['RebalanceLock'],
-            tables['LeaderLock'],
-            tables['Lock'],
-            tables['Token'],
-            tables['Claim'],
-            tables['Inst'],
-            tables['Audit'],
-            tables['Check'],
-            tables['Node']
-        ]:
-            conn.execute(text(f'DROP TABLE IF EXISTS {table}'))
-        conn.commit()
-
-
-def create_extensions(engine):
-    """Create required PostgreSQL extensions.
-    """
-    with engine.connect() as conn:
-        conn.execute(text('CREATE EXTENSION IF NOT EXISTS hstore'))
-        conn.commit()
-
-
-def terminate_postgres_connections(engine):
+def terminate_postgres_connections(engine: Engine) -> None:
     """Terminate all other connections to the test database.
     """
     sql = """
-    SELECT pg_terminate_backend(pg_stat_activity.pid)
-    FROM pg_stat_activity
-    WHERE pg_stat_activity.datname = current_database()
-    AND pid <> pg_backend_pid()
-    """
+select pg_terminate_backend(pg_stat_activity.pid)
+from pg_stat_activity
+where pg_stat_activity.datname = current_database()
+and pid <> pg_backend_pid()
+"""
     with engine.connect() as conn:
         conn.execute(text(sql))
         conn.commit()
 
 
 @pytest.fixture
-def postgres(psql_docker):
-    """Provide SQLAlchemy engine for PostgreSQL tests.
+def postgres(psql_docker: int) -> Iterator[Engine]:
+    """Engine on the container's jobsync database, with the sync_ schema built.
+
+    Yields
+    ------
+    Engine
+        Teardown terminates every other connection and drops every sync_
+        table, so each test starts from empty tables.
     """
     connection_string = f'postgresql+psycopg://postgres:postgres@127.0.0.1:{psql_docker}/jobsync'
-    engine = create_engine(connection_string, pool_pre_ping=True, pool_size=10, max_overflow=5)
+    engine = create_engine(
+        connection_string,
+        pool_pre_ping=True,
+        pool_size=10,
+        max_overflow=5)
 
-    create_extensions(engine)
+    with engine.connect() as conn:
+        conn.execute(text('create extension if not exists hstore'))
+        conn.commit()
     terminate_postgres_connections(engine)
     engine.dispose()
 
-    engine = create_engine(connection_string, pool_pre_ping=True, pool_size=10, max_overflow=5)
+    engine = create_engine(
+        connection_string,
+        pool_pre_ping=True,
+        pool_size=10,
+        max_overflow=5)
     schema.ensure_database_ready(engine, 'sync_')
 
     tables = schema.get_table_names('sync_')
-    with engine.connect() as conn:
-        conn.execute(text(f"""
-CREATE TABLE IF NOT EXISTS {tables['Inst']} (
+    sql = f"""
+create table if not exists {tables['Inst']} (
     item varchar not null,
     done boolean not null
 );
-        """))
+"""
+    with engine.connect() as conn:
+        conn.execute(text(sql))
         conn.commit()
 
     try:
         yield engine
     finally:
         terminate_postgres_connections(engine)
-        drop_tables(engine, 'sync_')
+        with engine.connect() as conn:
+            for table in [
+                tables['Rebalance'],
+                tables['RebalanceLock'],
+                tables['LeaderLock'],
+                tables['Lock'],
+                tables['Token'],
+                tables['Claim'],
+                tables['Inst'],
+                tables['Audit'],
+                tables['Check'],
+                tables['Node'],
+                ]:
+                conn.execute(text(f'drop table if exists {table}'))
+            conn.commit()
         engine.dispose()

@@ -1,6 +1,7 @@
 """Tests for error handling, resilience, and edge cases.
 
-USE THIS FILE FOR:
+Scope
+-----
 - Error handling and recovery tests
 - Thread failure scenarios
 - Database failure scenarios
@@ -27,7 +28,10 @@ from jobsync.client import retry_with_backoff
 logger = logging.getLogger(__name__)
 
 
-def skew_client_clock(monkeypatch, skew: datetime.timedelta) -> None:
+def skew_client_clock(
+    monkeypatch: pytest.MonkeyPatch,
+    skew: datetime.timedelta
+) -> None:
     """Shift the wall clock jobsync.client reads, leaving the database clock.
 
     Parameters
@@ -43,7 +47,7 @@ def skew_client_clock(monkeypatch, skew: datetime.timedelta) -> None:
     class SkewedDatetime(real_datetime):
 
         @classmethod
-        def now(cls, tz=None):
+        def now(cls, tz: datetime.tzinfo | None = None) -> datetime.datetime:
             return real_datetime.now(tz) - skew
 
     skewed_module = types.SimpleNamespace(
@@ -55,7 +59,8 @@ def skew_client_clock(monkeypatch, skew: datetime.timedelta) -> None:
 
 
 class TestThreadShutdown:
-    """Test thread shutdown behavior and responsiveness."""
+    """Test thread shutdown behavior and responsiveness.
+    """
 
     def test_fast_shutdown(self, postgres):
         """Verify __exit__ of a running leader returns within 3s.
@@ -96,7 +101,13 @@ class TestThreadShutdown:
         try:
             assert wait_for_state(node, JobState.RUNNING_LEADER, timeout_sec=5)
 
-            monitor_names = {'heartbeat', 'health', 'token_refresh', 'dead_node', 'rebalance'}
+            monitor_names = {
+                'heartbeat',
+                'health',
+                'token_refresh',
+                'dead_node',
+                'rebalance',
+                }
             assert monitor_names <= set(node._monitors), \
                 f'Leader should run {monitor_names}, has {set(node._monitors)}'
             assert all(node._monitors[name].thread.is_alive() for name in monitor_names)
@@ -123,7 +134,8 @@ class TestThreadShutdown:
             node = create_job('node1', postgres, coordination_config=config)
             node.__enter__()
 
-            assert wait_for_running_state(node, timeout_sec=5), 'Should reach running state'
+            assert wait_for_running_state(node, timeout_sec=5), \
+                'Should reach running state'
 
             node.__exit__(None, None, None)
 
@@ -133,7 +145,8 @@ class TestThreadShutdown:
             and 'did not stop within timeout' in record.getMessage()
             ]
 
-        assert timeout_warnings == [], f'Should have no thread timeout warnings, found: {timeout_warnings}'
+        assert timeout_warnings == [], \
+            f'Should have no thread timeout warnings, found: {timeout_warnings}'
 
     def test_shutdown_with_long_intervals(self, postgres):
         """Verify shutdown stays fast when monitor intervals are 60s.
@@ -146,8 +159,7 @@ class TestThreadShutdown:
         coord_config = CoordinationConfig(
             heartbeat_interval_sec=60,
             health_check_interval_sec=60,
-            token_refresh_steady_interval_sec=60
-        )
+            token_refresh_steady_interval_sec=60)
 
         node = create_job('node1', postgres, coordination_config=coord_config)
         node.__enter__()
@@ -158,11 +170,13 @@ class TestThreadShutdown:
         node.__exit__(None, None, None)
         elapsed = time.time() - start
 
-        assert elapsed < 3, f'Shutdown with long intervals took {elapsed:.1f}s (should be < 3s)'
+        assert elapsed < 3, \
+            f'Shutdown with long intervals took {elapsed:.1f}s (should be < 3s)'
 
 
 class TestMonitorRepeatedFailures:
-    """Test monitor behavior with repeated check() failures."""
+    """Test monitor behavior with repeated check() failures.
+    """
 
     def test_heartbeat_monitor_recovers_from_transient_failures(self, postgres):
         """Verify the heartbeat resumes after five consecutive check() errors.
@@ -175,8 +189,7 @@ class TestMonitorRepeatedFailures:
         """
         coord_config = CoordinationConfig(
             heartbeat_interval_sec=0.5,
-            heartbeat_timeout_sec=10
-        )
+            heartbeat_timeout_sec=10)
 
         job = create_job('node1', postgres, coordination_config=coord_config)
         job.__enter__()
@@ -200,7 +213,9 @@ class TestMonitorRepeatedFailures:
                 f'Monitor should keep calling check(), got {failure_count[0]} failures'
             heartbeat_after_failures = job.cluster.last_heartbeat_sent
 
-            assert wait_for(lambda: job.cluster.last_heartbeat_sent > heartbeat_after_failures, timeout_sec=5), \
+            assert wait_for(
+                lambda: job.cluster.last_heartbeat_sent > heartbeat_after_failures,
+                timeout_sec=5), \
                 'Heartbeat should resume after the failures stop'
             assert heartbeat_monitor.thread.is_alive(), \
                 'Monitor thread should still be alive after failures'
@@ -218,8 +233,7 @@ class TestMonitorRepeatedFailures:
         """
         coord_config = CoordinationConfig(
             health_check_interval_sec=0.3,
-            heartbeat_timeout_sec=10
-        )
+            heartbeat_timeout_sec=10)
 
         job = create_job('node1', postgres, coordination_config=coord_config)
         job.__enter__()
@@ -242,7 +256,8 @@ class TestMonitorRepeatedFailures:
             assert wait_for(lambda: call_count[0] >= 5, timeout_sec=10), \
                 f'Monitor should keep calling check() after failures, got {call_count[0]} calls'
             assert health_monitor.thread.is_alive(), 'Thread should still be alive'
-            assert not job._shutdown_event.is_set(), 'Should not trigger shutdown from transient failures'
+            assert not job._shutdown_event.is_set(), \
+                'Should not trigger shutdown from transient failures'
 
         finally:
             job.__exit__(None, None, None)
@@ -257,8 +272,7 @@ class TestMonitorRepeatedFailures:
         """
         coord_config = CoordinationConfig(
             heartbeat_interval_sec=0.3,
-            heartbeat_timeout_sec=10
-        )
+            heartbeat_timeout_sec=10)
 
         with caplog.at_level(logging.ERROR):
             job = create_job('node1', postgres, coordination_config=coord_config)
@@ -277,10 +291,10 @@ class TestMonitorRepeatedFailures:
                         record.levelno == logging.ERROR
                         and 'heartbeat-node1 monitor error' in record.getMessage()
                         and 'Intentional test failure' in record.getMessage()
-                        for record in list(caplog.records)
-                        )
+                        for record in list(caplog.records))
 
-                assert wait_for(monitor_error_logged, timeout_sec=5), 'Should log monitor errors at ERROR'
+                assert wait_for(monitor_error_logged, timeout_sec=5), \
+                    'Should log monitor errors at ERROR'
 
             finally:
                 job.__exit__(None, None, None)
@@ -298,8 +312,7 @@ class TestMonitorRepeatedFailures:
             health_check_interval_sec=0.3,
             dead_node_check_interval_sec=0.3,
             rebalance_check_interval_sec=0.3,
-            heartbeat_timeout_sec=10
-        )
+            heartbeat_timeout_sec=10)
 
         job = create_job('leader', postgres, coordination_config=coord_config)
         job.__enter__()
@@ -307,7 +320,10 @@ class TestMonitorRepeatedFailures:
         try:
             assert wait_for_state(job, JobState.RUNNING_LEADER, timeout_sec=10)
 
-            monitors = {name: job._monitors[name] for name in ('heartbeat', 'health', 'dead_node')}
+            monitors = {
+                name: job._monitors[name]
+                for name in ('heartbeat', 'health', 'dead_node')
+                }
             failure_counts = dict.fromkeys(monitors, 0)
 
             def make_failing_check(name, original_check):
@@ -321,11 +337,14 @@ class TestMonitorRepeatedFailures:
             for name, monitor in monitors.items():
                 monitor.check = make_failing_check(name, monitor.check)
 
-            assert wait_for(lambda: all(count == 2 for count in failure_counts.values()), timeout_sec=10), \
+            assert wait_for(
+                lambda: all(count == 2 for count in failure_counts.values()),
+                timeout_sec=10), \
                 f'Each monitor should fail twice, got {failure_counts}'
             assert all(monitor.thread.is_alive() for monitor in monitors.values()), \
                 'All monitors should still be running'
-            assert job.state_machine.state == JobState.RUNNING_LEADER, 'Job should remain leader'
+            assert job.state_machine.state == JobState.RUNNING_LEADER, \
+                'Job should remain leader'
             assert job.am_i_healthy(), 'Job should remain healthy'
 
         finally:
@@ -333,7 +352,8 @@ class TestMonitorRepeatedFailures:
 
 
 class TestDatabaseReconnection:
-    """Test database reconnection after failures."""
+    """Test database reconnection after failures.
+    """
 
     def test_reconnection_after_connection_closes(self, postgres, caplog):
         """Verify monitors survive dropped pool connections without an error.
@@ -346,8 +366,7 @@ class TestDatabaseReconnection:
         """
         coord_config = CoordinationConfig(
             heartbeat_interval_sec=0.5,
-            heartbeat_timeout_sec=10
-        )
+            heartbeat_timeout_sec=10)
 
         with caplog.at_level(logging.WARNING):
             job = create_job('node1', postgres, coordination_config=coord_config)
@@ -371,7 +390,9 @@ and state = 'idle'
                 terminated_at = datetime.datetime.now(datetime.timezone.utc)
 
                 assert terminated, 'Should terminate at least one idle backend'
-                assert wait_for(lambda: job.cluster.last_heartbeat_sent > terminated_at, timeout_sec=5), \
+                assert wait_for(
+                    lambda: job.cluster.last_heartbeat_sent > terminated_at,
+                    timeout_sec=5), \
                     'Heartbeat should continue after its connections close'
 
                 connection_errors = [
@@ -379,14 +400,16 @@ and state = 'idle'
                     if 'monitor error' in record.getMessage()
                     or 'Failed to check leader status' in record.getMessage()
                     ]
-                assert connection_errors == [], f'Reconnect should be silent, got {connection_errors}'
+                assert connection_errors == [], \
+                    f'Reconnect should be silent, got {connection_errors}'
 
             finally:
                 job.__exit__(None, None, None)
 
 
 class TestRetryWithBackoff:
-    """Test retry logic with exponential backoff."""
+    """Test retry logic with exponential backoff.
+    """
 
     def test_succeeds_on_first_attempt(self):
         """Verify a succeeding function is called once and its value returned.
@@ -478,7 +501,8 @@ class TestRetryWithBackoff:
 
 
 class TestFollowerJoinDistribution:
-    """Test token distribution to a follower that joins a running leader."""
+    """Test token distribution to a follower that joins a running leader.
+    """
 
     @clean_tables('Node', 'Token')
     def test_distribution_succeeds_with_healthy_leader(self, postgres):
@@ -489,7 +513,9 @@ class TestFollowerJoinDistribution:
         Oracle: token ids 0-99 for total_tokens=100, split over exactly
             the two node names.
         """
-        config = get_coordination_config(total_tokens=100, token_distribution_timeout_sec=15)
+        config = get_coordination_config(
+            total_tokens=100,
+            token_distribution_timeout_sec=15)
         tables = schema.get_table_names(config.appname)
 
         leader = create_job('healthy-leader', postgres, coordination_config=config)
@@ -506,7 +532,8 @@ class TestFollowerJoinDistribution:
                 assert follower.my_tokens, 'Follower should own tokens after __enter__'
 
                 assignments = get_token_assignments(postgres, tables)
-                assert set(assignments) == set(range(100)), 'Every token should have an owner'
+                assert set(assignments) == set(range(100)), \
+                    'Every token should have an owner'
                 assert set(assignments.values()) == {'healthy-leader', 'follower'}
 
             finally:
@@ -517,7 +544,8 @@ class TestFollowerJoinDistribution:
 
 
 class TestTimezoneAware:
-    """Test timezone-aware datetime enforcement."""
+    """Test timezone-aware datetime enforcement.
+    """
 
     def test_ensure_timezone_aware_accepts_utc(self):
         """Verify an aware UTC datetime is returned as the same object.
@@ -567,13 +595,15 @@ class TestTimezoneAware:
         job = create_job('test-node', postgres, coordination_config=config)
 
         try:
-            assert job._created_on.tzinfo is not None, 'created_on should be timezone-aware'
+            assert job._created_on.tzinfo is not None, \
+                'created_on should be timezone-aware'
         finally:
             job.__exit__(None, None, None)
 
 
 class TestTokenDistributionValidation:
-    """Test defensive validation in token distribution."""
+    """Test defensive validation in token distribution.
+    """
 
     @clean_tables('Node', 'Token')
     def test_validates_assignment_count(self, postgres, monkeypatch):
@@ -599,7 +629,8 @@ class TestTokenDistributionValidation:
             with pytest.raises(ValueError, match='11 > 10'):
                 job.tokens.distribute(job.locks, job.cluster)
 
-            assert get_token_assignments(postgres, tables) == {}, 'Rejected distribution should write nothing'
+            assert get_token_assignments(postgres, tables) == {}, \
+                'Rejected distribution should write nothing'
 
         finally:
             job.__exit__(None, None, None)
@@ -627,14 +658,16 @@ class TestTokenDistributionValidation:
             with pytest.raises(ValueError, match='ghost'):
                 job.tokens.distribute(job.locks, job.cluster)
 
-            assert get_token_assignments(postgres, tables) == {}, 'Rejected distribution should write nothing'
+            assert get_token_assignments(postgres, tables) == {}, \
+                'Rejected distribution should write nothing'
 
         finally:
             job.__exit__(None, None, None)
 
 
 class TestCorruptLockPatternHandling:
-    """Test handling of corrupted lock pattern data."""
+    """Test handling of corrupted lock pattern data.
+    """
 
     @clean_tables('Lock')
     def test_handles_invalid_json_in_patterns(self, postgres):
@@ -648,8 +681,20 @@ class TestCorruptLockPatternHandling:
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
         insert_lock(postgres, tables, 1, ['valid-pattern'], created_by='test')
-        insert_lock(postgres, tables, 2, [], created_by='test', raw_patterns=json.dumps('[not json'))
-        insert_lock(postgres, tables, 3, [], created_by='test', raw_patterns=json.dumps(json.dumps(['legacy-pattern'])))
+        insert_lock(
+            postgres,
+            tables,
+            2,
+            [],
+            created_by='test',
+            raw_patterns=json.dumps('[not json'))
+        insert_lock(
+            postgres,
+            tables,
+            3,
+            [],
+            created_by='test',
+            raw_patterns=json.dumps(json.dumps(['legacy-pattern'])))
 
         job = create_job('test', postgres, coordination_config=config)
 
@@ -675,8 +720,14 @@ class TestCorruptLockPatternHandling:
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
         insert_lock(postgres, tables, 1, ['valid'], created_by='test')
-        insert_lock(postgres, tables, 2, [], created_by='test',
-                    reason='invalid - object not list', raw_patterns=json.dumps({'node': 'node1'}))
+        insert_lock(
+            postgres,
+            tables,
+            2,
+            [],
+            created_by='test',
+            reason='invalid - object not list',
+            raw_patterns=json.dumps({'node': 'node1'}))
 
         job = create_job('test', postgres, coordination_config=config)
 
@@ -691,7 +742,8 @@ class TestCorruptLockPatternHandling:
 
 
 class TestDatabaseNOWConsistency:
-    """Test that database NOW() is used for timestamps."""
+    """Test that database NOW() is used for timestamps.
+    """
 
     @clean_tables('Token', 'Node')
     def test_token_assigned_at_uses_database_now(self, postgres, monkeypatch):
@@ -716,7 +768,8 @@ class TestDatabaseNOWConsistency:
             after_distribute = datetime.datetime.now(datetime.timezone.utc)
 
             with postgres.connect() as conn:
-                result = conn.execute(text(f'select min(assigned_at), max(assigned_at) from {tables["Token"]}'))
+                result = conn.execute(
+                    text(f'select min(assigned_at), max(assigned_at) from {tables["Token"]}'))
                 earliest, latest = result.one()
 
             assert before_distribute <= earliest <= latest <= after_distribute, \
@@ -750,7 +803,8 @@ class TestDatabaseNOWConsistency:
                 result = conn.execute(text(f'select created_at from {tables["Lock"]}'))
                 created_at = result.scalar()
 
-            assert before <= created_at <= after, 'created_at should be between register call times'
+            assert before <= created_at <= after, \
+                'created_at should be between register call times'
 
         finally:
             job.__exit__(None, None, None)
@@ -778,17 +832,20 @@ class TestDatabaseNOWConsistency:
             after = datetime.datetime.now(datetime.timezone.utc)
 
             with postgres.connect() as conn:
-                result = conn.execute(text(f'select triggered_at from {tables["Rebalance"]}'))
+                result = conn.execute(
+                    text(f'select triggered_at from {tables["Rebalance"]}'))
                 triggered_at = result.scalar_one()
 
-            assert before <= triggered_at <= after, 'triggered_at should be between distribute call times'
+            assert before <= triggered_at <= after, \
+                'triggered_at should be between distribute call times'
 
         finally:
             job.__exit__(None, None, None)
 
 
 class TestStaleTaskOwnership:
-    """Test validation of task ownership at audit write time."""
+    """Test validation of task ownership at audit write time.
+    """
 
     @clean_tables('Audit')
     def test_task_ownership_not_revalidated_at_write_time(self, postgres):
@@ -807,7 +864,9 @@ class TestStaleTaskOwnership:
         try:
             task_id_by_token = {}
             for candidate_id in range(1000):
-                task_id_by_token.setdefault(job.task_to_token(candidate_id), candidate_id)
+                task_id_by_token.setdefault(
+                    job.task_to_token(candidate_id),
+                    candidate_id)
             queued_task_ids = [task_id_by_token[token_id] for token_id in (1, 2, 3)]
 
             job.state_machine.state = JobState.RUNNING_FOLLOWER
@@ -816,18 +875,21 @@ class TestStaleTaskOwnership:
             for task_id in queued_task_ids:
                 job.add_task(Task(task_id))
 
-            assert len(job.tasks._tasks) == 3, 'Should queue all 3 tasks with valid ownership'
+            assert len(job.tasks._tasks) == 3, \
+                'Should queue all 3 tasks with valid ownership'
 
             job.tokens.my_tokens = set()
 
             job.write_audit()
 
             with postgres.connect() as conn:
-                result = conn.execute(text(f'select task_id from {tables["Audit"]} where node = :node'),
-                                      {'node': 'node1'})
+                result = conn.execute(
+                    text(f'select task_id from {tables["Audit"]} where node = :node'),
+                    {'node': 'node1'})
                 audited_task_ids = sorted(row[0] for row in result)
 
-            assert audited_task_ids == sorted(str(task_id) for task_id in queued_task_ids), \
+            assert audited_task_ids == sorted(
+                str(task_id) for task_id in queued_task_ids), \
                 'All 3 tasks written despite no longer owning tokens'
 
         finally:

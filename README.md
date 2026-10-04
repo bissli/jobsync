@@ -309,7 +309,7 @@ pytest tests/test_coordination.py -v
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.11+
 - PostgreSQL 12+
 - Required packages: psycopg (psycopg3), sqlalchemy (installed automatically)
 

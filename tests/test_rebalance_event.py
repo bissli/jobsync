@@ -1,10 +1,13 @@
 """Tests for RebalanceEvent and the on_rebalance arity-dispatch shim.
 
-USE THIS FILE FOR:
+Scope
+-----
 - Unit tests of invoke_callback's backward-compatible arity detection
 - Integration tests asserting the RebalanceEvent payload at the call sites
 """
 import threading
+from collections.abc import Callable
+from typing import Any
 
 from fixtures import *  # noqa: F401, F403
 
@@ -12,15 +15,19 @@ import jobsync.client as jc
 from jobsync import RebalanceEvent
 from jobsync.client import CoordinationConfig, TokenDistributor
 
-SAMPLE = RebalanceEvent(is_initial=True, token_version=178, tokens_added=82, tokens_removed=0)
+SAMPLE = RebalanceEvent(
+    is_initial=True,
+    token_version=178,
+    tokens_added=82,
+    tokens_removed=0)
 
 
-def run_callback(callback, event):
+def run_callback(callback: Callable[..., Any], event: RebalanceEvent) -> None:
     """Dispatch callback via invoke_callback and wait for the pool to drain.
 
     Parameters
     ----------
-    callback : callable
+    callback : Callable[..., Any]
         Callback under test. An exception it raises is logged by the
         distributor, never re-raised here.
     event : RebalanceEvent
@@ -32,7 +39,8 @@ def run_callback(callback, event):
 
 
 class TestArityDispatch:
-    """invoke_callback passes the event only to callbacks that accept one."""
+    """invoke_callback passes the event only to callbacks that accept one.
+    """
 
     def test_one_arg_callback_receives_event(self):
         """Verify a one-argument callable receives the RebalanceEvent.
@@ -129,13 +137,14 @@ class TestArityDispatch:
 
 
 class EventTracker:
-    """Capture RebalanceEvent objects delivered to on_rebalance."""
+    """Capture RebalanceEvent objects delivered to on_rebalance.
+    """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.events = []
         self.lock = threading.Lock()
 
-    def on_rebalance(self, event=None):
+    def on_rebalance(self, event: RebalanceEvent | None = None) -> None:
         """Record the event passed by jobsync.
         """
         with self.lock:
@@ -143,7 +152,8 @@ class EventTracker:
 
 
 class TestRebalanceEventPayload:
-    """The call sites build a correct RebalanceEvent."""
+    """The call sites build a correct RebalanceEvent.
+    """
 
     def test_initial_assignment_event_is_initial(self, postgres):
         """Verify a lone node's first assignment delivers the exact event.
@@ -156,8 +166,12 @@ class TestRebalanceEventPayload:
         coord_cfg = get_coordination_config()
         tracker = EventTracker()
 
-        with create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
-                        on_rebalance=tracker.on_rebalance) as job:
+        with create_job(
+            'node1',
+            postgres,
+            coordination_config=coord_cfg,
+            wait_on_enter=10,
+            on_rebalance=tracker.on_rebalance) as job:
             assert wait_for(lambda: len(job.my_tokens) >= 1, timeout_sec=15)
             assert wait_for(lambda: len(tracker.events) >= 1, timeout_sec=15)
 
@@ -178,8 +192,12 @@ class TestRebalanceEventPayload:
         coord_cfg = get_coordination_config()
         tracker = EventTracker()
 
-        job1 = create_job('node1', postgres, coordination_config=coord_cfg, wait_on_enter=10,
-                          on_rebalance=tracker.on_rebalance)
+        job1 = create_job(
+            'node1',
+            postgres,
+            coordination_config=coord_cfg,
+            wait_on_enter=10,
+            on_rebalance=tracker.on_rebalance)
         job1.__enter__()
 
         try:
@@ -190,7 +208,11 @@ class TestRebalanceEventPayload:
             with tracker.lock:
                 tracker.events.clear()
 
-            job2 = create_job('node2', postgres, coordination_config=coord_cfg, wait_on_enter=10)
+            job2 = create_job(
+                'node2',
+                postgres,
+                coordination_config=coord_cfg,
+                wait_on_enter=10)
             job2.__enter__()
 
             try:
@@ -199,12 +221,15 @@ class TestRebalanceEventPayload:
                     lambda: any(
                         e is not None and not e.is_initial and e.tokens_removed > 0
                         for e in tracker.events),
-                    timeout_sec=15), 'node1 should receive a non-initial event with tokens removed'
-                assert tracker.events == [RebalanceEvent(
-                    is_initial=False,
-                    token_version=2,
-                    tokens_added=0,
-                    tokens_removed=coord_cfg.total_tokens // 2)]
+                    timeout_sec=15), \
+                    'node1 should receive a non-initial event with tokens removed'
+                assert tracker.events == [
+                    RebalanceEvent(
+                        is_initial=False,
+                        token_version=2,
+                        tokens_added=0,
+                        tokens_removed=coord_cfg.total_tokens // 2),
+                    ]
             finally:
                 job2.__exit__(None, None, None)
         finally:

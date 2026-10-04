@@ -1,6 +1,7 @@
 """Unit tests for individual components and algorithms.
 
-USE THIS FILE FOR:
+Scope
+-----
 - Pure unit tests with no database required (or minimal DB usage)
 - Algorithm verification (hashing, distribution, pattern matching)
 - Data structure validation
@@ -26,7 +27,8 @@ logger = logging.getLogger(__name__)
 
 
 class TestStateTransitions:
-    """Test valid and invalid state transitions."""
+    """Test valid and invalid state transitions.
+    """
 
     def test_initial_state(self):
         """Verify a new state machine starts in INITIALIZING.
@@ -45,19 +47,23 @@ class TestStateTransitions:
         """
         sm = JobStateMachine()
 
-        assert sm.transition_to(JobState.CLUSTER_FORMING), 'Should transition to CLUSTER_FORMING'
+        assert sm.transition_to(JobState.CLUSTER_FORMING), \
+            'Should transition to CLUSTER_FORMING'
         assert sm.state == JobState.CLUSTER_FORMING
 
         assert sm.transition_to(JobState.ELECTING), 'Should transition to ELECTING'
         assert sm.state == JobState.ELECTING
 
-        assert sm.transition_to(JobState.DISTRIBUTING), 'Should transition to DISTRIBUTING'
+        assert sm.transition_to(JobState.DISTRIBUTING), \
+            'Should transition to DISTRIBUTING'
         assert sm.state == JobState.DISTRIBUTING
 
-        assert sm.transition_to(JobState.RUNNING_FOLLOWER), 'Should transition to RUNNING_FOLLOWER'
+        assert sm.transition_to(JobState.RUNNING_FOLLOWER), \
+            'Should transition to RUNNING_FOLLOWER'
         assert sm.state == JobState.RUNNING_FOLLOWER
 
-        assert sm.transition_to(JobState.SHUTTING_DOWN), 'Should transition to SHUTTING_DOWN'
+        assert sm.transition_to(JobState.SHUTTING_DOWN), \
+            'Should transition to SHUTTING_DOWN'
         assert sm.state == JobState.SHUTTING_DOWN
 
     def test_leader_lifecycle_transitions(self):
@@ -73,10 +79,12 @@ class TestStateTransitions:
         sm.transition_to(JobState.ELECTING)
         sm.transition_to(JobState.DISTRIBUTING)
 
-        assert sm.transition_to(JobState.RUNNING_LEADER), 'Should transition to RUNNING_LEADER'
+        assert sm.transition_to(JobState.RUNNING_LEADER), \
+            'Should transition to RUNNING_LEADER'
         assert sm.state == JobState.RUNNING_LEADER
 
-        assert sm.transition_to(JobState.SHUTTING_DOWN), 'Should transition to SHUTTING_DOWN'
+        assert sm.transition_to(JobState.SHUTTING_DOWN), \
+            'Should transition to SHUTTING_DOWN'
         assert sm.state == JobState.SHUTTING_DOWN
 
     def test_leader_follower_transitions(self):
@@ -93,10 +101,12 @@ class TestStateTransitions:
         sm.transition_to(JobState.DISTRIBUTING)
         sm.transition_to(JobState.RUNNING_FOLLOWER)
 
-        assert sm.transition_to(JobState.RUNNING_LEADER), 'Follower should promote to leader'
+        assert sm.transition_to(JobState.RUNNING_LEADER), \
+            'Follower should promote to leader'
         assert sm.state == JobState.RUNNING_LEADER
 
-        assert sm.transition_to(JobState.RUNNING_FOLLOWER), 'Leader should demote to follower'
+        assert sm.transition_to(JobState.RUNNING_FOLLOWER), \
+            'Leader should demote to follower'
         assert sm.state == JobState.RUNNING_FOLLOWER
 
     def test_invalid_transition_rejected(self):
@@ -111,7 +121,8 @@ class TestStateTransitions:
 
         result = sm.transition_to(JobState.RUNNING_LEADER)
         assert not result, 'Should reject invalid transition'
-        assert sm.state == JobState.INITIALIZING, 'State should not change on invalid transition'
+        assert sm.state == JobState.INITIALIZING, \
+            'State should not change on invalid transition'
 
     def test_skip_invalid_state_rejected(self):
         """Verify CLUSTER_FORMING -> DISTRIBUTING, skipping ELECTING, fails.
@@ -153,9 +164,9 @@ class TestStateTransitions:
         assert result, 'Transition to same state should succeed'
         assert sm.state == JobState.INITIALIZING
 
-    @pytest.mark.parametrize('from_state', [
-        state for state in JobState if state != JobState.SHUTTING_DOWN
-        ])
+    @pytest.mark.parametrize(
+        'from_state',
+        [state for state in JobState if state != JobState.SHUTTING_DOWN])
     def test_shutting_down_from_any_state(self, from_state):
         """Verify SHUTTING_DOWN is reachable from every other state.
 
@@ -170,7 +181,8 @@ class TestStateTransitions:
 
 
 class TestCallbacks:
-    """Test callback registration and invocation."""
+    """Test callback registration and invocation.
+    """
 
     def test_on_enter_callback_invoked(self):
         """Verify the on_enter callback runs once on entering its state.
@@ -252,7 +264,8 @@ class TestCallbacks:
         sm.on_enter(JobState.RUNNING_LEADER, callback)
         sm.transition_to(JobState.RUNNING_LEADER)
 
-        assert len(callback_invoked) == 0, 'Callback should not be invoked for invalid transition'
+        assert len(callback_invoked) == 0, \
+            'Callback should not be invoked for invalid transition'
 
     def test_callback_not_invoked_on_same_state_transition(self):
         """Verify a same-state transition runs no enter or exit callback.
@@ -276,8 +289,10 @@ class TestCallbacks:
 
         sm.transition_to(JobState.INITIALIZING)
 
-        assert enter_count[0] == 0, 'Enter callback should not fire for same-state transition'
-        assert exit_count[0] == 0, 'Exit callback should not fire for same-state transition'
+        assert enter_count[0] == 0, \
+            'Enter callback should not fire for same-state transition'
+        assert exit_count[0] == 0, \
+            'Exit callback should not fire for same-state transition'
 
     def test_callback_exception_handling(self):
         """Verify an on_enter exception propagates after the state changes.
@@ -296,7 +311,8 @@ class TestCallbacks:
         with pytest.raises(RuntimeError):
             sm.transition_to(JobState.CLUSTER_FORMING)
 
-        assert sm.state == JobState.CLUSTER_FORMING, 'State should change despite callback exception'
+        assert sm.state == JobState.CLUSTER_FORMING, \
+            'State should change despite callback exception'
 
     def test_exit_invoked_before_enter(self):
         """Verify on_exit of the source runs before on_enter of the target.
@@ -323,17 +339,40 @@ class TestCallbacks:
 
 
 class TestCanClaimTask:
-    """Test state-dependent task claiming behavior."""
+    """Test state-dependent task claiming behavior.
+    """
 
-    @pytest.mark.parametrize(('state_path', 'expected'), [
-        ([], False),
-        ([JobState.CLUSTER_FORMING], False),
-        ([JobState.CLUSTER_FORMING, JobState.ELECTING], False),
-        ([JobState.CLUSTER_FORMING, JobState.ELECTING, JobState.DISTRIBUTING], False),
-        ([JobState.CLUSTER_FORMING, JobState.ELECTING, JobState.DISTRIBUTING, JobState.RUNNING_FOLLOWER], True),
-        ([JobState.CLUSTER_FORMING, JobState.ELECTING, JobState.DISTRIBUTING, JobState.RUNNING_LEADER], True),
-        ([JobState.CLUSTER_FORMING, JobState.ELECTING, JobState.DISTRIBUTING, JobState.RUNNING_FOLLOWER, JobState.SHUTTING_DOWN], False),
-        ])
+    @pytest.mark.parametrize(
+        ('state_path', 'expected'),
+        [
+            ([], False),
+            ([JobState.CLUSTER_FORMING], False),
+            ([JobState.CLUSTER_FORMING, JobState.ELECTING], False),
+            ([
+                JobState.CLUSTER_FORMING,
+                JobState.ELECTING,
+                JobState.DISTRIBUTING,
+                ], False),
+            ([
+                JobState.CLUSTER_FORMING,
+                JobState.ELECTING,
+                JobState.DISTRIBUTING,
+                JobState.RUNNING_FOLLOWER,
+                ], True),
+            ([
+                JobState.CLUSTER_FORMING,
+                JobState.ELECTING,
+                JobState.DISTRIBUTING,
+                JobState.RUNNING_LEADER,
+                ], True),
+            ([
+                JobState.CLUSTER_FORMING,
+                JobState.ELECTING,
+                JobState.DISTRIBUTING,
+                JobState.RUNNING_FOLLOWER,
+                JobState.SHUTTING_DOWN,
+                ], False),
+            ])
     def test_can_claim_depends_on_state(self, state_path, expected):
         """Verify can_claim_task is True only in the two running states.
 
@@ -376,14 +415,17 @@ class TestCanClaimTask:
 
 
 class TestErrorStateTransitions:
-    """Test ERROR state transitions and behavior."""
+    """Test ERROR state transitions and behavior.
+    """
 
-    @pytest.mark.parametrize('state_path', [
-        [],
-        [JobState.CLUSTER_FORMING],
-        [JobState.CLUSTER_FORMING, JobState.ELECTING],
-        [JobState.CLUSTER_FORMING, JobState.ELECTING, JobState.DISTRIBUTING],
-        ])
+    @pytest.mark.parametrize(
+        'state_path',
+        [
+            [],
+            [JobState.CLUSTER_FORMING],
+            [JobState.CLUSTER_FORMING, JobState.ELECTING],
+            [JobState.CLUSTER_FORMING, JobState.ELECTING, JobState.DISTRIBUTING],
+            ])
     def test_error_state_reachable(self, state_path):
         """Verify ERROR is reachable from each pre-running state.
 
@@ -411,10 +453,12 @@ class TestErrorStateTransitions:
         assert result, 'Should transition to SHUTTING_DOWN from ERROR'
         assert sm.state == JobState.SHUTTING_DOWN
 
-    @pytest.mark.parametrize('running_state', [
-        JobState.RUNNING_LEADER,
-        JobState.RUNNING_FOLLOWER,
-        ])
+    @pytest.mark.parametrize(
+        'running_state',
+        [
+            JobState.RUNNING_LEADER,
+            JobState.RUNNING_FOLLOWER,
+            ])
     def test_cannot_transition_to_error_from_running(self, running_state):
         """Verify a running state rejects a transition to ERROR.
 
@@ -445,9 +489,9 @@ class TestErrorStateTransitions:
 
         assert sm.is_error(), 'is_error() should return True in ERROR state'
 
-    @pytest.mark.parametrize('state', [
-        state for state in JobState if state != JobState.ERROR
-        ])
+    @pytest.mark.parametrize(
+        'state',
+        [state for state in JobState if state != JobState.ERROR])
     def test_is_error_returns_false_in_other_states(self, state):
         """Verify is_error() is False in every state other than ERROR.
 
@@ -472,10 +516,12 @@ class TestErrorStateTransitions:
 
         assert not sm.can_claim_task(), 'Cannot claim tasks in ERROR state'
 
-    @pytest.mark.parametrize('to_state', [
-        state for state in JobState
-        if state not in {JobState.ERROR, JobState.SHUTTING_DOWN}
-        ])
+    @pytest.mark.parametrize(
+        'to_state',
+        [
+            state for state in JobState
+            if state not in {JobState.ERROR, JobState.SHUTTING_DOWN}
+            ])
     def test_error_state_exits_only_to_shutting_down(self, to_state):
         """Verify ERROR rejects a transition to every state but SHUTTING_DOWN.
 
@@ -527,7 +573,8 @@ class TestErrorStateTransitions:
 
 
 class TestTransitionValidation:
-    """Test transition validation logic."""
+    """Test transition validation logic.
+    """
 
     def test_transition_graph_matches_expected_edges(self):
         """Verify transition_to accepts exactly the expected edges.
@@ -621,7 +668,8 @@ class TestTransitionThreadSafety:
 
 
 class TestEventQueue:
-    """Test EventQueue thread-safe event handling."""
+    """Test EventQueue thread-safe event handling.
+    """
 
     def test_publish_single_event(self):
         """Verify a published event keeps its type and data.
@@ -678,7 +726,7 @@ class TestEventQueue:
         assert events == []
 
     def test_consume_all_multiple_events(self):
-        """Verify consume_all returns every pending event in order, then clears.
+        """Verify consume_all returns all pending events in order, then clears.
 
         Mutation: consume_all keeping its events after returning them, or
             returning the live list that its own clear() then empties.
@@ -804,7 +852,8 @@ class TestEventQueue:
 
 
 class TestEventQueueWithHistory:
-    """Test EventQueue ring buffer and history persistence."""
+    """Test EventQueue ring buffer and history persistence.
+    """
 
     def test_history_persists_after_consume(self):
         """Verify consumed events are retained in history.
@@ -990,7 +1039,8 @@ class TestEventQueueWithHistory:
 
 
 class TestJobCoordinationStatus:
-    """Test Job.get_coordination_status() debugging API."""
+    """Test Job.get_coordination_status() debugging API.
+    """
 
     def test_coordination_disabled_returns_minimal_info(self):
         """Verify status when coordination is disabled.
@@ -1076,7 +1126,11 @@ class TestJobCoordinationStatus:
         Oracle: event10 to event29, the last 20 of 30 events published.
         """
         coord_config = get_coordination_config()
-        job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
+        job = create_job(
+            'node1',
+            postgres,
+            coordination_config=coord_config,
+            wait_on_enter=0)
 
         with job:
             for i in range(30):
@@ -1096,7 +1150,11 @@ class TestJobCoordinationStatus:
             either side of publish.
         """
         coord_config = get_coordination_config()
-        job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
+        job = create_job(
+            'node1',
+            postgres,
+            coordination_config=coord_config,
+            wait_on_enter=0)
 
         with job:
             before = time.time()
@@ -1119,7 +1177,11 @@ class TestJobCoordinationStatus:
         Oracle: every coordinated job starts a monitor named coordination.
         """
         coord_config = get_coordination_config()
-        job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
+        job = create_job(
+            'node1',
+            postgres,
+            coordination_config=coord_config,
+            wait_on_enter=0)
 
         with job:
             status = job.get_coordination_status()
@@ -1129,13 +1191,16 @@ class TestJobCoordinationStatus:
 
 
 class TestTaskTokenMapping:
-    """Test task-to-token mapping and related methods."""
+    """Test task-to-token mapping and related methods.
+    """
 
-    @pytest.mark.parametrize(('hash_function', 'int_token', 'str_token'), [
-        ('md5', 5808, 8672),
-        ('sha256', 6717, 3581),
-        ('double_sha256', 107, 9302),
-        ])
+    @pytest.mark.parametrize(
+        ('hash_function', 'int_token', 'str_token'),
+        [
+            ('md5', 5808, 8672),
+            ('sha256', 6717, 3581),
+            ('double_sha256', 107, 9302),
+            ])
     def test_consistent_hashing(self, hash_function, int_token, str_token):
         """Verify every process maps a task ID to the same pinned token.
 
@@ -1157,7 +1222,11 @@ class TestTaskTokenMapping:
         Oracle: the module-level task_to_token with the configured values.
         """
         coord_config = CoordinationConfig(total_tokens=100, hash_function=hash_function)
-        job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
+        job = create_job(
+            'node1',
+            postgres,
+            coordination_config=coord_config,
+            wait_on_enter=0)
 
         with job:
             for task_id in [0, 1, 99, 'string-task', 'another-task']:
@@ -1232,16 +1301,18 @@ class TestTaskTokenMapping:
             f'String ID bucket imbalance {imbalance} exceeds 30% threshold ({hash_function})'
 
     @pytest.mark.parametrize('hash_function', ['md5', 'sha256', 'double_sha256'])
-    @pytest.mark.parametrize('task_id', [
-        0,
-        -1,
-        -999999,
-        999999999,
-        '',
-        'unicode-\u03c4\u03b5\u03c3\u03c4-\u65e5\u672c',
-        None,
-        (1, 2, 3),
-        ])
+    @pytest.mark.parametrize(
+        'task_id',
+        [
+            0,
+            -1,
+            -999999,
+            999999999,
+            '',
+            'unicode-\u03c4\u03b5\u03c3\u03c4-\u65e5\u672c',
+            None,
+            (1, 2, 3),
+            ])
     def test_edge_case_task_ids(self, task_id, hash_function):
         """Verify unusual hashable task IDs map to a token in range.
 
@@ -1254,7 +1325,8 @@ class TestTaskTokenMapping:
 
 
 class TestCoordinationConfig:
-    """Test CoordinationConfig validation and consistency."""
+    """Test CoordinationConfig validation and consistency.
+    """
 
     def test_task_mapping_defaults_pinned(self):
         """Verify the defaults that fix the task-to-token mapping stay put.
@@ -1286,7 +1358,9 @@ class TestCoordinationConfig:
             a node starts.
         """
         config = CoordinationConfig()
-        assert config.token_refresh_steady_interval_sec >= config.token_refresh_initial_interval_sec, \
+        steady_sec = config.token_refresh_steady_interval_sec
+        initial_sec = config.token_refresh_initial_interval_sec
+        assert steady_sec >= initial_sec, \
             'Steady interval should be >= initial interval'
 
     def test_stale_lock_ages_are_reasonable(self):
@@ -1297,12 +1371,14 @@ class TestCoordinationConfig:
         Oracle: leader_lock_timeout_sec, the default acquisition window.
         """
         config = CoordinationConfig()
-        assert config.stale_leader_lock_age_sec >= 10 * config.leader_lock_timeout_sec, \
+        lock_timeout_sec = config.leader_lock_timeout_sec
+        assert config.stale_leader_lock_age_sec >= 10 * lock_timeout_sec, \
             'Stale lock age should be much greater than lock timeout'
 
 
 class TestTaskComparison:
-    """Test Task comparison and sorting operations."""
+    """Test Task comparison and sorting operations.
+    """
 
     def test_task_equality(self):
         """Verify tasks with same ID are equal.
@@ -1324,11 +1400,13 @@ class TestTaskComparison:
         task2 = create_task(2, 'same_name')
         assert task1 != task2
 
-    @pytest.mark.parametrize(('id1', 'id2', 'expected_lt', 'expected_gt'), [
-        (1, 2, True, False),
-        (2, 1, False, True),
-        (1, 1, False, False),
-    ])
+    @pytest.mark.parametrize(
+        ('id1', 'id2', 'expected_lt', 'expected_gt'),
+        [
+            (1, 2, True, False),
+            (2, 1, False, True),
+            (1, 1, False, False),
+            ])
     def test_task_comparisons(self, id1, id2, expected_lt, expected_gt):
         """Verify < and > order tasks by ID and are both false on a tie.
 
@@ -1390,14 +1468,17 @@ class TestTaskComparison:
 
 
 class TestBasicDistribution:
-    """Test basic token distribution scenarios."""
+    """Test basic token distribution scenarios.
+    """
 
-    @pytest.mark.parametrize(('total_tokens', 'nodes', 'expected_counts'), [
-        (100, [], {}),
-        (100, ['node1'], {'node1': 100}),
-        (100, ['node1', 'node2'], {'node1': 50, 'node2': 50}),
-        (100, ['node1', 'node2', 'node3'], {'node1': 34, 'node2': 33, 'node3': 33}),
-    ])
+    @pytest.mark.parametrize(
+        ('total_tokens', 'nodes', 'expected_counts'),
+        [
+            (100, [], {}),
+            (100, ['node1'], {'node1': 100}),
+            (100, ['node1', 'node2'], {'node1': 50, 'node2': 50}),
+            (100, ['node1', 'node2', 'node3'], {'node1': 34, 'node2': 33, 'node3': 33}),
+            ])
     def test_basic_token_distribution(self, total_tokens, nodes, expected_counts):
         """Verify a fresh distribution splits tokens evenly, remainder first.
 
@@ -1411,8 +1492,7 @@ class TestBasicDistribution:
             active_nodes=nodes,
             current_assignments={},
             locked_tokens={},
-            pattern_matcher=exact_match
-        )
+            pattern_matcher=exact_match)
 
         counts = {}
         for node in assignments.values():
@@ -1435,8 +1515,7 @@ class TestBasicDistribution:
             active_nodes=nodes,
             current_assignments={},
             locked_tokens={},
-            pattern_matcher=exact_match
-        )
+            pattern_matcher=exact_match)
 
         counts = dict.fromkeys(nodes, 0)
         for node in assignments.values():
@@ -1461,7 +1540,7 @@ class TestBasicDistribution:
             **dict.fromkeys(range(55), 'node-a'),
             **dict.fromkeys(range(55, 111), 'node-b'),
             **dict.fromkeys(range(111, 166), 'node-c'),
-        }
+            }
 
         nodes = ['node-a', 'node-b', 'node-c']
 
@@ -1470,8 +1549,7 @@ class TestBasicDistribution:
             active_nodes=nodes,
             current_assignments=current,
             locked_tokens={},
-            pattern_matcher=exact_match
-        )
+            pattern_matcher=exact_match)
 
         counts = dict.fromkeys(nodes, 0)
         for node in assignments.values():
@@ -1482,7 +1560,8 @@ class TestBasicDistribution:
 
 
 class TestMinimalMovement:
-    """Test that algorithm minimizes token movement."""
+    """Test that algorithm minimizes token movement.
+    """
 
     def test_no_movement_when_balanced(self):
         """Verify no tokens move when distribution is already balanced.
@@ -1497,8 +1576,7 @@ class TestMinimalMovement:
             active_nodes=['node1', 'node2'],
             current_assignments=current,
             locked_tokens={},
-            pattern_matcher=exact_match
-        )
+            pattern_matcher=exact_match)
 
         assert moved == 0
         assert assignments == current
@@ -1518,8 +1596,7 @@ class TestMinimalMovement:
             active_nodes=['node1', 'node2'],
             current_assignments=current,
             locked_tokens={},
-            pattern_matcher=exact_match
-        )
+            pattern_matcher=exact_match)
 
         assert len(assignments) == 100
         assert moved == 10
@@ -1531,7 +1608,8 @@ class TestMinimalMovement:
 
 
 class TestLockedTokenBehavior:
-    """Test locked token constraint handling and strict enforcement."""
+    """Test locked token constraint handling and strict enforcement.
+    """
 
     def test_locked_token_assigned_to_pattern(self):
         """Verify locked tokens go to their matching node.
@@ -1546,8 +1624,7 @@ class TestLockedTokenBehavior:
             active_nodes=['node1', 'node2'],
             current_assignments={},
             locked_tokens={0: 'node2', 1: 'node1'},
-            pattern_matcher=exact_match
-        )
+            pattern_matcher=exact_match)
 
         assert assignments[0] == 'node2'
         assert assignments[1] == 'node1'
@@ -1565,17 +1642,16 @@ class TestLockedTokenBehavior:
             active_nodes=['node1', 'node2'],
             current_assignments={},
             locked_tokens={0: 'node1', 1: 'node1', 2: 'node1'},
-            pattern_matcher=exact_match
-        )
+            pattern_matcher=exact_match)
 
         assert assignments[0] == 'node1'
         assert assignments[1] == 'node1'
         assert assignments[2] == 'node1'
 
-        unlocked_node1 = sum(1 for tid, node in assignments.items()
-                             if node == 'node1' and tid >= 3)
-        unlocked_node2 = sum(1 for tid, node in assignments.items()
-                             if node == 'node2' and tid >= 3)
+        unlocked_node1 = sum(
+            1 for tid, node in assignments.items() if node == 'node1' and tid >= 3)
+        unlocked_node2 = sum(
+            1 for tid, node in assignments.items() if node == 'node2' and tid >= 3)
 
         assert unlocked_node1 == 4
         assert unlocked_node2 == 3
@@ -1592,8 +1668,7 @@ class TestLockedTokenBehavior:
             active_nodes=['worker1', 'worker2', 'manager1'],
             current_assignments={},
             locked_tokens={0: 'worker%', 5: 'manager%'},
-            pattern_matcher=wildcard_match
-        )
+            pattern_matcher=wildcard_match)
 
         assert assignments[0] in {'worker1', 'worker2'}
         assert assignments[5] == 'manager1'
@@ -1609,14 +1684,16 @@ class TestLockedTokenBehavior:
             active_nodes=['node1', 'node2'],
             current_assignments={},
             locked_tokens={0: 'node3'},
-            pattern_matcher=exact_match
-        )
+            pattern_matcher=exact_match)
 
-        assert 0 not in assignments, 'Token 0 locked to node3 should NOT be assigned when node3 inactive'
+        assert 0 not in assignments, \
+            'Token 0 locked to node3 should NOT be assigned when node3 inactive'
 
         for token_id in range(1, 10):
-            assert token_id in assignments, f'Unlocked token {token_id} should be assigned'
-            assert assignments[token_id] in {'node1', 'node2'}, f'Unlocked token {token_id} assigned to valid node'
+            assert token_id in assignments, \
+                f'Unlocked token {token_id} should be assigned'
+            assert assignments[token_id] in {'node1', 'node2'}, \
+                f'Unlocked token {token_id} assigned to valid node'
 
     def test_locked_tokens_never_assigned_to_non_matching_nodes(self):
         """Verify locked tokens are NEVER assigned outside their patterns.
@@ -1631,8 +1708,7 @@ class TestLockedTokenBehavior:
             active_nodes=['worker1', 'worker2', 'manager1'],
             current_assignments={},
             locked_tokens={5: 'worker%', 10: 'manager%', 15: 'admin%'},
-            pattern_matcher=wildcard_match
-        )
+            pattern_matcher=wildcard_match)
 
         assert assignments[5] in {'worker1', 'worker2'}, \
             'Token 5 locked to worker% must only go to worker nodes'
@@ -1652,16 +1728,15 @@ class TestLockedTokenBehavior:
         current = {
             5: 'worker2',
             10: 'worker2',
-            15: 'manager1'
-        }
+            15: 'manager1',
+            }
 
         assignments, moved = compute_minimal_move_distribution(
             total_tokens=20,
             active_nodes=['worker1', 'worker2', 'manager1'],
             current_assignments=current,
             locked_tokens={5: 'worker%', 10: 'worker%', 15: 'manager%'},
-            pattern_matcher=wildcard_match
-        )
+            pattern_matcher=wildcard_match)
 
         assert assignments[5] == 'worker2'
         assert assignments[10] == 'worker2'
@@ -1678,16 +1753,15 @@ class TestLockedTokenBehavior:
         """
         current = {
             5: 'manager1',
-            10: 'worker1'
-        }
+            10: 'worker1',
+            }
 
         assignments, moved = compute_minimal_move_distribution(
             total_tokens=20,
             active_nodes=['worker1', 'worker2', 'manager1'],
             current_assignments=current,
             locked_tokens={5: 'worker%', 10: 'manager%'},
-            pattern_matcher=wildcard_match
-        )
+            pattern_matcher=wildcard_match)
 
         assert assignments[5] in {'worker1', 'worker2'}, \
             'Token 5 must move from manager1 to worker node (pattern mismatch)'
@@ -1707,8 +1781,7 @@ class TestLockedTokenBehavior:
             active_nodes=['primary-alpha', 'backup-beta', 'tertiary-gamma'],
             current_assignments={},
             locked_tokens={5: ['primary-%', 'backup-%', 'tertiary-%']},
-            pattern_matcher=wildcard_match
-        )
+            pattern_matcher=wildcard_match)
 
         assert assignments[5] == 'primary-alpha', \
             'Should use first matching pattern (primary-%) over later fallbacks'
@@ -1725,8 +1798,7 @@ class TestLockedTokenBehavior:
             active_nodes=['backup-alpha', 'backup-beta', 'tertiary-gamma'],
             current_assignments={},
             locked_tokens={5: ['primary-%', 'backup-%', 'tertiary-%']},
-            pattern_matcher=wildcard_match
-        )
+            pattern_matcher=wildcard_match)
 
         assert assignments[5] in {'backup-alpha', 'backup-beta'}, \
             'Should use second pattern (backup-%) when first pattern (primary-%) has no matches'
@@ -1743,8 +1815,7 @@ class TestLockedTokenBehavior:
             active_nodes=['tertiary-alpha', 'other-node'],
             current_assignments={},
             locked_tokens={5: ['primary-%', 'backup-%', 'tertiary-%']},
-            pattern_matcher=wildcard_match
-        )
+            pattern_matcher=wildcard_match)
 
         assert assignments.get(5) == 'tertiary-alpha', \
             'Should use third pattern (tertiary-%) when first two patterns fail'
@@ -1760,8 +1831,7 @@ class TestLockedTokenBehavior:
             active_nodes=['other-node1', 'other-node2'],
             current_assignments={},
             locked_tokens={5: ['primary-%', 'backup-%', 'tertiary-%']},
-            pattern_matcher=wildcard_match
-        )
+            pattern_matcher=wildcard_match)
 
         assert 5 not in assignments, \
             'Token should not be assigned when all fallback patterns fail'
@@ -1779,8 +1849,7 @@ class TestLockedTokenBehavior:
             active_nodes=['node1', 'node2', 'node3'],
             current_assignments={},
             locked_tokens={0: 'node1', 1: 'node1', 2: 'node1'},
-            pattern_matcher=exact_match
-        )
+            pattern_matcher=exact_match)
 
         assert assignments[0] == 'node1'
         assert assignments[1] == 'node1'
@@ -1808,10 +1877,9 @@ class TestLockedTokenBehavior:
                 0: 'manager%',
                 5: 'worker%',
                 10: 'worker%',
-                15: 'admin%'
-            },
-            pattern_matcher=wildcard_match
-        )
+                15: 'admin%',
+                },
+            pattern_matcher=wildcard_match)
 
         assert assignments[0] == 'manager1', 'Token 0 locked to manager'
         assert assignments[5] in {'worker1', 'worker2'}, 'Token 5 locked to workers'
@@ -1833,16 +1901,15 @@ class TestLockedTokenBehavior:
         """
         current = {
             5: 'worker1',
-            10: 'manager1'
-        }
+            10: 'manager1',
+            }
 
         assignments, _ = compute_minimal_move_distribution(
             total_tokens=20,
             active_nodes=['worker1', 'worker2', 'worker3'],
             current_assignments=current,
             locked_tokens={5: 'worker%', 10: 'worker%'},
-            pattern_matcher=wildcard_match
-        )
+            pattern_matcher=wildcard_match)
 
         assert assignments[5] == 'worker1', \
             'Token 5 should stay with worker1 (current owner matches pattern)'
@@ -1861,8 +1928,7 @@ class TestLockedTokenBehavior:
             active_nodes=['worker1', 'worker2', 'worker3'],
             current_assignments={},
             locked_tokens=dict.fromkeys(range(10, 20), 'worker%'),
-            pattern_matcher=wildcard_match
-        )
+            pattern_matcher=wildcard_match)
 
         locked_counts = {'worker1': 0, 'worker2': 0, 'worker3': 0}
         for tid in range(10, 20):
@@ -1872,7 +1938,8 @@ class TestLockedTokenBehavior:
 
 
 class TestNodeFailure:
-    """Test handling of node failures and recovery."""
+    """Test handling of node failures and recovery.
+    """
 
     def test_dead_node_tokens_redistributed(self):
         """Verify tokens from dead nodes get redistributed.
@@ -1890,8 +1957,7 @@ class TestNodeFailure:
             active_nodes=['node1', 'node2'],
             current_assignments=current,
             locked_tokens={},
-            pattern_matcher=exact_match
-        )
+            pattern_matcher=exact_match)
 
         assert len(assignments) == 100
         assert 'dead_node' not in assignments.values()
@@ -1921,8 +1987,7 @@ class TestNodeFailure:
             active_nodes=['node1', 'node2', 'node3'],
             current_assignments=current,
             locked_tokens={},
-            pattern_matcher=exact_match
-        )
+            pattern_matcher=exact_match)
 
         counts = {}
         for node in assignments.values():
@@ -1935,7 +2000,8 @@ class TestNodeFailure:
 
 
 class TestDistributionEdgeCases:
-    """Test edge cases and boundary conditions for token distribution."""
+    """Test edge cases and boundary conditions for token distribution.
+    """
 
     def test_more_nodes_than_tokens(self):
         """Verify handling when nodes outnumber tokens.
@@ -1950,10 +2016,15 @@ class TestDistributionEdgeCases:
             active_nodes=['node1', 'node2', 'node3', 'node4', 'node5', 'node6'],
             current_assignments={},
             locked_tokens={},
-            pattern_matcher=exact_match
-        )
+            pattern_matcher=exact_match)
 
-        assert sorted(assignments.values()) == ['node1', 'node2', 'node3', 'node4', 'node5']
+        assert sorted(assignments.values()) == [
+            'node1',
+            'node2',
+            'node3',
+            'node4',
+            'node5',
+            ]
 
     def test_all_tokens_locked(self):
         """Verify behavior when all tokens are locked.
@@ -1968,8 +2039,7 @@ class TestDistributionEdgeCases:
             active_nodes=['node1', 'node2'],
             current_assignments={},
             locked_tokens=locked,
-            pattern_matcher=exact_match
-        )
+            pattern_matcher=exact_match)
 
         assert assignments == locked
 
@@ -1986,8 +2056,7 @@ class TestDistributionEdgeCases:
             active_nodes=['node1', 'node2'],
             current_assignments={},
             locked_tokens=locked,
-            pattern_matcher=wildcard_match
-        )
+            pattern_matcher=wildcard_match)
 
         assert len(assignments) == 0, 'No assignments when locks match no nodes'
 
@@ -2002,8 +2071,7 @@ class TestDistributionEdgeCases:
             active_nodes=['node2', 'node1'],
             current_assignments={},
             locked_tokens={},
-            pattern_matcher=exact_match
-        )
+            pattern_matcher=exact_match)
 
         assert assignments == {0: 'node1'}
 
@@ -2019,16 +2087,14 @@ class TestDistributionEdgeCases:
             active_nodes=['node1', 'node2', 'node3'],
             current_assignments={},
             locked_tokens={},
-            pattern_matcher=exact_match
-        )
+            pattern_matcher=exact_match)
 
         shuffled_result = compute_minimal_move_distribution(
             total_tokens=100,
             active_nodes=['node3', 'node1', 'node2'],
             current_assignments={},
             locked_tokens={},
-            pattern_matcher=exact_match
-        )
+            pattern_matcher=exact_match)
 
         assert shuffled_result == sorted_result
 
@@ -2041,18 +2107,18 @@ class TestDistributionEdgeCases:
             the second pattern.
         """
         locked = {
-            5: ['missing-%', 'special-%', 'node%']
-        }
+            5: ['missing-%', 'special-%', 'node%'],
+            }
 
         assignments, _ = compute_minimal_move_distribution(
             total_tokens=10,
             active_nodes=['node1', 'special-alpha'],
             current_assignments={},
             locked_tokens=locked,
-            pattern_matcher=wildcard_match
-        )
+            pattern_matcher=wildcard_match)
 
-        assert assignments[5] == 'special-alpha', 'Should use second fallback pattern when first fails'
+        assert assignments[5] == 'special-alpha', \
+            'Should use second fallback pattern when first fails'
 
     def test_reverse_iteration_moves_only_excess(self):
         """Verify a rebalance moves only node1's excess, highest ids first.
@@ -2069,8 +2135,7 @@ class TestDistributionEdgeCases:
             active_nodes=['node1', 'node2', 'node3'],
             current_assignments=current,
             locked_tokens={},
-            pattern_matcher=exact_match
-        )
+            pattern_matcher=exact_match)
 
         expected = {
             **dict.fromkeys(range(34), 'node1'),
@@ -2082,7 +2147,8 @@ class TestDistributionEdgeCases:
 
 
 class TestTokenIterationOrder:
-    """Test token iteration order logic during rebalancing."""
+    """Test token iteration order logic during rebalancing.
+    """
 
     def test_reverse_iteration_when_rebalancing_imbalance(self):
         """Verify an over-quota node gives up its highest token ids.
@@ -2099,11 +2165,11 @@ class TestTokenIterationOrder:
             active_nodes=['node1', 'node2'],
             current_assignments=current,
             locked_tokens={},
-            pattern_matcher=exact_match
-        )
+            pattern_matcher=exact_match)
 
-        moved_tokens = {tid for tid, node in assignments.items()
-                        if current.get(tid) != node}
+        moved_tokens = {
+            tid for tid, node in assignments.items() if current.get(tid) != node
+            }
 
         assert moved_tokens == set(range(50, 80))
 
@@ -2119,8 +2185,7 @@ class TestTokenIterationOrder:
             active_nodes=['node1', 'node2'],
             current_assignments={},
             locked_tokens={},
-            pattern_matcher=exact_match
-        )
+            pattern_matcher=exact_match)
 
         expected = {
             **dict.fromkeys(range(50), 'node1'),
@@ -2130,7 +2195,8 @@ class TestTokenIterationOrder:
 
 
 class TestLargeScale:
-    """Test algorithm performance and correctness at scale."""
+    """Test algorithm performance and correctness at scale.
+    """
 
     def test_large_token_count(self):
         """Verify 10,000 tokens split exactly evenly over ten nodes.
@@ -2146,8 +2212,7 @@ class TestLargeScale:
             active_nodes=nodes,
             current_assignments={},
             locked_tokens={},
-            pattern_matcher=exact_match
-        )
+            pattern_matcher=exact_match)
 
         counts = dict.fromkeys(nodes, 0)
         for node in assignments.values():
@@ -2167,8 +2232,7 @@ class TestLargeScale:
             active_nodes=nodes,
             current_assignments={},
             locked_tokens={},
-            pattern_matcher=exact_match
-        )
+            pattern_matcher=exact_match)
 
         counts = dict.fromkeys(nodes, 0)
         for node in assignments.values():
@@ -2191,8 +2255,7 @@ class TestLargeScale:
             active_nodes=nodes,
             current_assignments={},
             locked_tokens={},
-            pattern_matcher=exact_match
-        )
+            pattern_matcher=exact_match)
 
         counts = dict.fromkeys(nodes, 0)
         for node in assignments.values():
@@ -2213,8 +2276,7 @@ class TestLargeScale:
             active_nodes=['node0', 'node1', 'node2'],
             current_assignments={},
             locked_tokens=locked,
-            pattern_matcher=exact_match
-        )
+            pattern_matcher=exact_match)
 
         assert len(assignments) == 1000
         for tid, pattern in locked.items():
@@ -2222,25 +2284,28 @@ class TestLargeScale:
 
 
 class TestPatternMatching:
-    """Test SQL LIKE pattern matching."""
+    """Test SQL LIKE pattern matching.
+    """
 
-    @pytest.mark.parametrize(('node_name', 'pattern', 'should_match'), [
-        ('node1', 'node1', True),
-        ('node1', 'node2', False),
-        ('prod-alpha', 'prod-%', True),
-        ('prod-beta', 'prod-%', True),
-        ('test-alpha', 'prod-%', False),
-        ('alpha-gpu', '%-gpu', True),
-        ('beta-gpu', '%-gpu', True),
-        ('alpha-cpu', '%-gpu', False),
-        ('prod-special-001', '%special%', True),
-        ('special', '%special%', True),
-        ('prod-regular-001', '%special%', False),
-        ('node1', 'node_', True),
-        ('node2', 'node_', True),
-        ('node10', 'node_', False),
-        ('nodeX1', 'node.1', False),
-    ])
+    @pytest.mark.parametrize(
+        ('node_name', 'pattern', 'should_match'),
+        [
+            ('node1', 'node1', True),
+            ('node1', 'node2', False),
+            ('prod-alpha', 'prod-%', True),
+            ('prod-beta', 'prod-%', True),
+            ('test-alpha', 'prod-%', False),
+            ('alpha-gpu', '%-gpu', True),
+            ('beta-gpu', '%-gpu', True),
+            ('alpha-cpu', '%-gpu', False),
+            ('prod-special-001', '%special%', True),
+            ('special', '%special%', True),
+            ('prod-regular-001', '%special%', False),
+            ('node1', 'node_', True),
+            ('node2', 'node_', True),
+            ('node10', 'node_', False),
+            ('nodeX1', 'node.1', False),
+            ])
     def test_pattern_matching(self, node_name, pattern, should_match):
         """Verify matches_pattern follows SQL LIKE semantics.
 
@@ -2253,7 +2318,8 @@ class TestPatternMatching:
 
 
 class TestTaskHashableValidation:
-    """Test Task validation of hashable IDs."""
+    """Test Task validation of hashable IDs.
+    """
 
     def test_hashable_ids_accepted(self):
         """Verify hashable types are accepted as task IDs.
@@ -2267,17 +2333,20 @@ class TestTaskHashableValidation:
             'string-id',
             ('tuple', 'id'),
             frozenset([1, 2, 3]),
-        ]
+            ]
 
         for task_id in valid_ids:
             task = Task(task_id, 'test-task')
-            assert task.id == task_id, f'Should accept hashable type {type(task_id).__name__}'
+            assert task.id == task_id, \
+                f'Should accept hashable type {type(task_id).__name__}'
 
-    @pytest.mark.parametrize('task_id', [
-        [1, 2, 3],
-        {'key': 'value'},
-        {1, 2, 3},
-        ])
+    @pytest.mark.parametrize(
+        'task_id',
+        [
+            [1, 2, 3],
+            {'key': 'value'},
+            {1, 2, 3},
+            ])
     def test_non_hashable_rejected(self, task_id):
         """Verify non-hashable IDs are rejected.
 
@@ -2299,14 +2368,19 @@ class TestTaskHashableValidation:
 
 
 class TestSetClaimEdgeCases:
-    """Test TaskManager.set_claim edge cases."""
+    """Test TaskManager.set_claim edge cases.
+    """
 
     @pytest.fixture
     def claim_job(self, postgres):
         """Create and enter a job, yield it, then exit.
         """
         coord_config = get_coordination_config()
-        job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
+        job = create_job(
+            'node1',
+            postgres,
+            coordination_config=coord_config,
+            wait_on_enter=0)
         job.__enter__()
         try:
             yield job
@@ -2326,7 +2400,7 @@ class TestSetClaimEdgeCases:
         claim_job.set_claim(empty_input)
 
         with postgres.connect() as conn:
-            result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Claim"]}'))
+            result = conn.execute(text(f'select count(*) from {tables["Claim"]}'))
             count = result.scalar()
 
         assert count == 0, 'No claims should be created for empty iterable'
@@ -2342,8 +2416,9 @@ class TestSetClaimEdgeCases:
         claim_job.set_claim(list(range(1000)))
 
         with postgres.connect() as conn:
-            result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Claim"]} WHERE node = :node'),
-                                  {'node': 'node1'})
+            result = conn.execute(
+                text(f'select count(*) from {tables["Claim"]} where node = :node'),
+                {'node': 'node1'})
             count = result.scalar()
 
         assert count == 1000, 'All 1000 items should be claimed'
@@ -2359,10 +2434,14 @@ class TestSetClaimEdgeCases:
         tables = schema.get_table_names()
         claim_job.set_claim([1, 'string-item', (2, 3), 42, 'another-string'])
 
+        claims_sql = f"""
+select task_id
+from {tables["Claim"]}
+where node = :node
+order by task_id
+"""
         with postgres.connect() as conn:
-            result = conn.execute(text(f"""
-                SELECT task_id FROM {tables["Claim"]} WHERE node = :node ORDER BY task_id
-            """), {'node': 'node1'})
+            result = conn.execute(text(claims_sql), {'node': 'node1'})
             items = [row[0] for row in result]
 
         assert len(items) == 5, 'All 5 mixed-type items should be claimed'
@@ -2380,10 +2459,13 @@ class TestSetClaimEdgeCases:
         tables = schema.get_table_names()
         claim_job.set_claim('single-string-item')
 
+        claims_sql = f"""
+select task_id
+from {tables["Claim"]}
+where node = :node
+"""
         with postgres.connect() as conn:
-            result = conn.execute(text(f"""
-                SELECT task_id FROM {tables["Claim"]} WHERE node = :node
-            """), {'node': 'node1'})
+            result = conn.execute(text(claims_sql), {'node': 'node1'})
             items = [row[0] for row in result]
 
         assert items == ['single-string-item']
@@ -2399,10 +2481,13 @@ class TestSetClaimEdgeCases:
         tables = schema.get_table_names()
         claim_job.set_claim(42)
 
+        claims_sql = f"""
+select task_id
+from {tables["Claim"]}
+where node = :node
+"""
         with postgres.connect() as conn:
-            result = conn.execute(text(f"""
-                SELECT task_id FROM {tables["Claim"]} WHERE node = :node
-            """), {'node': 'node1'})
+            result = conn.execute(text(claims_sql), {'node': 'node1'})
             items = [row[0] for row in result]
 
         assert items == ['42']
@@ -2419,8 +2504,9 @@ class TestSetClaimEdgeCases:
         claim_job.set_claim(i * 2 for i in range(10))
 
         with postgres.connect() as conn:
-            result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Claim"]} WHERE node = :node'),
-                                  {'node': 'node1'})
+            result = conn.execute(
+                text(f'select count(*) from {tables["Claim"]} where node = :node'),
+                {'node': 'node1'})
             count = result.scalar()
 
         assert count == 10, 'All 10 generated items should be claimed'
@@ -2437,8 +2523,9 @@ class TestSetClaimEdgeCases:
         claim_job.set_claim(range(20))
 
         with postgres.connect() as conn:
-            result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Claim"]} WHERE node = :node'),
-                                  {'node': 'node1'})
+            result = conn.execute(
+                text(f'select count(*) from {tables["Claim"]} where node = :node'),
+                {'node': 'node1'})
             count = result.scalar()
 
         assert count == 20, 'All 20 range items should be claimed'
@@ -2454,10 +2541,13 @@ class TestSetClaimEdgeCases:
         tables = schema.get_table_names()
         claim_job.set_claim([1, 2, 3, 2, 1, 4, 3])
 
+        claims_sql = f"""
+select task_id
+from {tables["Claim"]}
+where node = :node
+"""
         with postgres.connect() as conn:
-            result = conn.execute(text(f"""
-                SELECT task_id FROM {tables["Claim"]} WHERE node = :node
-            """), {'node': 'node1'})
+            result = conn.execute(text(claims_sql), {'node': 'node1'})
             items = [row[0] for row in result]
 
         assert sorted(items) == ['1', '2', '3', '4']
@@ -2472,10 +2562,13 @@ class TestSetClaimEdgeCases:
         tables = schema.get_table_names()
         claim_job.set_claim([1, None, 2, None, 3])
 
+        claims_sql = f"""
+select task_id
+from {tables["Claim"]}
+where node = :node
+"""
         with postgres.connect() as conn:
-            result = conn.execute(text(f"""
-                SELECT task_id FROM {tables["Claim"]} WHERE node = :node
-            """), {'node': 'node1'})
+            result = conn.execute(text(claims_sql), {'node': 'node1'})
             items = [row[0] for row in result]
 
         assert sorted(items) == ['1', '2', '3', 'None']

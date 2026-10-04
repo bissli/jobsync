@@ -1,13 +1,4 @@
-"""Shared test fixtures, utilities, and helpers.
-
-This module provides common test infrastructure to avoid duplication across test files.
-Includes config builders, object factories, wait helpers, assertion helpers, and database utilities.
-
-USE THIS FILE FOR:
-- Creating reusable test fixtures and utilities
-- Adding new wait/assertion helpers used by multiple test files
-- Database setup/teardown utilities
-- Test data factories
+"""Config builders, job factories, wait and assert helpers, and row inserts.
 """
 import contextlib
 import datetime
@@ -16,42 +7,39 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Hashable
+from collections.abc import Callable, Hashable, Iterator
 from dataclasses import replace
+from typing import Any
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import Engine, text
 
 from jobsync import schema
 from jobsync.client import CoordinationConfig, Job, JobState, Task
+from jobsync.client import task_to_token
 
 logger = logging.getLogger(__name__)
 
 
-# ============================================================================
-# CONFIG BUILDERS - Create test configurations
-# ============================================================================
+# --- Config builders ---
 
-def get_coordination_config(**overrides) -> CoordinationConfig:
-    """Create CoordinationConfig with test-optimized values (alias: test_config).
+def get_coordination_config(**overrides: Any) -> CoordinationConfig:
+    """Same as test_config(): CoordinationConfig with test-optimized values.
     """
     return test_config(**overrides)
 
 
-def test_config(**overrides) -> CoordinationConfig:
-    """Create CoordinationConfig with test-optimized values.
+def test_config(**overrides: Any) -> CoordinationConfig:
+    """CoordinationConfig with short intervals for fast tests.
 
-    Fast intervals for quick tests. Use overrides for specific test needs.
-
-    Args:
-        **overrides: Override specific config values
+    Parameters
+    ----------
+    **overrides : Any
+        CoordinationConfig fields that replace the test defaults.
 
     Returns
-        CoordinationConfig suitable for testing
-
-    Usage:
-        config = get_coordination_config()
-        config = get_coordination_config(total_tokens=50, heartbeat_interval_sec=0.5)
+    -------
+    CoordinationConfig
     """
     defaults = {
         'minimum_nodes': 1,
@@ -60,7 +48,7 @@ def test_config(**overrides) -> CoordinationConfig:
         'health_check_interval_sec': 2,
         'dead_node_check_interval_sec': 2,
         'rebalance_check_interval_sec': 2,
-    }
+        }
     defaults.update(overrides)
     return CoordinationConfig(**defaults)
 
@@ -70,28 +58,26 @@ def test_config(**overrides) -> CoordinationConfig:
 test_config.__test__ = False
 
 
-def get_state_driven_config(**overrides) -> CoordinationConfig:
-    """Create CoordinationConfig for state machine testing.
-
-    Returns standard config suitable for state-driven tests.
+def get_state_driven_config(**overrides: Any) -> CoordinationConfig:
+    """Same as test_config(), named for state machine tests.
     """
     return test_config(**overrides)
 
 
-def get_structure_test_config(**overrides) -> CoordinationConfig:
-    """Create CoordinationConfig for schema structure testing.
-
-    Returns standard config suitable for structure tests.
+def get_structure_test_config(**overrides: Any) -> CoordinationConfig:
+    """Same as test_config(), named for schema structure tests.
     """
     return test_config(**overrides)
 
 
-# ============================================================================
-# CLUSTER MANAGEMENT - Start/stop coordinated clusters
-# ============================================================================
+# --- Cluster management ---
 
 @contextlib.contextmanager
-def cluster(postgres, *node_names, **config_overrides):
+def cluster(
+    postgres: Engine,
+    *node_names: str,
+    **config_overrides: Any
+) -> Iterator[list[Job]]:
     """Start cluster of nodes in parallel with automatic cleanup.
 
     Parameters
@@ -100,7 +86,7 @@ def cluster(postgres, *node_names, **config_overrides):
         The postgres fixture.
     *node_names : str
         Node names to create, entered in this order 0.1s apart.
-    **config_overrides
+    **config_overrides : Any
         CoordinationConfig overrides on top of test_config().
 
     Yields
@@ -115,12 +101,14 @@ def cluster(postgres, *node_names, **config_overrides):
         A job's __enter__ raised. The other jobs are exited first.
     """
     config = test_config(**config_overrides)
-    jobs = [create_job(name, postgres, coordination_config=config, wait_on_enter=15)
-            for name in node_names]
+    jobs = [
+        create_job(name, postgres, coordination_config=config, wait_on_enter=15)
+        for name in node_names
+        ]
 
     enter_errors = []
 
-    def enter(job):
+    def enter(job: Job) -> None:
         try:
             job.__enter__()
         except Exception as exc:
@@ -145,30 +133,29 @@ def cluster(postgres, *node_names, **config_overrides):
                 job.__exit__(None, None, None)
 
 
-def find_task_ids_covering_all_tokens(config: CoordinationConfig, max_search: int = 10000) -> list[Hashable]:
-    """Find task IDs that hash to all token IDs using given coordination config.
+def find_task_ids_covering_all_tokens(
+    config: CoordinationConfig,
+    max_search: int = 10000
+) -> list[Hashable]:
+    """One task id per token, each hashing to its token under config.
 
-    Searches for task IDs that collectively cover all token_ids from 0 to total_tokens-1.
-    Ensures hash function and total_tokens always match the config being tested.
-
-    Args:
-        config: CoordinationConfig to get total_tokens and hash_function from
-        max_search: Maximum candidate task IDs to search
+    Parameters
+    ----------
+    config : CoordinationConfig
+        Supplies total_tokens and hash_function.
+    max_search : int, default 10000
+        Candidate ids tried, 0 through max_search - 1.
 
     Returns
-        List of task IDs (one per token, in token ID order)
+    -------
+    list[Hashable]
+        Integer task ids. Entry i hashes to token i.
 
     Raises
-        RuntimeError: If cannot find covering set within max_search
-
-    Usage:
-        coord_config = get_coordination_config(total_tokens=20)
-        task_ids = find_task_ids_covering_all_tokens(coord_config)
-        for task_id in task_ids:
-            insert_lock(postgres, tables, task_id, ['pattern'], created_by='test')
+    ------
+    RuntimeError
+        The candidates leave a token uncovered.
     """
-    from jobsync.client import task_to_token
-
     total_tokens = config.total_tokens
     hash_function = config.hash_function
 
@@ -183,15 +170,12 @@ def find_task_ids_covering_all_tokens(config: CoordinationConfig, max_search: in
     if len(token_to_task) < total_tokens:
         raise RuntimeError(
             f'Could not find task IDs covering all {total_tokens} tokens '
-            f'(found {len(token_to_task)} after searching {max_search} candidates)'
-        )
+            f'(found {len(token_to_task)} after searching {max_search} candidates)')
 
     return [token_to_task[i] for i in range(total_tokens)]
 
 
-# ============================================================================
-# TEST UTILITIES - Reusable test helpers
-# ============================================================================
+# --- Test utilities ---
 
 def simulate_node_crash(node: Job, cleanup: bool = False) -> None:
     """Stop a node's monitor threads without the shutdown cleanup.
@@ -223,93 +207,89 @@ def simulate_node_crash(node: Job, cleanup: bool = False) -> None:
 
 
 class CallbackTracker:
-    """Thread-safe callback tracker for testing rebalance notifications.
+    """Records each on_rebalance call, safe across threads.
 
-    Usage:
-        tracker = CallbackTracker()
-        job = create_job('node1', postgres, on_rebalance=tracker.on_rebalance)
-        with job:
-            assert wait_for(lambda: len(tracker.rebalance_calls) >= 1)
+    Attributes
+    ----------
+    rebalance_calls : list[float]
+        Epoch seconds of each on_rebalance call, oldest first.
+    lock : threading.Lock
+        Guards rebalance_calls.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.rebalance_calls = []
         self.lock = threading.Lock()
 
-    def on_rebalance(self):
-        """Track on_rebalance calls.
+    def on_rebalance(self) -> None:
+        """Record the call time in rebalance_calls.
         """
         with self.lock:
             self.rebalance_calls.append(time.time())
             logger.info('on_rebalance called')
 
-    def reset(self):
-        """Reset all tracking.
+    def reset(self) -> None:
+        """Empty rebalance_calls.
         """
         with self.lock:
             self.rebalance_calls.clear()
 
 
-# ============================================================================
-# FACTORIES - Create test objects with sensible defaults
-# ============================================================================
+# --- Factories ---
 
 @pytest.fixture(scope='module')
-def shared_unit_test_job(postgres):
-    """Shared job for unit tests that don't modify state.
+def shared_unit_test_job(postgres: Engine) -> Job:
+    """Unentered job shared by every test in a module.
 
-    Module-scoped to avoid recreation. Only for tests checking read-only
-    operations like task_to_token(), pattern matching, etc.
+    Returns
+    -------
+    Job
+        Built with wait_on_enter=0. Only for tests that change no state,
+        since later tests in the module reuse it.
     """
     coord_config = get_coordination_config()
-    job = create_job('unit-test-shared', postgres, coordination_config=coord_config, wait_on_enter=0)
+    job = create_job(
+        'unit-test-shared',
+        postgres,
+        coordination_config=coord_config,
+        wait_on_enter=0)
     return job
 
 
 @pytest.fixture
-def callback_tracker():
-    """Fixture that provides CallbackTracker instance.
-
-    Usage:
-        def test_callbacks(postgres, callback_tracker):
-            job = create_job('node1', postgres, on_rebalance=callback_tracker.on_rebalance)
+def callback_tracker() -> CallbackTracker:
+    """A fresh CallbackTracker.
     """
     return CallbackTracker()
 
 
 def create_job(
     node_name: str,
-    postgres,
+    postgres: Engine,
     coordination_config: CoordinationConfig = None,
     wait_on_enter: int = 0,
-    **kwargs
+    **kwargs: Any
 ) -> Job:
-    """Create Job with test defaults.
+    """Unentered Job pointed at the test database.
 
-    Args:
-        node_name: Unique node identifier
-        postgres: pytest postgres fixture
-        coordination_config: Optional CoordinationConfig to enable coordination (None disables)
-        wait_on_enter: Seconds to wait for cluster formation.
-                      Use 0 for unit tests (no coordination needed).
-                      Use 2-5 for simple integration tests.
-                      Use 10-15 for complex multi-node cluster tests.
-        **kwargs: Additional Job() parameters
+    Parameters
+    ----------
+    node_name : str
+        Unique node identifier.
+    postgres : Engine
+        The postgres fixture. Its URL replaces the host, port, dbname, user
+        and password in coordination_config.
+    coordination_config : CoordinationConfig, default None
+        None runs the job without coordination.
+    wait_on_enter : int, default 0
+        Seconds __enter__ waits for the cluster to form: 0 for unit tests,
+        2-5 for simple integration tests, 10-15 for multi-node clusters.
+    **kwargs : Any
+        Passed to Job().
 
     Returns
-        Configured Job instance (not entered)
-
-    Usage:
-        # Simple test with coordination
-        coord_cfg = get_coordination_config()
-        job = create_job('node1', postgres, coordination_config=coord_cfg)
-
-        # Disable coordination
-        job = create_job('node1', postgres, coordination_config=None)
-
-        # Custom coordination settings
-        coord_cfg = CoordinationConfig(total_tokens=50, heartbeat_interval_sec=1)
-        job = create_job('node1', postgres, coordination_config=coord_cfg)
+    -------
+    Job
     """
     if coordination_config is not None:
         url = postgres.url
@@ -319,59 +299,44 @@ def create_job(
             port=url.port,
             dbname=url.database,
             user=url.username,
-            password=url.password
-        )
+            password=url.password)
 
     return Job(
         node_name,
         coordination_config=coordination_config,
         wait_on_enter=wait_on_enter,
-        **kwargs
-    )
+        **kwargs)
 
 
 def create_task(task_id: Hashable, name: str = None) -> Task:
-    """Create Task with default name.
-
-    Args:
-        task_id: Unique task identifier
-
-    Returns
-        Task instance with name 'task-{task_id}'
+    """Task for task_id, named name or else 'task-{task_id}'.
     """
     name = name or f'task-{task_id}'
     return Task(task_id, name)
 
 
-# ============================================================================
-# WAIT HELPERS - Poll for conditions with timeout
-#
-# PREFER wait_for_condition() or wait_for() FOR SIMPLE CONDITIONS:
-#   assert wait_for(lambda: len(job.my_tokens) >= 10)
-#   assert wait_for(lambda: job.am_i_healthy())
-#   assert wait_for(lambda: job._shutdown_event.is_set())
-#
-# Use specialized helpers only for complex multi-step operations.
-# ============================================================================
+# --- Wait helpers ---
 
 def wait_for_condition(
     condition: callable,
     timeout_sec: float = 5.0,
     check_interval: float = 0.1
 ) -> bool:
-    """Wait for arbitrary condition function to return True.
+    """Poll condition until it returns a truthy value or time runs out.
 
-    Args:
-        condition: Function that returns bool
-        timeout_sec: Maximum wait time
-        check_interval: How often to check
+    Parameters
+    ----------
+    condition : callable
+        Called with no arguments. An exception it raises counts as False.
+    timeout_sec : float, default 5.0
+        Seconds to keep polling.
+    check_interval : float, default 0.1
+        Seconds between calls.
 
     Returns
-        True if condition met, False if timeout
-
-    Usage:
-        assert wait_for_condition(lambda: len(my_list) > 0, timeout_sec=5)
-        assert wait_for(lambda: job.am_i_healthy())  # Using alias
+    -------
+    bool
+        True once condition holds, False on timeout.
     """
     start = time.time()
     while time.time() - start < timeout_sec:
@@ -385,12 +350,7 @@ def wait_for_condition(
 
 
 def wait_for(condition: callable, timeout_sec: float = 5.0) -> bool:
-    """Shorter alias for wait_for_condition().
-
-    Usage:
-        assert wait_for(lambda: job.am_i_healthy())
-        assert wait_for(lambda: len(job.my_tokens) >= 10, timeout_sec=15)
-        assert wait_for(lambda: job._shutdown_event.is_set())
+    """wait_for_condition() with the default check_interval.
     """
     return wait_for_condition(condition, timeout_sec)
 
@@ -401,22 +361,29 @@ def wait_for_leader_election(
     timeout_sec: float = 10.0,
     check_interval: float = 0.2
 ) -> str:
-    """Wait for leader to be elected, optionally verify expected leader.
+    """Poll job.cluster.elect_leader() until a leader is elected.
 
-    Args:
-        job: Job instance to check
-        expected_leader: Optional expected leader name
-        timeout_sec: Maximum wait time
-        check_interval: How often to check
+    Parameters
+    ----------
+    job : Job
+        Job whose cluster is polled.
+    expected_leader : str, default None
+        Keep polling until this node leads. None accepts any leader.
+    timeout_sec : float, default 10.0
+        Seconds to keep polling.
+    check_interval : float, default 0.2
+        Seconds between polls.
 
     Returns
-        Leader name if elected (and matches expected if provided)
+    -------
+    str
+        Name of the elected leader.
 
     Raises
-        TimeoutError: If timeout reached
-
-    Usage:
-        leader = wait_for_leader_election(job, expected_leader='node1')
+    ------
+    TimeoutError
+        No leader, or a leader other than expected_leader, within
+        timeout_sec. An exception from elect_leader counts as no leader.
     """
     start = time.time()
     last_leader = None
@@ -434,8 +401,7 @@ def wait_for_leader_election(
     if expected_leader is not None:
         raise TimeoutError(
             f'Leader election timeout: expected {expected_leader}, '
-            f'got {last_leader} after {timeout_sec}s'
-        )
+            f'got {last_leader} after {timeout_sec}s')
 
     raise TimeoutError(f'Leader election timeout after {timeout_sec}s')
 
@@ -446,16 +412,23 @@ def wait_for_state(
     timeout_sec: float = 10.0,
     check_interval: float = 0.1
 ) -> bool:
-    """Wait for job to reach specific state.
+    """Poll until the job's state machine is in state.
 
-    Args:
-        job: Job instance to check
-        state: Expected state
-        timeout_sec: Maximum wait time
-        check_interval: How often to check
+    Parameters
+    ----------
+    job : Job
+        Job to watch.
+    state : JobState
+        State to wait for.
+    timeout_sec : float, default 10.0
+        Seconds to keep polling.
+    check_interval : float, default 0.1
+        Seconds between checks.
 
     Returns
-        True if state reached, False if timeout
+    -------
+    bool
+        True once state is reached, False on timeout.
     """
     start = time.time()
     while time.time() - start < timeout_sec:
@@ -494,22 +467,30 @@ def wait_for_cluster_running(
     leader_name: str = None,
     timeout_sec: float = 10.0
 ) -> bool:
-    """Wait for all nodes in cluster to reach running states.
+    """Wait for every node to reach a running state, one node at a time.
 
-    Args:
-        nodes: List of Job instances
-        leader_name: Optional expected leader name
-        timeout_sec: Maximum wait time per node
+    Parameters
+    ----------
+    nodes : list[Job]
+        Nodes to wait on, in order.
+    leader_name : str, default None
+        Node that must reach RUNNING_LEADER. Every other node must reach
+        RUNNING_FOLLOWER. None accepts either running state.
+    timeout_sec : float, default 10.0
+        Seconds allowed per node, so the whole wait can run to
+        len(nodes) * timeout_sec.
 
     Returns
-        True if all nodes reach running states, False if timeout
-
-    Usage:
-        assert wait_for_cluster_running(nodes, leader_name='node1')
+    -------
+    bool
+        True once all nodes are running, False at the first node to time
+        out.
     """
     for node in nodes:
         if leader_name:
-            expected = JobState.RUNNING_LEADER if node.node_name == leader_name else JobState.RUNNING_FOLLOWER
+            expected = (
+                JobState.RUNNING_LEADER if node.node_name == leader_name
+                else JobState.RUNNING_FOLLOWER)
             if not wait_for_state(node, expected, timeout_sec):
                 return False
         else:
@@ -519,31 +500,42 @@ def wait_for_cluster_running(
 
 
 def wait_for_rebalance(
-    postgres,
+    postgres: Engine,
     tables: dict,
     min_count: int = 1,
     timeout_sec: float = 20.0,
     check_interval: float = 0.3
 ) -> bool:
-    """Wait for rebalance events to be logged (complex multi-step DB query).
+    """Poll the Rebalance table until enough recent events are logged.
 
-    Args:
-        postgres: postgres fixture
-        tables: Table name dict from get_table_names()
-        min_count: Minimum number of rebalance events
-        timeout_sec: Maximum wait time
-        check_interval: How often to check
+    Parameters
+    ----------
+    postgres : Engine
+        The postgres fixture.
+    tables : dict
+        Table name dict from get_table_names().
+    min_count : int, default 1
+        Events required. Each poll counts only events triggered within the
+        last timeout_sec seconds.
+    timeout_sec : float, default 20.0
+        Seconds to keep polling, and the age window above, truncated to
+        whole seconds.
+    check_interval : float, default 0.3
+        Seconds between polls.
 
     Returns
-        True if condition met, False if timeout
+    -------
+    bool
+        True once min_count is reached, False on timeout.
     """
+    sql = f"""
+select count(*) from {tables["Rebalance"]}
+where triggered_at > now() - interval '{int(timeout_sec)} seconds'
+"""
     start = time.time()
     while time.time() - start < timeout_sec:
         with postgres.connect() as conn:
-            result = conn.execute(text(f"""
-                SELECT COUNT(*) FROM {tables["Rebalance"]}
-                WHERE triggered_at > NOW() - INTERVAL '{int(timeout_sec)} seconds'
-            """))
+            result = conn.execute(text(sql))
             if result.scalar() >= min_count:
                 return True
         time.sleep(check_interval)
@@ -551,62 +543,70 @@ def wait_for_rebalance(
 
 
 def wait_for_no_leader_lock(
-    postgres,
+    postgres: Engine,
     tables: dict,
     timeout_sec: float = 5.0,
     check_interval: float = 0.1
 ) -> bool:
-    """Wait for leader lock to be released (DB query helper).
+    """Poll until the LeaderLock table is empty.
 
-    Args:
-        postgres: postgres fixture
-        tables: Table name dict from get_table_names()
-        timeout_sec: Maximum wait time
-        check_interval: How often to check
+    Parameters
+    ----------
+    postgres : Engine
+        The postgres fixture.
+    tables : dict
+        Table name dict from get_table_names().
+    timeout_sec : float, default 5.0
+        Seconds to keep polling.
+    check_interval : float, default 0.1
+        Seconds between polls.
 
     Returns
-        True if no lock held, False if timeout
+    -------
+    bool
+        True once no lock is held, False on timeout.
     """
-    return wait_for_condition(
-        lambda: _check_no_leader_lock(postgres, tables),
-        timeout_sec,
-        check_interval
-    )
+    def no_leader_lock() -> bool:
+        with postgres.connect() as conn:
+            result = conn.execute(text(f'select count(*) from {tables["LeaderLock"]}'))
+            return result.scalar() == 0
 
-
-def _check_no_leader_lock(postgres, tables: dict) -> bool:
-    """Check if leader lock exists (helper for wait_for_no_leader_lock).
-    """
-    with postgres.connect() as conn:
-        result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["LeaderLock"]}'))
-        return result.scalar() == 0
+    return wait_for_condition(no_leader_lock, timeout_sec, check_interval)
 
 
 def wait_for_dead_node_removal(
-    postgres,
+    postgres: Engine,
     tables: dict,
     node_name: str,
     timeout_sec: float = 20.0,
     check_interval: float = 0.3
 ) -> bool:
-    """Wait for dead node to be removed from Node table.
+    """Poll until node_name has no row in the Node table.
 
-    Args:
-        postgres: postgres fixture
-        tables: Table name dict from get_table_names()
-        node_name: Name of node to wait for removal
-        timeout_sec: Maximum wait time
-        check_interval: How often to check
+    Parameters
+    ----------
+    postgres : Engine
+        The postgres fixture.
+    tables : dict
+        Table name dict from get_table_names().
+    node_name : str
+        Node whose row must go.
+    timeout_sec : float, default 20.0
+        Seconds to keep polling.
+    check_interval : float, default 0.3
+        Seconds between polls.
 
     Returns
-        True if node removed, False if timeout
+    -------
+    bool
+        True once the row is gone, False on timeout.
     """
     start = time.time()
     while time.time() - start < timeout_sec:
         with postgres.connect() as conn:
-            result = conn.execute(text(f"""
-                SELECT COUNT(*) FROM {tables["Node"]} WHERE name = :name
-            """), {'name': node_name})
+            result = conn.execute(
+                text(f'select count(*) from {tables["Node"]} where name = :name'),
+                {'name': node_name})
             if result.scalar() == 0:
                 return True
         time.sleep(check_interval)
@@ -620,24 +620,26 @@ def wait_for_token_sync(
     timeout_sec: float = 10.0,
     check_interval: float = 0.2
 ) -> bool:
-    """Wait for nodes to sync tokens with database.
+    """Poll until the nodes' token rows in the database total expected_total.
 
-    Args:
-        nodes: List of Job instances
-        expected_total: Expected total tokens across all nodes
-        check_cache: If True, verify cached tokens match DB (use after rebalance)
-        timeout_sec: Maximum wait time
-        check_interval: How often to check
+    Parameters
+    ----------
+    nodes : list[Job]
+        Nodes whose token rows are counted.
+    expected_total : int
+        Token count the nodes must hold between them.
+    check_cache : bool, default True
+        Also require each node's cached tokens and version to match its
+        database rows. Pass True after a rebalance.
+    timeout_sec : float, default 10.0
+        Seconds to keep polling.
+    check_interval : float, default 0.2
+        Seconds between polls.
 
     Returns
-        True if synced, False if timeout
-
-    Usage:
-        # Just check DB totals:
-        assert wait_for_token_sync(nodes, 100, check_cache=False)
-
-        # Verify cache also synced (after rebalance):
-        assert wait_for_token_sync(nodes, 100, check_cache=True)
+    -------
+    bool
+        True once synced, False on timeout.
     """
     start = time.time()
     while time.time() - start < timeout_sec:
@@ -670,11 +672,14 @@ def wait_for_all_nodes_token_sync(
     timeout_sec: float = 10.0,
     check_interval: float = 0.2
 ) -> bool:
-    """Wait for all nodes to sync tokens to expected total (DB only, no cache check).
-
-    Deprecated: Use wait_for_token_sync(nodes, total, check_cache=False) instead.
+    """Deprecated alias of wait_for_token_sync(..., check_cache=False).
     """
-    return wait_for_token_sync(nodes, expected_total, check_cache=False, timeout_sec=timeout_sec, check_interval=check_interval)
+    return wait_for_token_sync(
+        nodes,
+        expected_total,
+        check_cache=False,
+        timeout_sec=timeout_sec,
+        check_interval=check_interval)
 
 
 def wait_for_cached_tokens_sync(
@@ -683,54 +688,71 @@ def wait_for_cached_tokens_sync(
     timeout_sec: float = 10.0,
     check_interval: float = 0.2
 ) -> bool:
-    """Wait for nodes' cached token sets to sync with database.
-
-    Deprecated: Use wait_for_token_sync(nodes, total, check_cache=True) instead.
+    """Deprecated alias of wait_for_token_sync(..., check_cache=True).
     """
-    return wait_for_token_sync(nodes, expected_total, check_cache=True, timeout_sec=timeout_sec, check_interval=check_interval)
+    return wait_for_token_sync(
+        nodes,
+        expected_total,
+        check_cache=True,
+        timeout_sec=timeout_sec,
+        check_interval=check_interval)
 
 
-def wait_for_shutdown(node: Job, timeout_sec: float = 5.0, check_interval: float = 0.1) -> bool:
-    """Wait for all monitor threads to stop.
+def wait_for_shutdown(
+    node: Job,
+    timeout_sec: float = 5.0,
+    check_interval: float = 0.1
+) -> bool:
+    """Wait for every monitor thread of node to stop.
 
-    Args:
-        node: Job instance with monitors to check
-        timeout_sec: Maximum time to wait
-        check_interval: Time between checks
+    Parameters
+    ----------
+    node : Job
+        Job whose monitor threads are checked.
+    timeout_sec : float, default 5.0
+        Seconds to keep polling.
+    check_interval : float, default 0.1
+        Ignored. Polling runs every 0.1 seconds.
 
     Returns
-        True if all threads stopped within timeout, False otherwise
+    -------
+    bool
+        True once every thread has stopped, False on timeout.
     """
-    def all_threads_stopped():
+    def all_threads_stopped() -> bool:
         return all(
             not m.thread or not m.thread.is_alive()
-            for m in node._monitors.values()
-        )
+            for m in node._monitors.values())
 
     return wait_for(all_threads_stopped, timeout_sec=timeout_sec)
 
 
-# ============================================================================
-# ASSERTION HELPERS - Common test assertions
-# ============================================================================
+# --- Assertion helpers ---
 
 def assert_token_distribution_balanced(
     jobs: list[Job],
     total_tokens: int,
     tolerance: float = 0.15
 ) -> None:
-    """Assert tokens are evenly distributed across jobs.
+    """Assert jobs split total_tokens evenly, within tolerance.
 
-    Args:
-        jobs: List of Job instances
-        total_tokens: Expected total token count
-        tolerance: Acceptable deviation (0.15 = 15%)
+    Parameters
+    ----------
+    jobs : list[Job]
+        Jobs whose cached my_tokens are counted.
+    total_tokens : int
+        Token count the jobs must hold between them, exactly.
+    tolerance : float, default 0.15
+        Allowed deviation from the even share, as a fraction (0.15 is 15%).
+        Both bounds truncate to int.
 
     Raises
-        AssertionError: If distribution is imbalanced
-
-    Usage:
-        assert_token_distribution_balanced([job1, job2, job3], total_tokens=100)
+    ------
+    AssertionError
+        A job's count is outside the bounds, or the counts do not sum to
+        total_tokens.
+    ValueError
+        jobs is empty.
     """
     node_count = len(jobs)
     if node_count == 0:
@@ -760,15 +782,21 @@ def assert_monitors_running(
     job: Job,
     monitor_names: list[str] = None
 ) -> None:
-    """Assert specified monitors are running.
+    """Assert the named monitors have live threads.
 
-    Args:
-        job: Job instance to check
-        monitor_names: Optional list of monitor name substrings to check
-                      (if None, checks all monitors are running)
+    Parameters
+    ----------
+    job : Job
+        Job whose monitors are checked.
+    monitor_names : list[str], default None
+        Substrings of monitor names. Each must match at least one monitor,
+        and every match must be alive. None checks every monitor.
 
     Raises
-        AssertionError: If any monitor not running
+    ------
+    AssertionError
+        A matched monitor has no thread or a dead one, or a substring
+        matches no monitor.
     """
     if monitor_names is None:
         for monitor in job._monitors.values():
@@ -798,80 +826,69 @@ def assert_monitors_stopped(
     job: Job,
     monitor_names: list[str] = None
 ) -> None:
-    """Assert specified monitors are stopped.
+    """Assert the named monitors have no live thread.
 
-    Args:
-        job: Job instance to check
-        monitor_names: Optional list of monitor name substrings to check
+    Parameters
+    ----------
+    job : Job
+        Job whose monitors are checked.
+    monitor_names : list[str], default None
+        Substrings of monitor names. A substring that matches no monitor
+        passes. None checks every monitor.
 
     Raises
-        AssertionError: If any monitor still running
+    ------
+    AssertionError
+        A matched monitor's thread is alive.
     """
     if monitor_names is None:
         for monitor in job._monitors.values():
             if monitor.thread and monitor.thread.is_alive():
                 raise AssertionError(
-                    f'Monitor {monitor.name} is still running'
-                )
+                    f'Monitor {monitor.name} is still running')
     else:
         for name_pattern in monitor_names:
             for monitor in job._monitors.values():
-                if name_pattern in monitor.name and monitor.thread and monitor.thread.is_alive():
+                if (name_pattern in monitor.name
+                    and monitor.thread
+                    and monitor.thread.is_alive()):
                     raise AssertionError(
-                        f'Monitor {monitor.name} is still running'
-                    )
+                        f'Monitor {monitor.name} is still running')
 
 
-# ============================================================================
-# DATABASE HELPERS - Setup/query utilities
-# ============================================================================
+# --- Database helpers ---
 
 def get_fresh_token_count(node: Job) -> int:
-    """Get current token count directly from database (bypasses cache).
-
-    Args:
-        node: Job instance to query
-
-    Returns
-        Current token count for this node
+    """Token count for node read from the database, bypassing its cache.
     """
     tokens, _ = node.tokens.get_my_tokens_versioned()
     return len(tokens)
 
 
-def clean_tables(*table_names):
-    """Decorator to clear tables before test execution.
+def clean_tables(*table_names: str) -> Callable:
+    """Decorator that empties the named tables before the test runs.
 
-    Args:
-        *table_names: Table keys to clear (e.g., 'Node', 'Token', 'Lock')
+    Parameters
+    ----------
+    *table_names : str
+        Keys of get_table_names(), e.g. 'Node', 'Token', 'Lock'.
 
-    Usage:
-        @clean_tables('Node', 'Token', 'Lock')
-        def test_something(postgres):
-            # Tables already cleaned
-            ...
-
-        # Also works on class methods:
-        @clean_tables('Node')
-        def test_method(self, postgres):
-            ...
+    Returns
+    -------
+    Callable
+        Decorator for a test function or method that takes the postgres
+        fixture. The wrapped test raises TypeError when it gets none.
     """
-    def decorator(func: callable):
+    def decorator(func: callable) -> Callable:
         @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            # Handle both regular functions and class methods
-            # pytest passes fixtures as kwargs, so postgres is usually in kwargs
-
-            # Get postgres from kwargs or args
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
             postgres = kwargs.get('postgres')
             if postgres is None:
-                # Check if it's in args (class method with postgres as positional)
-                if args and hasattr(args[0], '__class__') and not isinstance(args[0], dict):
-                    # Class method: args = (self, postgres, ...) - but pytest uses kwargs
+                if (args and hasattr(args[0], '__class__')
+                    and not isinstance(args[0], dict)):
                     if len(args) >= 2:
                         postgres = args[1]
                 elif args:
-                    # Regular function: args = (postgres, ...)
                     postgres = args[0]
 
             if postgres is None:
@@ -884,39 +901,55 @@ def clean_tables(*table_names):
     return decorator
 
 
-def clear_tables(postgres, tables: dict, table_names: list[str]) -> None:
-    """Clear specified tables for testing.
+def clear_tables(postgres: Engine, tables: dict, table_names: list[str]) -> None:
+    """Delete every row from the named tables in one transaction.
 
-    Args:
-        postgres: postgres fixture
-        tables: Table name dict from get_table_names()
-        table_names: List of table keys to clear (e.g., ['Lock', 'Node'])
+    Parameters
+    ----------
+    postgres : Engine
+        The postgres fixture.
+    tables : dict
+        Table name dict from get_table_names().
+    table_names : list[str]
+        Keys into tables, e.g. ['Lock', 'Node'].
     """
     with postgres.connect() as conn:
         for table_key in table_names:
             table_name = tables[table_key]
-            conn.execute(text(f'DELETE FROM {table_name}'))
+            conn.execute(text(f'delete from {table_name}'))
         conn.commit()
 
 
-def delete_rows(postgres, tables: dict, table_key: str, where_clause: str, params: dict = None) -> int:
-    """Delete rows from table with optional WHERE clause.
+def delete_rows(
+    postgres: Engine,
+    tables: dict,
+    table_key: str,
+    where_clause: str,
+    params: dict = None
+) -> int:
+    """Delete the rows of one table that match where_clause.
 
-    Args:
-        postgres: postgres fixture
-        tables: Table name dict from get_table_names()
-        table_key: Table key to delete from (e.g., 'Node', 'Lock')
-        where_clause: WHERE clause without 'WHERE' keyword (e.g., 'name = :name')
-        params: Optional parameters dict for WHERE clause (e.g., {'name': 'node1'})
+    Parameters
+    ----------
+    postgres : Engine
+        The postgres fixture.
+    tables : dict
+        Table name dict from get_table_names().
+    table_key : str
+        Key into tables, e.g. 'Node'.
+    where_clause : str
+        SQL condition without the WHERE keyword, e.g. 'name = :name'.
+        It goes into the statement as written.
+    params : dict, default None
+        Bind values for where_clause, e.g. {'name': 'node1'}.
 
     Returns
-        Number of rows deleted
-
-    Usage:
-        delete_rows(postgres, tables, 'Node', 'name = :name', {'name': 'node1'})
+    -------
+    int
+        Rows deleted.
     """
     table_name = tables[table_key]
-    sql = f'DELETE FROM {table_name} WHERE {where_clause}'
+    sql = f'delete from {table_name} where {where_clause}'
 
     with postgres.connect() as conn:
         result = conn.execute(text(sql), params or {})
@@ -927,66 +960,78 @@ def delete_rows(postgres, tables: dict, table_key: str, where_clause: str, param
 
 
 def insert_active_node(
-    postgres,
+    postgres: Engine,
     tables: dict,
     node_name: str,
     created_on: datetime.datetime = None
 ) -> None:
-    """Insert active node with current heartbeat for testing.
+    """Insert a Node row whose heartbeat is now.
 
-    Args:
-        postgres: postgres fixture
-        tables: Table name dict from get_table_names()
-        node_name: Name for node
-        created_on: Optional creation timestamp (defaults to now)
+    Parameters
+    ----------
+    postgres : Engine
+        The postgres fixture.
+    tables : dict
+        Table name dict from get_table_names().
+    node_name : str
+        Name for the node.
+    created_on : datetime.datetime, default None
+        Creation time. None means now.
     """
     now = datetime.datetime.now(datetime.timezone.utc)
     if created_on is None:
         created_on = now
 
+    sql = f"""
+insert into {tables["Node"]} (name, created_on, last_heartbeat)
+values (:name, :created_on, :heartbeat)
+"""
     with postgres.connect() as conn:
-        conn.execute(text(f"""
-            INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
-            VALUES (:name, :created_on, :heartbeat)
-        """), {
+        conn.execute(text(sql), {
             'name': node_name,
             'created_on': created_on,
-            'heartbeat': now
-        })
+            'heartbeat': now,
+            })
         conn.commit()
 
 
 def insert_stale_node(
-    postgres,
+    postgres: Engine,
     tables: dict,
     node_name: str,
     heartbeat_age_seconds: int = 30
 ) -> None:
-    """Insert node with old heartbeat for testing dead node detection.
+    """Insert a Node row created now with an old heartbeat.
 
-    Args:
-        postgres: postgres fixture
-        tables: Table name dict from get_table_names()
-        node_name: Name for dead node
-        heartbeat_age_seconds: How old the heartbeat should be
+    Parameters
+    ----------
+    postgres : Engine
+        The postgres fixture.
+    tables : dict
+        Table name dict from get_table_names().
+    node_name : str
+        Name for the dead node.
+    heartbeat_age_seconds : int, default 30
+        Seconds before now of the heartbeat.
     """
     now = datetime.datetime.now(datetime.timezone.utc)
     stale_heartbeat = now - datetime.timedelta(seconds=heartbeat_age_seconds)
 
+    sql = f"""
+insert into {tables["Node"]} (name, created_on, last_heartbeat)
+values (:name, :created_on, :heartbeat)
+"""
     with postgres.connect() as conn:
-        conn.execute(text(f"""
-            INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
-            VALUES (:name, :created_on, :heartbeat)
-        """), {
+        conn.execute(text(sql), {
             'name': node_name,
             'created_on': now,
-            'heartbeat': stale_heartbeat
-        })
+            'heartbeat': stale_heartbeat,
+            })
         conn.commit()
 
 
 def insert_lock(
-    postgres,
+    postgres: Engine,
     tables: dict,
     task_id: str | int,
     patterns: list[str],
@@ -995,133 +1040,180 @@ def insert_lock(
     reason: str = 'test lock',
     raw_patterns: str = None
 ) -> None:
-    """Insert lock record for testing.
+    """Insert a Lock row created now.
 
-    Args:
-        postgres: postgres fixture
-        tables: Table name dict
-        task_id: Task identifier to lock
-        patterns: Node patterns for lock
-        created_by: Creator node name
-        expires_at: Optional expiration timestamp
-        reason: Lock reason/description
-        raw_patterns: Raw JSON string for patterns (for testing invalid JSON)
+    Parameters
+    ----------
+    postgres : Engine
+        The postgres fixture.
+    tables : dict
+        Table name dict from get_table_names().
+    task_id : str | int
+        Task to lock, stored as str.
+    patterns : list[str]
+        Node patterns, stored as JSON.
+    created_by : str, default 'test'
+        Creator node name.
+    expires_at : datetime.datetime, default None
+        Expiry time. None stores NULL.
+    reason : str, default 'test lock'
+        Lock reason.
+    raw_patterns : str, default None
+        Stored in place of the JSON of patterns when given, e.g. invalid
+        JSON.
     """
     now = datetime.datetime.now(datetime.timezone.utc)
 
     patterns_value = raw_patterns if raw_patterns is not None else json.dumps(patterns)
 
+    sql = f"""
+insert into {tables["Lock"]}
+(task_id, node_patterns, reason, created_at, created_by, expires_at)
+values (:task_id, :patterns, :reason, :created_at, :created_by, :expires_at)
+"""
     with postgres.connect() as conn:
-        conn.execute(text(f"""
-            INSERT INTO {tables["Lock"]}
-            (task_id, node_patterns, reason, created_at, created_by, expires_at)
-            VALUES (:task_id, :patterns, :reason, :created_at, :created_by, :expires_at)
-        """), {
+        conn.execute(text(sql), {
             'task_id': str(task_id),
             'patterns': patterns_value,
             'reason': reason,
             'created_at': now,
             'created_by': created_by,
-            'expires_at': expires_at
-        })
+            'expires_at': expires_at,
+            })
         conn.commit()
 
 
-def insert_inst(postgres, tables: dict, task_id: str, done: bool = False) -> None:
-    """Insert test task record into Inst table.
+def insert_inst(
+    postgres: Engine,
+    tables: dict,
+    task_id: str,
+    done: bool = False
+) -> None:
+    """Insert an Inst row.
 
-    Args:
-        postgres: postgres fixture
-        tables: Table name dict
-        task_id: Task identifier
-        done: Task completion status
+    Parameters
+    ----------
+    postgres : Engine
+        The postgres fixture.
+    tables : dict
+        Table name dict from get_table_names().
+    task_id : str
+        Stored in the item column.
+    done : bool, default False
+        Task completion status.
     """
     with postgres.connect() as conn:
-        conn.execute(text(f'INSERT INTO {tables["Inst"]} (item, done) VALUES (:task_id, :done)'),
-                     {'task_id': task_id, 'done': done})
+        conn.execute(
+            text(f'insert into {tables["Inst"]} (item, done) values (:task_id, :done)'),
+            {'task_id': task_id, 'done': done})
         conn.commit()
 
 
-def insert_leader_lock(postgres, tables: dict, node: str, operation: str, acquired_at: datetime.datetime = None) -> None:
-    """Insert leader lock record for testing.
+def insert_leader_lock(
+    postgres: Engine,
+    tables: dict,
+    node: str,
+    operation: str,
+    acquired_at: datetime.datetime = None
+) -> None:
+    """Insert the singleton LeaderLock row.
 
-    Args:
-        postgres: postgres fixture
-        tables: Table name dict
-        node: Node holding the lock
-        operation: Operation description
-        acquired_at: Lock acquisition timestamp (defaults to now)
+    Parameters
+    ----------
+    postgres : Engine
+        The postgres fixture.
+    tables : dict
+        Table name dict from get_table_names().
+    node : str
+        Node holding the lock.
+    operation : str
+        Operation description.
+    acquired_at : datetime.datetime, default None
+        Acquisition time. None means now.
     """
     if acquired_at is None:
         acquired_at = datetime.datetime.now(datetime.timezone.utc)
 
+    sql = f"""
+insert into {tables["LeaderLock"]} (singleton, node, acquired_at, operation)
+values (1, :node, :acquired_at, :operation)
+"""
     with postgres.connect() as conn:
-        conn.execute(text(f"""
-            INSERT INTO {tables["LeaderLock"]} (singleton, node, acquired_at, operation)
-            VALUES (1, :node, :acquired_at, :operation)
-        """), {
+        conn.execute(text(sql), {
             'node': node,
             'acquired_at': acquired_at,
-            'operation': operation
-        })
+            'operation': operation,
+            })
         conn.commit()
 
 
 def insert_token(
-    postgres,
+    postgres: Engine,
     tables: dict,
     token_id: int,
     node: str,
     assigned_at: datetime.datetime = None,
     version: int = 1
 ) -> None:
-    """Insert token assignment record for testing.
+    """Insert a Token row assigning token_id to node.
 
-    Args:
-        postgres: postgres fixture
-        tables: Table name dict
-        token_id: Token identifier
-        node: Node assigned to token
-        assigned_at: Assignment timestamp (defaults to now)
-        version: Token version
+    Parameters
+    ----------
+    postgres : Engine
+        The postgres fixture.
+    tables : dict
+        Table name dict from get_table_names().
+    token_id : int
+        Token to assign.
+    node : str
+        Node that owns the token.
+    assigned_at : datetime.datetime, default None
+        Assignment time. None means now.
+    version : int, default 1
+        Token version.
     """
     if assigned_at is None:
         assigned_at = datetime.datetime.now(datetime.timezone.utc)
 
+    sql = f"""
+insert into {tables["Token"]} (token_id, node, assigned_at, version)
+values (:token_id, :node, :assigned_at, :version)
+"""
     with postgres.connect() as conn:
-        conn.execute(text(f"""
-            INSERT INTO {tables["Token"]} (token_id, node, assigned_at, version)
-            VALUES (:token_id, :node, :assigned_at, :version)
-        """), {
+        conn.execute(text(sql), {
             'token_id': token_id,
             'node': node,
             'assigned_at': assigned_at,
-            'version': version
-        })
+            'version': version,
+            })
         conn.commit()
 
 
 def get_token_assignments(
-    postgres,
+    postgres: Engine,
     tables: dict
 ) -> dict[int, str]:
-    """Get current token assignments from database.
+    """Owner of every assigned token, read from the Token table.
 
-    Args:
-        postgres: postgres fixture
-        tables: Table name dict
+    Parameters
+    ----------
+    postgres : Engine
+        The postgres fixture.
+    tables : dict
+        Table name dict from get_table_names().
 
     Returns
-        Dict mapping token_id -> node_name
+    -------
+    dict[int, str]
+        Node name keyed by token_id.
     """
     with postgres.connect() as conn:
         result = conn.execute(
-            text(f'SELECT token_id, node FROM {tables["Token"]}')
-        )
+            text(f'select token_id, node from {tables["Token"]}'))
         return {row[0]: row[1] for row in result}
 
 
-def get_rebalance_count(postgres, tables: dict, trigger_reason: str) -> int:
+def get_rebalance_count(postgres: Engine, tables: dict, trigger_reason: str) -> int:
     """Number of distributions logged with trigger_reason, at any age.
 
     Parameters
@@ -1141,27 +1233,34 @@ def get_rebalance_count(postgres, tables: dict, trigger_reason: str) -> int:
     """
     with postgres.connect() as conn:
         result = conn.execute(
-            text(f'SELECT COUNT(*) FROM {tables["Rebalance"]} WHERE trigger_reason = :reason'),
+            text(f'select count(*) from {tables["Rebalance"]} where trigger_reason = :reason'),
             {'reason': trigger_reason})
         return result.scalar()
 
 
-# ============================================================================
-# PATTERN MATCHERS - For mock usage
-# ============================================================================
+# --- Pattern matchers ---
 
 def exact_match(node: str, pattern: str) -> bool:
-    """Pattern matcher that only matches exact strings.
-
-    Used for testing distribution algorithm without SQL LIKE complexity.
+    """True when node equals pattern, with no wildcards.
     """
     return node == pattern
 
 
 def wildcard_match(node: str, pattern: str) -> bool:
-    """Pattern matcher supporting % wildcard (SQL LIKE style).
+    """Approximate SQL LIKE with one leading or trailing % wildcard.
 
-    Used for testing distribution algorithm with pattern matching.
+    Parameters
+    ----------
+    node : str
+        Node name to test.
+    pattern : str
+        Exact name, 'prefix%' or '%suffix'. With % at both ends, the
+        leading one is literal. A % anywhere else matches only the
+        identical string.
+
+    Returns
+    -------
+    bool
     """
     if pattern == node:
         return True

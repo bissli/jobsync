@@ -1,6 +1,7 @@
 """Tests for lock registration, management, and coordination.
 
-USE THIS FILE FOR:
+Scope
+-----
 - Lock registration and lifecycle tests
 - Lock provider callback tests
 - Pattern matching and fallback logic
@@ -13,10 +14,17 @@ from dataclasses import replace
 
 import pytest
 from fixtures import *  # noqa: F401, F403
-from sqlalchemy import text
+from sqlalchemy import Engine, text
 
 from jobsync import schema
 from jobsync.client import CoordinationConfig, JobState, LockNotAcquired
+
+
+def count_locks(postgres: Engine, tables: dict) -> int:
+    """Rows in tables['Lock'], expired locks included.
+    """
+    with postgres.connect() as conn:
+        return conn.execute(text(f'select count(*) from {tables["Lock"]}')).scalar()
 
 
 @pytest.fixture
@@ -36,7 +44,8 @@ def jobs_to_exit():
 
 
 class TestLockRegistration:
-    """Test lock registration API."""
+    """Test lock registration API.
+    """
 
     @clean_tables('Lock')
     def test_register_single_lock(self, postgres, jobs_to_exit):
@@ -56,12 +65,13 @@ class TestLockRegistration:
         task_id = 'task-123'
         job.register_lock(task_id, 'special-%', 'test reason')
 
+        lock_sql = f"""
+select node_patterns, reason, created_by
+from {tables["Lock"]}
+where task_id = :task_id
+"""
         with postgres.connect() as conn:
-            result = conn.execute(text(f"""
-                SELECT node_patterns, reason, created_by
-                FROM {tables["Lock"]}
-                WHERE task_id = :task_id
-            """), {'task_id': str(task_id)})
+            result = conn.execute(text(lock_sql), {'task_id': str(task_id)})
             lock = [dict(row._mapping) for row in result]
 
         assert len(lock) == 1, 'Lock should be created'
@@ -88,16 +98,17 @@ class TestLockRegistration:
             ('task-1', 'pattern-1', 'reason-1'),
             ('task-2', 'pattern-2', 'reason-2'),
             ('task-3', 'pattern-3', 'reason-3'),
-        ]
+            ]
 
         job.register_locks_bulk(locks)
 
+        locks_sql = f"""
+select task_id, node_patterns, reason, created_by
+from {tables["Lock"]}
+order by task_id
+"""
         with postgres.connect() as conn:
-            result = conn.execute(text(f"""
-                SELECT task_id, node_patterns, reason, created_by
-                FROM {tables["Lock"]}
-                ORDER BY task_id
-            """))
+            result = conn.execute(text(locks_sql))
             rows = [tuple(row) for row in result]
         assert rows == [
             ('task-1', ['pattern-1'], 'reason-1', 'node1'),
@@ -124,20 +135,24 @@ class TestLockRegistration:
         job.register_lock(task_id, 'pattern-1', 'reason-1')
         job.register_lock(task_id, 'pattern-2', 'reason-2')
 
+        patterns_sql = f"""
+select node_patterns
+from {tables["Lock"]}
+where task_id = :task_id
+"""
         with postgres.connect() as conn:
-            result = conn.execute(text(f"""
-                SELECT node_patterns FROM {tables["Lock"]}
-                WHERE task_id = :task_id
-            """), {'task_id': str(task_id)})
+            result = conn.execute(text(patterns_sql), {'task_id': str(task_id)})
             locks = [dict(row._mapping) for row in result]
 
         assert len(locks) == 1, 'Should only have 1 lock (ON CONFLICT DO UPDATE)'
         patterns = locks[0]['node_patterns']
-        assert patterns == ['pattern-2'], 'Second pattern should replace first (DO UPDATE)'
+        assert patterns == ['pattern-2'], \
+            'Second pattern should replace first (DO UPDATE)'
 
 
 class TestConcurrentLockRegistration:
-    """Test concurrent lock registration from multiple nodes."""
+    """Test concurrent lock registration from multiple nodes.
+    """
 
     @clean_tables('Lock')
     def test_same_lock_from_multiple_nodes_sequential(self, postgres, jobs_to_exit):
@@ -151,25 +166,33 @@ class TestConcurrentLockRegistration:
         tables = schema.get_table_names(config.appname)
 
         for i in range(1, 11):
-            job = create_job(f'node{i}', postgres, coordination_config=config, wait_on_enter=0)
+            job = create_job(
+                f'node{i}',
+                postgres,
+                coordination_config=config,
+                wait_on_enter=0)
             jobs_to_exit.append(job)
             job.register_lock('task-X1', 'Node1', 'lock X1 to Node1')
 
-        with postgres.connect() as conn:
-            result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Lock"]}'))
-            lock_count = result.scalar()
-        assert lock_count == 1, 'Only 1 lock should exist (idempotent)'
+        assert count_locks(postgres, tables) == 1, \
+            'Only 1 lock should exist (idempotent)'
 
         with postgres.connect() as conn:
-            result = conn.execute(text(f'SELECT node_patterns, created_by FROM {tables["Lock"]}'))
+            result = conn.execute(
+                text(f'select node_patterns, created_by from {tables["Lock"]}'))
             lock = [dict(row._mapping) for row in result]
         assert len(lock) == 1
         patterns = lock[0]['node_patterns']
         assert patterns == ['Node1'], 'Pattern should be ["Node1"]'
-        assert lock[0]['created_by'] == 'node10', 'Last node should be recorded as creator (DO UPDATE)'
+        assert lock[0]['created_by'] == 'node10', \
+            'Last node should be recorded as creator (DO UPDATE)'
 
     @clean_tables('Lock')
-    def test_same_lock_from_multiple_nodes_simulated_concurrent(self, postgres, jobs_to_exit):
+    def test_same_lock_from_multiple_nodes_simulated_concurrent(
+        self,
+        postgres,
+        jobs_to_exit
+    ):
         """Verify ten simultaneous registrations of one task all succeed.
 
         Mutation: register_lock replaced by a check-then-insert (SELECT, then
@@ -180,8 +203,14 @@ class TestConcurrentLockRegistration:
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
 
-        jobs = [create_job(f'node{i}', postgres, coordination_config=config, wait_on_enter=0)
-                for i in range(1, 11)]
+        jobs = [
+            create_job(
+                f'node{i}',
+                postgres,
+                coordination_config=config,
+                wait_on_enter=0)
+            for i in range(1, 11)
+            ]
         jobs_to_exit.extend(jobs)
         barrier = threading.Barrier(len(jobs))
         errors = []
@@ -201,10 +230,8 @@ class TestConcurrentLockRegistration:
             t.join()
 
         assert errors == [], f'Concurrent registration raised: {errors}'
-        with postgres.connect() as conn:
-            result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Lock"]}'))
-            lock_count = result.scalar()
-        assert lock_count == 1, 'Only 1 lock should exist despite concurrent registration'
+        assert count_locks(postgres, tables) == 1, \
+            'Only 1 lock should exist despite concurrent registration'
 
     @clean_tables('Lock')
     def test_bulk_lock_registration_idempotency(self, postgres, jobs_to_exit):
@@ -221,21 +248,24 @@ class TestConcurrentLockRegistration:
             ('task-1', 'pattern-A', 'reason-1'),
             ('task-2', 'pattern-A', 'reason-2'),
             ('task-3', 'pattern-B', 'reason-3'),
-        ]
+            ]
 
         for i in range(1, 8):
-            job = create_job(f'node{i}', postgres, coordination_config=config, wait_on_enter=0)
+            job = create_job(
+                f'node{i}',
+                postgres,
+                coordination_config=config,
+                wait_on_enter=0)
             jobs_to_exit.append(job)
             job.register_locks_bulk(locks_to_register)
 
-        with postgres.connect() as conn:
-            result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Lock"]}'))
-            lock_count = result.scalar()
-        assert lock_count == 3, 'Should have exactly 3 locks despite 7 nodes registering'
+        assert count_locks(postgres, tables) == 3, \
+            'Should have exactly 3 locks despite 7 nodes registering'
 
 
 class TestLockClearing:
-    """Test lock clearing functionality."""
+    """Test lock clearing functionality.
+    """
 
     @clean_tables('Lock')
     def test_clear_locks_by_creator(self, postgres, jobs_to_exit):
@@ -255,16 +285,12 @@ class TestLockClearing:
         job.register_lock('task-2', 'pattern-2', 'reason-2')
         job.register_lock('task-3', 'pattern-3', 'reason-3')
 
-        with postgres.connect() as conn:
-            count_before = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Lock"]}')).scalar()
-        assert count_before == 3, 'Should have 3 locks'
+        assert count_locks(postgres, tables) == 3, 'Should have 3 locks'
 
         removed = job.clear_locks_by_creator('node1')
         assert removed == 3, 'Should remove 3 locks'
 
-        with postgres.connect() as conn:
-            count_after = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Lock"]}')).scalar()
-        assert count_after == 0, 'Should have 0 locks remaining'
+        assert count_locks(postgres, tables) == 0, 'Should have 0 locks remaining'
 
     @clean_tables('Lock')
     def test_clear_locks_by_creator_selective(self, postgres, jobs_to_exit):
@@ -276,26 +302,33 @@ class TestLockClearing:
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
 
-        job1 = create_job('node1', postgres, coordination_config=config, wait_on_enter=0)
-        job2 = create_job('node2', postgres, coordination_config=config, wait_on_enter=0)
+        job1 = create_job(
+            'node1',
+            postgres,
+            coordination_config=config,
+            wait_on_enter=0)
+        job2 = create_job(
+            'node2',
+            postgres,
+            coordination_config=config,
+            wait_on_enter=0)
         jobs_to_exit.extend([job1, job2])
 
         job1.register_lock('task-1', 'pattern-1', 'from node1')
         job1.register_lock('task-2', 'pattern-2', 'from node1')
         job2.register_lock('task-3', 'pattern-3', 'from node2')
 
-        with postgres.connect() as conn:
-            count_before = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Lock"]}')).scalar()
-        assert count_before == 3, 'Should have 3 locks total'
+        assert count_locks(postgres, tables) == 3, 'Should have 3 locks total'
 
         removed = job1.clear_locks_by_creator('node1')
         assert removed == 2, 'Should remove 2 locks from node1'
 
         with postgres.connect() as conn:
-            result = conn.execute(text(f'SELECT created_by FROM {tables["Lock"]}'))
+            result = conn.execute(text(f'select created_by from {tables["Lock"]}'))
             remaining = [dict(row._mapping) for row in result]
         assert len(remaining) == 1, 'Should have 1 lock remaining'
-        assert remaining[0]['created_by'] == 'node2', 'Remaining lock should be from node2'
+        assert remaining[0]['created_by'] == 'node2', \
+            'Remaining lock should be from node2'
 
     @clean_tables('Lock')
     def test_clear_all_locks(self, postgres, jobs_to_exit):
@@ -307,27 +340,32 @@ class TestLockClearing:
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
 
-        job1 = create_job('node1', postgres, coordination_config=config, wait_on_enter=0)
-        job2 = create_job('node2', postgres, coordination_config=config, wait_on_enter=0)
+        job1 = create_job(
+            'node1',
+            postgres,
+            coordination_config=config,
+            wait_on_enter=0)
+        job2 = create_job(
+            'node2',
+            postgres,
+            coordination_config=config,
+            wait_on_enter=0)
         jobs_to_exit.extend([job1, job2])
 
         job1.register_lock('task-1', 'pattern-1', 'from node1')
         job2.register_lock('task-2', 'pattern-2', 'from node2')
 
-        with postgres.connect() as conn:
-            count_before = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Lock"]}')).scalar()
-        assert count_before == 2, 'Should have 2 locks'
+        assert count_locks(postgres, tables) == 2, 'Should have 2 locks'
 
         removed = job1.clear_all_locks()
         assert removed == 2, 'Should remove all locks'
 
-        with postgres.connect() as conn:
-            count_after = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Lock"]}')).scalar()
-        assert count_after == 0, 'Should have 0 locks'
+        assert count_locks(postgres, tables) == 0, 'Should have 0 locks'
 
 
 class TestLockListing:
-    """Test lock listing functionality."""
+    """Test lock listing functionality.
+    """
 
     @clean_tables('Lock')
     def test_list_locks_content(self, postgres, jobs_to_exit):
@@ -369,9 +407,16 @@ class TestLockListing:
         job.register_lock('task-1', 'pattern-1', 'not expired')
         job.register_lock('task-2', 'pattern-2', 'expires soon', expires_in_days=1)
 
-        expired_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=2)
-        insert_lock(postgres, tables, 999, ['pattern-expired'],
-                    created_by='node1', expires_at=expired_time, reason='already expired')
+        expired_time = (
+            datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=2))
+        insert_lock(
+            postgres,
+            tables,
+            999,
+            ['pattern-expired'],
+            created_by='node1',
+            expires_at=expired_time,
+            reason='already expired')
 
         locks = job.list_locks()
 
@@ -382,11 +427,12 @@ class TestLockListing:
 
 
 class TestClearExistingLocks:
-    """Test clear_existing_locks parameter behavior."""
+    """Test clear_existing_locks parameter behavior.
+    """
 
     @clean_tables('Lock')
     def test_clear_existing_locks_true(self, postgres):
-        """Verify clear_existing_locks=True clears old locks before the provider.
+        """Verify clear_existing_locks=True keeps only the provider's new lock.
 
         Mutation: _on_enter_cluster_forming ignores the flag, or clears
             after calling lock_provider.
@@ -399,27 +445,39 @@ class TestClearExistingLocks:
             job.register_lock('task-1', 'pattern-OLD', 'first run')
             job.register_lock('task-2', 'pattern-OLD', 'first run')
 
-        with create_job('node1', postgres, coordination_config=config,
-                        lock_provider=first_lock_provider, clear_existing_locks=False,
-                        wait_on_enter=0, wait_on_exit=0):
+        with create_job(
+            'node1',
+            postgres,
+            coordination_config=config,
+            lock_provider=first_lock_provider,
+            clear_existing_locks=False,
+            wait_on_enter=0,
+            wait_on_exit=0):
             pass
 
         with postgres.connect() as conn:
-            count_after_first = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Lock"]} WHERE created_by = :creator'),
-                                             {'creator': 'node1'}).scalar()
+            count_after_first = conn.execute(
+                text(f'select count(*) from {tables["Lock"]} where created_by = :creator'),
+                {'creator': 'node1'}).scalar()
         assert count_after_first == 2, 'Should have 2 locks after first run'
 
         def second_lock_provider(job):
             job.register_lock('task-3', 'pattern-NEW', 'second run')
 
-        with create_job('node1', postgres, coordination_config=config,
-                        lock_provider=second_lock_provider, clear_existing_locks=True,
-                        wait_on_enter=0, wait_on_exit=0):
+        with create_job(
+            'node1',
+            postgres,
+            coordination_config=config,
+            lock_provider=second_lock_provider,
+            clear_existing_locks=True,
+            wait_on_enter=0,
+            wait_on_exit=0):
             pass
 
         with postgres.connect() as conn:
-            result = conn.execute(text(f'SELECT node_patterns FROM {tables["Lock"]} WHERE created_by = :creator'),
-                                  {'creator': 'node1'})
+            result = conn.execute(
+                text(f'select node_patterns from {tables["Lock"]} where created_by = :creator'),
+                {'creator': 'node1'})
             locks = [dict(row._mapping) for row in result]
 
         patterns = [l['node_patterns'][0] for l in locks]
@@ -441,22 +499,33 @@ class TestClearExistingLocks:
         def first_lock_provider(job):
             job.register_lock('task-1', 'pattern-OLD', 'first run')
 
-        with create_job('node1', postgres, coordination_config=config,
-                        lock_provider=first_lock_provider, clear_existing_locks=False,
-                        wait_on_enter=0, wait_on_exit=0):
+        with create_job(
+            'node1',
+            postgres,
+            coordination_config=config,
+            lock_provider=first_lock_provider,
+            clear_existing_locks=False,
+            wait_on_enter=0,
+            wait_on_exit=0):
             pass
 
         def second_lock_provider(job):
             job.register_lock('task-2', 'pattern-NEW', 'second run')
 
-        with create_job('node1', postgres, coordination_config=config,
-                        lock_provider=second_lock_provider, clear_existing_locks=False,
-                        wait_on_enter=0, wait_on_exit=0):
+        with create_job(
+            'node1',
+            postgres,
+            coordination_config=config,
+            lock_provider=second_lock_provider,
+            clear_existing_locks=False,
+            wait_on_enter=0,
+            wait_on_exit=0):
             pass
 
         with postgres.connect() as conn:
-            result = conn.execute(text(f'SELECT node_patterns FROM {tables["Lock"]} WHERE created_by = :creator ORDER BY task_id'),
-                                  {'creator': 'node1'})
+            result = conn.execute(
+                text(f'select node_patterns from {tables["Lock"]} where created_by = :creator order by task_id'),
+                {'creator': 'node1'})
             locks = [dict(row._mapping) for row in result]
 
         patterns = [l['node_patterns'][0] for l in locks]
@@ -467,7 +536,8 @@ class TestClearExistingLocks:
 
 
 class TestLockProviderTiming:
-    """Test lock_provider callback timing in state machine."""
+    """Test lock_provider callback timing in state machine.
+    """
 
     @clean_tables('Lock')
     def test_lock_provider_called_during_cluster_forming(self, postgres):
@@ -486,8 +556,12 @@ class TestLockProviderTiming:
             callback_invoked.append(job.state_machine.state)
             job.register_lock('task-1', 'pattern-1', 'test lock')
 
-        job = create_job('node1', postgres, coordination_config=config, wait_on_enter=2,
-                         lock_provider=track_lock_provider)
+        job = create_job(
+            'node1',
+            postgres,
+            coordination_config=config,
+            wait_on_enter=2,
+            lock_provider=track_lock_provider)
 
         job.__enter__()
 
@@ -495,13 +569,10 @@ class TestLockProviderTiming:
             assert wait_for_running_state(job, timeout_sec=5)
 
             assert len(callback_invoked) > 0, 'lock_provider should be invoked'
-            assert callback_invoked[0] == JobState.CLUSTER_FORMING, 'lock_provider should be called during CLUSTER_FORMING'
+            assert callback_invoked[0] == JobState.CLUSTER_FORMING, \
+                'lock_provider should be called during CLUSTER_FORMING'
 
-            with postgres.connect() as conn:
-                result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Lock"]}'))
-                lock_count = result.scalar()
-
-            assert lock_count == 1, 'Lock should be registered'
+            assert count_locks(postgres, tables) == 1, 'Lock should be registered'
 
         finally:
             job.__exit__(None, None, None)
@@ -518,20 +589,26 @@ class TestLockProviderTiming:
         def track_lock_provider(job):
             callback_invoked.append(True)
 
-        job = create_job('node1', postgres, wait_on_enter=0,
-                         coordination_config=None, lock_provider=track_lock_provider)
+        job = create_job(
+            'node1',
+            postgres,
+            wait_on_enter=0,
+            coordination_config=None,
+            lock_provider=track_lock_provider)
 
         job.__enter__()
 
         try:
-            assert len(callback_invoked) == 0, 'lock_provider should not be invoked when coordination disabled'
+            assert len(callback_invoked) == 0, \
+                'lock_provider should not be invoked when coordination disabled'
 
         finally:
             job.__exit__(None, None, None)
 
 
 class TestLockFallbackPatterns:
-    """Test lock fallback pattern matching in real cluster."""
+    """Test lock fallback pattern matching in real cluster.
+    """
 
     @clean_tables('Node', 'Lock', 'Token')
     def test_fallback_to_second_pattern(self, postgres):
@@ -547,15 +624,30 @@ class TestLockFallbackPatterns:
 
         now = datetime.datetime.now(datetime.timezone.utc)
         insert_active_node(postgres, tables, 'node1', created_on=now)
-        insert_active_node(postgres, tables, 'node2', created_on=now + datetime.timedelta(seconds=1))
-        insert_active_node(postgres, tables, 'special-node', created_on=now + datetime.timedelta(seconds=2))
+        insert_active_node(
+            postgres,
+            tables,
+            'node2',
+            created_on=now + datetime.timedelta(seconds=1))
+        insert_active_node(
+            postgres,
+            tables,
+            'special-node',
+            created_on=now + datetime.timedelta(seconds=2))
 
         def register_fallback_locks(job) -> None:
-            job.register_lock('task-1', ['missing-%', 'special-%', 'node%'], 'test fallback')
+            job.register_lock(
+                'task-1',
+                ['missing-%', 'special-%', 'node%'],
+                'test fallback')
 
         coord_config = CoordinationConfig(total_tokens=30)
-        job = create_job('node1', postgres, wait_on_enter=5,
-                         coordination_config=coord_config, lock_provider=register_fallback_locks)
+        job = create_job(
+            'node1',
+            postgres,
+            wait_on_enter=5,
+            coordination_config=coord_config,
+            lock_provider=register_fallback_locks)
         job.__enter__()
 
         try:
@@ -563,11 +655,7 @@ class TestLockFallbackPatterns:
 
             token_id = job.task_to_token('task-1')
 
-            with postgres.connect() as conn:
-                result = conn.execute(text(f"""
-                    SELECT node FROM {tables["Token"]} WHERE token_id = :token_id
-                """), {'token_id': token_id})
-                assigned_node = result.scalar()
+            assigned_node = get_token_assignments(postgres, tables).get(token_id)
 
             assert assigned_node == 'special-node', \
                 'Should use second pattern (special-%) when first (missing-%) has no match'
@@ -587,14 +675,25 @@ class TestLockFallbackPatterns:
 
         now = datetime.datetime.now(datetime.timezone.utc)
         insert_active_node(postgres, tables, 'node1', created_on=now)
-        insert_active_node(postgres, tables, 'node2', created_on=now + datetime.timedelta(seconds=1))
+        insert_active_node(
+            postgres,
+            tables,
+            'node2',
+            created_on=now + datetime.timedelta(seconds=1))
 
         def register_fallback_locks(job) -> None:
-            job.register_lock('task-1', ['missing-%', 'also-missing-%', 'node%'], 'three-level fallback')
+            job.register_lock(
+                'task-1',
+                ['missing-%', 'also-missing-%', 'node%'],
+                'three-level fallback')
 
         coord_config = CoordinationConfig(total_tokens=30)
-        job = create_job('node1', postgres, wait_on_enter=5,
-                         coordination_config=coord_config, lock_provider=register_fallback_locks)
+        job = create_job(
+            'node1',
+            postgres,
+            wait_on_enter=5,
+            coordination_config=coord_config,
+            lock_provider=register_fallback_locks)
         job.__enter__()
 
         try:
@@ -602,11 +701,7 @@ class TestLockFallbackPatterns:
 
             token_id = job.task_to_token('task-1')
 
-            with postgres.connect() as conn:
-                result = conn.execute(text(f"""
-                    SELECT node FROM {tables["Token"]} WHERE token_id = :token_id
-                """), {'token_id': token_id})
-                assigned_node = result.scalar()
+            assigned_node = get_token_assignments(postgres, tables).get(token_id)
 
             assert assigned_node in {'node1', 'node2'}, \
                 'Should use third pattern (node%) when first two fail'
@@ -627,14 +722,25 @@ class TestLockFallbackPatterns:
 
         now = datetime.datetime.now(datetime.timezone.utc)
         insert_active_node(postgres, tables, 'node1', created_on=now)
-        insert_active_node(postgres, tables, 'node2', created_on=now + datetime.timedelta(seconds=1))
+        insert_active_node(
+            postgres,
+            tables,
+            'node2',
+            created_on=now + datetime.timedelta(seconds=1))
 
         def register_failed_fallback_locks(job) -> None:
-            job.register_lock('task-1', ['missing-%', 'also-missing-%', 'nope-%'], 'all fail')
+            job.register_lock(
+                'task-1',
+                ['missing-%', 'also-missing-%', 'nope-%'],
+                'all fail')
 
         coord_config = CoordinationConfig(total_tokens=30)
-        job = create_job('node1', postgres, wait_on_enter=5,
-                         coordination_config=coord_config, lock_provider=register_failed_fallback_locks)
+        job = create_job(
+            'node1',
+            postgres,
+            wait_on_enter=5,
+            coordination_config=coord_config,
+            lock_provider=register_failed_fallback_locks)
         job.__enter__()
 
         try:
@@ -642,13 +748,8 @@ class TestLockFallbackPatterns:
 
             token_id = job.task_to_token('task-1')
 
-            with postgres.connect() as conn:
-                result = conn.execute(text(f"""
-                    SELECT COUNT(*) FROM {tables["Token"]} WHERE token_id = :token_id
-                """), {'token_id': token_id})
-                count = result.scalar()
-
-            assert count == 0, 'Token should not be assigned when all patterns fail'
+            assert token_id not in get_token_assignments(postgres, tables), \
+                'Token should not be assigned when all patterns fail'
 
         finally:
             job.__exit__(None, None, None)
@@ -666,14 +767,22 @@ class TestLockFallbackPatterns:
 
         now = datetime.datetime.now(datetime.timezone.utc)
         insert_active_node(postgres, tables, 'primary-node', created_on=now)
-        insert_active_node(postgres, tables, 'backup-node', created_on=now + datetime.timedelta(seconds=1))
+        insert_active_node(
+            postgres,
+            tables,
+            'backup-node',
+            created_on=now + datetime.timedelta(seconds=1))
 
         def register_primary_locks(job) -> None:
             job.register_lock('task-1', ['primary-%', 'backup-%'], 'primary first')
 
         coord_config = CoordinationConfig(total_tokens=30)
-        job = create_job('primary-node', postgres, wait_on_enter=5,
-                         coordination_config=coord_config, lock_provider=register_primary_locks)
+        job = create_job(
+            'primary-node',
+            postgres,
+            wait_on_enter=5,
+            coordination_config=coord_config,
+            lock_provider=register_primary_locks)
         job.__enter__()
 
         try:
@@ -681,11 +790,7 @@ class TestLockFallbackPatterns:
 
             token_id = job.task_to_token('task-1')
 
-            with postgres.connect() as conn:
-                result = conn.execute(text(f"""
-                    SELECT node FROM {tables["Token"]} WHERE token_id = :token_id
-                """), {'token_id': token_id})
-                assigned_node = result.scalar()
+            assigned_node = get_token_assignments(postgres, tables).get(token_id)
 
             assert assigned_node == 'primary-node', \
                 'Should use first pattern (primary-%) when it matches'
@@ -706,33 +811,50 @@ class TestLockFallbackPatterns:
 
         now = datetime.datetime.now(datetime.timezone.utc)
         insert_active_node(postgres, tables, 'leader', created_on=now)
-        insert_active_node(postgres, tables, 'primary-node', created_on=now + datetime.timedelta(seconds=1))
-        insert_active_node(postgres, tables, 'backup-node', created_on=now + datetime.timedelta(seconds=2))
+        insert_active_node(
+            postgres,
+            tables,
+            'primary-node',
+            created_on=now + datetime.timedelta(seconds=1))
+        insert_active_node(
+            postgres,
+            tables,
+            'backup-node',
+            created_on=now + datetime.timedelta(seconds=2))
 
         def register_failover_locks(job) -> None:
             job.register_lock('task-1', ['primary-%', 'backup-%'], 'failover test')
 
         keep_alive = threading.Event()
+        heartbeat_sql = f"""
+update {tables["Node"]}
+set last_heartbeat = now()
+where name = 'backup-node'
+"""
 
         def maintain_backup_heartbeat():
             """Keep backup-node alive with periodic heartbeat updates.
             """
             while not keep_alive.is_set():
                 with postgres.connect() as conn:
-                    conn.execute(text(f"""
-                        UPDATE {tables["Node"]}
-                        SET last_heartbeat = NOW()
-                        WHERE name = 'backup-node'
-                    """))
+                    conn.execute(text(heartbeat_sql))
                     conn.commit()
                 keep_alive.wait(timeout=2)
 
-        heartbeat_thread = threading.Thread(target=maintain_backup_heartbeat, daemon=True)
+        heartbeat_thread = threading.Thread(
+            target=maintain_backup_heartbeat,
+            daemon=True)
         heartbeat_thread.start()
 
-        coord_config = CoordinationConfig(total_tokens=30, dead_node_check_interval_sec=1)
-        leader = create_job('leader', postgres, wait_on_enter=2,
-                            coordination_config=coord_config, lock_provider=register_failover_locks)
+        coord_config = CoordinationConfig(
+            total_tokens=30,
+            dead_node_check_interval_sec=1)
+        leader = create_job(
+            'leader',
+            postgres,
+            wait_on_enter=2,
+            coordination_config=coord_config,
+            lock_provider=register_failover_locks)
         leader.__enter__()
 
         try:
@@ -740,29 +862,28 @@ class TestLockFallbackPatterns:
 
             token_id = leader.task_to_token('task-1')
 
-            with postgres.connect() as conn:
-                result = conn.execute(text(f"""
-                    SELECT node FROM {tables["Token"]} WHERE token_id = :token_id
-                """), {'token_id': token_id})
-                initial_assignment = result.scalar()
+            initial_assignment = get_token_assignments(postgres, tables).get(token_id)
 
-            assert initial_assignment == 'primary-node', 'Should initially use primary-node'
+            assert initial_assignment == 'primary-node', \
+                'Should initially use primary-node'
 
+            stale_primary_sql = f"""
+update {tables["Node"]}
+set last_heartbeat = now() - interval '30 seconds'
+where name = 'primary-node'
+"""
             with postgres.connect() as conn:
-                conn.execute(text(f"""
-                    UPDATE {tables["Node"]}
-                    SET last_heartbeat = NOW() - INTERVAL '30 seconds'
-                    WHERE name = 'primary-node'
-                """))
+                conn.execute(text(stale_primary_sql))
                 conn.commit()
 
-            assert wait_for_dead_node_removal(postgres, tables, 'primary-node', timeout_sec=15)
+            assert wait_for_dead_node_removal(
+                postgres,
+                tables,
+                'primary-node',
+                timeout_sec=15)
 
             def token_owner():
-                with postgres.connect() as conn:
-                    return conn.execute(text(f"""
-                        SELECT node FROM {tables["Token"]} WHERE token_id = :token_id
-                    """), {'token_id': token_id}).scalar()
+                return get_token_assignments(postgres, tables).get(token_id)
 
             assert wait_for(lambda: token_owner() == 'backup-node', timeout_sec=20), \
                 f'Should fallback to backup-node when primary-node dies, owner is {token_owner()}'
@@ -785,8 +906,16 @@ class TestLockFallbackPatterns:
 
         now = datetime.datetime.now(datetime.timezone.utc)
         insert_active_node(postgres, tables, 'node1', created_on=now)
-        insert_active_node(postgres, tables, 'alpha-node', created_on=now + datetime.timedelta(seconds=1))
-        insert_active_node(postgres, tables, 'beta-node', created_on=now + datetime.timedelta(seconds=2))
+        insert_active_node(
+            postgres,
+            tables,
+            'alpha-node',
+            created_on=now + datetime.timedelta(seconds=1))
+        insert_active_node(
+            postgres,
+            tables,
+            'beta-node',
+            created_on=now + datetime.timedelta(seconds=2))
 
         def register_multiple_fallbacks(job) -> None:
             job.register_lock('task-1', ['missing-%', 'alpha-%'], 'fallback to alpha')
@@ -794,32 +923,34 @@ class TestLockFallbackPatterns:
             job.register_lock('task-3', ['node%', 'alpha-%'], 'use node pattern')
 
         coord_config = CoordinationConfig(total_tokens=50)
-        job = create_job('node1', postgres, wait_on_enter=5,
-                         coordination_config=coord_config, lock_provider=register_multiple_fallbacks)
+        job = create_job(
+            'node1',
+            postgres,
+            wait_on_enter=5,
+            coordination_config=coord_config,
+            lock_provider=register_multiple_fallbacks)
         job.__enter__()
 
         try:
             assert wait_for_running_state(job, timeout_sec=5)
 
+            token_owners = get_token_assignments(postgres, tables)
             assignments = {}
             for task_id in ['task-1', 'task-2', 'task-3']:
-                token_id = job.task_to_token(task_id)
-                with postgres.connect() as conn:
-                    result = conn.execute(text(f"""
-                        SELECT node FROM {tables["Token"]} WHERE token_id = :token_id
-                    """), {'token_id': token_id})
-                    assignments[task_id] = result.scalar()
+                assignments[task_id] = token_owners.get(job.task_to_token(task_id))
 
             assert assignments['task-1'] == 'alpha-node', 'task-1 should use alpha-node'
             assert assignments['task-2'] == 'beta-node', 'task-2 should use beta-node'
-            assert assignments['task-3'] == 'node1', 'task-3 should use node1 (first match)'
+            assert assignments['task-3'] == 'node1', \
+                'task-3 should use node1 (first match)'
 
         finally:
             job.__exit__(None, None, None)
 
 
 class TestConcurrentLeaderLockAcquisition:
-    """Test concurrent leader lock acquisition from multiple nodes."""
+    """Test concurrent leader lock acquisition from multiple nodes.
+    """
 
     @clean_tables('LeaderLock')
     def test_only_one_node_acquires_leader_lock(self, postgres, jobs_to_exit):
@@ -832,8 +963,14 @@ class TestConcurrentLeaderLockAcquisition:
         """
         lock_config = replace(get_coordination_config(), leader_lock_timeout_sec=0.2)
 
-        jobs = [create_job(f'node{i}', postgres, coordination_config=lock_config, wait_on_enter=0)
-                for i in range(1, 6)]
+        jobs = [
+            create_job(
+                f'node{i}',
+                postgres,
+                coordination_config=lock_config,
+                wait_on_enter=0)
+            for i in range(1, 6)
+            ]
         jobs_to_exit.extend(jobs)
         acquired_by = []
         refused_by = []
@@ -861,8 +998,10 @@ class TestConcurrentLeaderLockAcquisition:
         for t in threads:
             t.join()
 
-        assert len(acquired_by) == 1, f'Only 1 node should acquire lock, but {len(acquired_by)} did: {acquired_by}'
-        assert len(refused_by) == 4, f'The other 4 nodes should be refused, got {refused_by}'
+        assert len(acquired_by) == 1, \
+            f'Only 1 node should acquire lock, but {len(acquired_by)} did: {acquired_by}'
+        assert len(refused_by) == 4, \
+            f'The other 4 nodes should be refused, got {refused_by}'
 
     @clean_tables('LeaderLock')
     def test_leader_lock_released_after_operation(self, postgres):
@@ -875,7 +1014,11 @@ class TestConcurrentLeaderLockAcquisition:
         lock_config = get_coordination_config()
         tables = schema.get_table_names('sync_')
 
-        job1 = create_job('node1', postgres, coordination_config=lock_config, wait_on_enter=0)
+        job1 = create_job(
+            'node1',
+            postgres,
+            coordination_config=lock_config,
+            wait_on_enter=0)
         job1.__enter__()
 
         try:
@@ -883,16 +1026,20 @@ class TestConcurrentLeaderLockAcquisition:
                 pass
 
             with postgres.connect() as conn:
-                result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["LeaderLock"]}'))
+                result = conn.execute(
+                    text(f'select count(*) from {tables["LeaderLock"]}'))
                 lock_count = result.scalar()
 
             assert lock_count == 0, 'Lock should be released after context manager exit'
 
-            with pytest.raises(RuntimeError), job1.locks.acquire_leader_lock('operation-2'):
+            with (
+                pytest.raises(RuntimeError),
+                job1.locks.acquire_leader_lock('operation-2')):
                 raise RuntimeError('operation failed')
 
             with postgres.connect() as conn:
-                result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["LeaderLock"]}'))
+                result = conn.execute(
+                    text(f'select count(*) from {tables["LeaderLock"]}'))
                 lock_count = result.scalar()
 
             assert lock_count == 0, 'Lock should be released when the operation raises'
@@ -911,8 +1058,16 @@ class TestConcurrentLeaderLockAcquisition:
         """
         lock_config = replace(get_coordination_config(), leader_lock_timeout_sec=15)
 
-        job1 = create_job('node1', postgres, coordination_config=lock_config, wait_on_enter=0)
-        job2 = create_job('node2', postgres, coordination_config=lock_config, wait_on_enter=0)
+        job1 = create_job(
+            'node1',
+            postgres,
+            coordination_config=lock_config,
+            wait_on_enter=0)
+        job2 = create_job(
+            'node2',
+            postgres,
+            coordination_config=lock_config,
+            wait_on_enter=0)
         jobs_to_exit.extend([job1, job2])
         holder_has_lock = threading.Event()
         release_holder = threading.Event()
@@ -931,7 +1086,8 @@ class TestConcurrentLeaderLockAcquisition:
             releaser.start()
 
             with job2.locks.acquire_leader_lock('waiting-operation'):
-                assert release_holder.is_set(), 'node2 acquired the lock while node1 still held it'
+                assert release_holder.is_set(), \
+                    'node2 acquired the lock while node1 still held it'
 
         finally:
             release_holder.set()
@@ -949,19 +1105,23 @@ class TestConcurrentLeaderLockAcquisition:
         lock_config = get_coordination_config()
         tables = schema.get_table_names(lock_config.appname)
 
-        job = create_job('test-node', postgres, coordination_config=lock_config, wait_on_enter=0)
+        job = create_job(
+            'test-node',
+            postgres,
+            coordination_config=lock_config,
+            wait_on_enter=0)
         job.__enter__()
 
         try:
             with job.locks.acquire_leader_lock('test-operation'):
                 with postgres.connect() as conn:
-                    result = conn.execute(text(f"""
-                        SELECT node, operation FROM {tables["LeaderLock"]} WHERE singleton = 1
-                    """))
+                    result = conn.execute(
+                        text(f'select node, operation from {tables["LeaderLock"]} where singleton = 1'))
                     lock_info = result.first()
 
                 assert lock_info is not None, 'Lock record should exist'
-                assert lock_info[0] == 'test-node', 'Node should be recorded as lock holder'
+                assert lock_info[0] == 'test-node', \
+                    'Node should be recorded as lock holder'
                 assert lock_info[1] == 'test-operation', 'Operation should be recorded'
 
         finally:
@@ -977,7 +1137,14 @@ class TestConcurrentLeaderLockAcquisition:
         """
         lock_config = replace(get_coordination_config(), leader_lock_timeout_sec=2)
 
-        nodes = [create_job(f'node{i}', postgres, coordination_config=lock_config, wait_on_enter=0) for i in range(1, 4)]
+        nodes = [
+            create_job(
+                f'node{i}',
+                postgres,
+                coordination_config=lock_config,
+                wait_on_enter=0)
+            for i in range(1, 4)
+            ]
         jobs_to_exit.extend(nodes)
 
         for node in nodes:
@@ -988,7 +1155,8 @@ class TestConcurrentLeaderLockAcquisition:
             except LockNotAcquired:
                 pass
 
-            assert acquired, f'{node.node_name} should acquire lock after previous release'
+            assert acquired, \
+                f'{node.node_name} should acquire lock after previous release'
 
 
 if __name__ == '__main__':
