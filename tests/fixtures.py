@@ -65,6 +65,11 @@ def test_config(**overrides) -> CoordinationConfig:
     return CoordinationConfig(**defaults)
 
 
+# The test_ prefix makes pytest collect this helper as a test in every
+# module that star-imports fixtures.
+test_config.__test__ = False
+
+
 def get_state_driven_config(**overrides) -> CoordinationConfig:
     """Create CoordinationConfig for state machine testing.
 
@@ -89,25 +94,39 @@ def get_structure_test_config(**overrides) -> CoordinationConfig:
 def cluster(postgres, *node_names, **config_overrides):
     """Start cluster of nodes in parallel with automatic cleanup.
 
-    Args:
-        postgres: postgres fixture
-        *node_names: Node names to create
-        **config_overrides: Optional CoordinationConfig overrides
+    Parameters
+    ----------
+    postgres : Engine
+        The postgres fixture.
+    *node_names : str
+        Node names to create, entered in this order 0.1s apart.
+    **config_overrides
+        CoordinationConfig overrides on top of test_config().
 
     Yields
-        List of Job instances (already started)
+    ------
+    list[Job]
+        Entered jobs, in node_names order. Every job is exited on leaving
+        the block.
 
-    Usage:
-        with cluster(postgres, 'node1', 'node2', 'node3', total_tokens=100) as nodes:
-            assert wait_for_cluster_running(nodes)
-            # ...test logic...
-        # All nodes auto-cleanup on exit
+    Raises
+    ------
+    RuntimeError
+        A job's __enter__ raised. The other jobs are exited first.
     """
     config = test_config(**config_overrides)
     jobs = [create_job(name, postgres, coordination_config=config, wait_on_enter=15)
             for name in node_names]
 
-    threads = [threading.Thread(target=job.__enter__) for job in jobs]
+    enter_errors = []
+
+    def enter(job):
+        try:
+            job.__enter__()
+        except Exception as exc:
+            enter_errors.append((job.node_name, exc))
+
+    threads = [threading.Thread(target=enter, args=(job,)) for job in jobs]
     for i, t in enumerate(threads):
         t.start()
         if i < len(threads) - 1:
@@ -117,24 +136,13 @@ def cluster(postgres, *node_names, **config_overrides):
         t.join()
 
     try:
+        if enter_errors:
+            raise RuntimeError(f'cluster nodes failed to enter: {enter_errors}')
         yield jobs
     finally:
         for job in jobs:
             with contextlib.suppress(Exception):
                 job.__exit__(None, None, None)
-
-
-# ============================================================================
-# CONNECTION HELPERS - Build connection strings
-# ============================================================================
-
-def get_test_connection_string() -> str:
-    """Build connection string for tests.
-
-    Returns connection string suitable for SQLAlchemy Engine or Job.
-    Used by multiprocessing workers that can't access postgres fixture.
-    """
-    return 'postgresql+psycopg://postgres:postgres@localhost:5432/jobsync'
 
 
 def find_task_ids_covering_all_tokens(config: CoordinationConfig, max_search: int = 10000) -> list[Hashable]:
@@ -186,19 +194,20 @@ def find_task_ids_covering_all_tokens(config: CoordinationConfig, max_search: in
 # ============================================================================
 
 def simulate_node_crash(node: Job, cleanup: bool = False) -> None:
-    """Simulate node crash by stopping threads without database cleanup.
+    """Stop a node's monitor threads without the shutdown cleanup.
 
-    This leaves the node row in the database with a stale heartbeat,
-    allowing the leader to detect it as dead and trigger rebalancing.
-
-    Use this instead of __exit__() when testing dead node detection.
-
-    Args:
-        node: Job instance to crash
-        cleanup: If True, also dispose resources (use when node won't be rejoined)
+    Parameters
+    ----------
+    node : Job
+        Entered job to crash. Its Node row stays, with a heartbeat that goes
+        stale, so the leader detects it as dead. The caller still exits it.
+    cleanup : bool, default False
+        Also run the node's table cleanup (its Node, Claim and Check rows go)
+        and dispose its engine, so it leaves at once and is never seen as
+        dead.
     """
     node._shutdown_event.set()
-    for monitor in node._monitors.values():
+    for monitor in list(node._monitors.values()):
         if monitor.thread and monitor.thread.is_alive():
             monitor.thread.join(timeout=5)
 
@@ -463,19 +472,21 @@ def wait_for_running_state(
 ) -> bool:
     """Wait for job to reach either RUNNING_LEADER or RUNNING_FOLLOWER state.
 
-    Args:
-        job: Job instance to check
-        timeout_sec: Maximum wait time
-        check_interval: How often to check
+    Parameters
+    ----------
+    job : Job
+        Job instance to check.
+    timeout_sec : float, default 5.0
+        Maximum wait for either state, in seconds.
+    check_interval : float, default 0.1
+        Seconds between checks.
 
     Returns
-        True if either running state reached, False if timeout
-
-    Usage:
-        assert wait_for_running_state(job, timeout_sec=10)
+    -------
+    bool
+        True once the job is in either running state, False on timeout.
     """
-    running_states = {JobState.RUNNING_LEADER, JobState.RUNNING_FOLLOWER}
-    return any(wait_for_state(job, state, timeout_sec, check_interval) for state in running_states)
+    return wait_for_condition(job.state_machine.is_running, timeout_sec, check_interval)
 
 
 def wait_for_cluster_running(
@@ -1027,7 +1038,7 @@ def insert_inst(postgres, tables: dict, task_id: str, done: bool = False) -> Non
     """
     with postgres.connect() as conn:
         conn.execute(text(f'INSERT INTO {tables["Inst"]} (item, done) VALUES (:task_id, :done)'),
-                    {'task_id': task_id, 'done': done})
+                     {'task_id': task_id, 'done': done})
         conn.commit()
 
 
@@ -1108,6 +1119,31 @@ def get_token_assignments(
             text(f'SELECT token_id, node FROM {tables["Token"]}')
         )
         return {row[0]: row[1] for row in result}
+
+
+def get_rebalance_count(postgres, tables: dict, trigger_reason: str) -> int:
+    """Number of distributions logged with trigger_reason, at any age.
+
+    Parameters
+    ----------
+    postgres : Engine
+        The postgres fixture.
+    tables : dict
+        Table name dict from get_table_names().
+    trigger_reason : str
+        Exact reason, e.g. 'initial_distribution', 'dead_nodes',
+        'membership_change'.
+
+    Returns
+    -------
+    int
+        Matching rows in the Rebalance table.
+    """
+    with postgres.connect() as conn:
+        result = conn.execute(
+            text(f'SELECT COUNT(*) FROM {tables["Rebalance"]} WHERE trigger_reason = :reason'),
+            {'reason': trigger_reason})
+        return result.scalar()
 
 
 # ============================================================================

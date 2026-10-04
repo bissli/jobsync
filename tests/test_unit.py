@@ -13,6 +13,7 @@ import threading
 import time
 
 import pytest
+from fixtures import *  # noqa: F401, F403
 from sqlalchemy import text
 
 from jobsync import schema
@@ -21,8 +22,6 @@ from jobsync.client import JobState, JobStateMachine, Task
 from jobsync.client import compute_minimal_move_distribution, matches_pattern
 from jobsync.client import task_to_token
 
-from fixtures import *  # noqa: F401, F403
-
 logger = logging.getLogger(__name__)
 
 
@@ -30,13 +29,19 @@ class TestStateTransitions:
     """Test valid and invalid state transitions."""
 
     def test_initial_state(self):
-        """Verify state machine starts in INITIALIZING state.
+        """Verify a new state machine starts in INITIALIZING.
+
+        Mutation: __init__ sets the initial state to CLUSTER_FORMING.
+        Oracle: the JobState lifecycle, whose first state is INITIALIZING.
         """
         sm = JobStateMachine()
         assert sm.state == JobState.INITIALIZING, 'Should start in INITIALIZING state'
 
     def test_valid_transition_sequence(self):
-        """Verify standard lifecycle transitions work.
+        """Verify the follower path from INITIALIZING to SHUTTING_DOWN.
+
+        Mutation: dropping a follower-path edge, e.g. ELECTING -> DISTRIBUTING.
+        Oracle: the hand-written lifecycle order of JobState.
         """
         sm = JobStateMachine()
 
@@ -56,7 +61,11 @@ class TestStateTransitions:
         assert sm.state == JobState.SHUTTING_DOWN
 
     def test_leader_lifecycle_transitions(self):
-        """Verify leader node lifecycle transitions work.
+        """Verify DISTRIBUTING -> RUNNING_LEADER -> SHUTTING_DOWN succeeds.
+
+        Mutation: dropping the DISTRIBUTING -> RUNNING_LEADER or
+            RUNNING_LEADER -> SHUTTING_DOWN edge.
+        Oracle: the hand-written leader lifecycle order.
         """
         sm = JobStateMachine()
 
@@ -71,7 +80,11 @@ class TestStateTransitions:
         assert sm.state == JobState.SHUTTING_DOWN
 
     def test_leader_follower_transitions(self):
-        """Verify transitions between RUNNING_LEADER and RUNNING_FOLLOWER.
+        """Verify a follower promotes to leader and a leader demotes again.
+
+        Mutation: dropping the RUNNING_FOLLOWER -> RUNNING_LEADER or
+            RUNNING_LEADER -> RUNNING_FOLLOWER edge.
+        Oracle: failover requires both directions between the running states.
         """
         sm = JobStateMachine()
 
@@ -87,7 +100,12 @@ class TestStateTransitions:
         assert sm.state == JobState.RUNNING_FOLLOWER
 
     def test_invalid_transition_rejected(self):
-        """Verify invalid transitions return False and don't change state.
+        """Verify INITIALIZING -> RUNNING_LEADER fails and keeps the state.
+
+        Mutation: transition_to skips the valid_next_states check, or sets
+            the state before returning False.
+        Oracle: RUNNING_LEADER is reachable only from DISTRIBUTING or
+            RUNNING_FOLLOWER.
         """
         sm = JobStateMachine()
 
@@ -96,7 +114,10 @@ class TestStateTransitions:
         assert sm.state == JobState.INITIALIZING, 'State should not change on invalid transition'
 
     def test_skip_invalid_state_rejected(self):
-        """Verify skipping required states is rejected.
+        """Verify CLUSTER_FORMING -> DISTRIBUTING, skipping ELECTING, fails.
+
+        Mutation: adding a CLUSTER_FORMING -> DISTRIBUTING edge.
+        Oracle: the lifecycle order requires ELECTING before DISTRIBUTING.
         """
         sm = JobStateMachine()
         sm.transition_to(JobState.CLUSTER_FORMING)
@@ -106,7 +127,10 @@ class TestStateTransitions:
         assert sm.state == JobState.CLUSTER_FORMING, 'State should remain unchanged'
 
     def test_backward_transition_rejected(self):
-        """Verify backward transitions are rejected.
+        """Verify ELECTING -> CLUSTER_FORMING is rejected and keeps the state.
+
+        Mutation: adding an ELECTING -> CLUSTER_FORMING (re-form) edge.
+        Oracle: the lifecycle graph has no backward edges.
         """
         sm = JobStateMachine()
         sm.transition_to(JobState.CLUSTER_FORMING)
@@ -117,7 +141,11 @@ class TestStateTransitions:
         assert sm.state == JobState.ELECTING, 'State should remain unchanged'
 
     def test_transition_to_same_state_succeeds(self):
-        """Verify transitioning to current state is allowed (idempotent).
+        """Verify a transition to the current state returns True.
+
+        Mutation: removing the same-state short circuit, so the missing
+            INITIALIZING -> INITIALIZING edge returns False.
+        Oracle: transition_to's contract that a same-state call is a no-op.
         """
         sm = JobStateMachine()
 
@@ -125,26 +153,30 @@ class TestStateTransitions:
         assert result, 'Transition to same state should succeed'
         assert sm.state == JobState.INITIALIZING
 
-    @pytest.mark.parametrize('state_path', [
-        [],
-        [JobState.CLUSTER_FORMING],
-        [JobState.CLUSTER_FORMING, JobState.ELECTING, JobState.DISTRIBUTING, JobState.RUNNING_LEADER],
+    @pytest.mark.parametrize('from_state', [
+        state for state in JobState if state != JobState.SHUTTING_DOWN
         ])
-    def test_shutting_down_from_any_state(self, state_path):
-        """Verify SHUTTING_DOWN reachable from any state for cleanup.
+    def test_shutting_down_from_any_state(self, from_state):
+        """Verify SHUTTING_DOWN is reachable from every other state.
+
+        Mutation: dropping any X -> SHUTTING_DOWN edge, e.g. from ELECTING.
+        Oracle: every JobState member, enumerated apart from the graph.
         """
         sm = JobStateMachine()
-        for state in state_path:
-            sm.transition_to(state)
+        sm.state = from_state
         assert sm.transition_to(JobState.SHUTTING_DOWN), \
-            f'Can shutdown from {sm.state} for cleanup'
+            f'Cannot shut down from {from_state.value}'
+        assert sm.state == JobState.SHUTTING_DOWN
 
 
 class TestCallbacks:
     """Test callback registration and invocation."""
 
     def test_on_enter_callback_invoked(self):
-        """Verify on_enter callback fires when entering state.
+        """Verify the on_enter callback runs once on entering its state.
+
+        Mutation: transition_to omits the on_enter call.
+        Oracle: a call-recording callback.
         """
         sm = JobStateMachine()
         callback_invoked = []
@@ -158,7 +190,11 @@ class TestCallbacks:
         assert len(callback_invoked) == 1, 'Callback should be invoked once'
 
     def test_on_exit_callback_invoked(self):
-        """Verify on_exit callback fires when exiting state.
+        """Verify on_exit runs on leaving its state, and not on entering it.
+
+        Mutation: on_exit callbacks looked up by new_state in place of the
+            source state.
+        Oracle: a call-recording callback, checked after each transition.
         """
         sm = JobStateMachine()
         callback_invoked = []
@@ -175,7 +211,10 @@ class TestCallbacks:
         assert len(callback_invoked) == 1, 'Exit callback should be invoked'
 
     def test_multiple_transitions_invoke_callbacks(self):
-        """Verify callbacks invoked for each transition.
+        """Verify enter and exit callbacks of one state each run once.
+
+        Mutation: on_enter and on_exit storing into the same callback dict.
+        Oracle: hand-counted callback runs after each transition.
         """
         sm = JobStateMachine()
         enter_count = [0]
@@ -199,7 +238,10 @@ class TestCallbacks:
         assert exit_count[0] == 1, 'Exit callback invoked on exit'
 
     def test_callback_not_invoked_on_invalid_transition(self):
-        """Verify callbacks not invoked when transition fails.
+        """Verify a rejected transition runs no on_enter callback.
+
+        Mutation: the on_enter call moved above the valid_next_states check.
+        Oracle: INITIALIZING -> RUNNING_LEADER is not an edge.
         """
         sm = JobStateMachine()
         callback_invoked = []
@@ -213,7 +255,11 @@ class TestCallbacks:
         assert len(callback_invoked) == 0, 'Callback should not be invoked for invalid transition'
 
     def test_callback_not_invoked_on_same_state_transition(self):
-        """Verify callbacks not invoked when transitioning to same state.
+        """Verify a same-state transition runs no enter or exit callback.
+
+        Mutation: a same-state call treated as a valid transition, so it runs
+            on_exit and on_enter.
+        Oracle: transition_to's contract that a same-state call is a no-op.
         """
         sm = JobStateMachine()
         enter_count = [0]
@@ -234,7 +280,11 @@ class TestCallbacks:
         assert exit_count[0] == 0, 'Exit callback should not fire for same-state transition'
 
     def test_callback_exception_handling(self):
-        """Verify exceptions in callbacks don't prevent state transition.
+        """Verify an on_enter exception propagates after the state changes.
+
+        Mutation: transition_to swallows callback exceptions, or runs on_enter
+            before assigning the new state.
+        Oracle: a callback that always raises RuntimeError.
         """
         sm = JobStateMachine()
 
@@ -248,8 +298,11 @@ class TestCallbacks:
 
         assert sm.state == JobState.CLUSTER_FORMING, 'State should change despite callback exception'
 
-    def test_enter_invoked_before_exit(self):
-        """Verify exit callback called before enter callback during transition.
+    def test_exit_invoked_before_enter(self):
+        """Verify on_exit of the source runs before on_enter of the target.
+
+        Mutation: transition_to runs on_enter before on_exit.
+        Oracle: call order recorded by the two callbacks.
         """
         sm = JobStateMachine()
         call_order = []
@@ -272,7 +325,7 @@ class TestCallbacks:
 class TestCanClaimTask:
     """Test state-dependent task claiming behavior."""
 
-    @pytest.mark.parametrize('state_path,expected', [
+    @pytest.mark.parametrize(('state_path', 'expected'), [
         ([], False),
         ([JobState.CLUSTER_FORMING], False),
         ([JobState.CLUSTER_FORMING, JobState.ELECTING], False),
@@ -282,7 +335,11 @@ class TestCanClaimTask:
         ([JobState.CLUSTER_FORMING, JobState.ELECTING, JobState.DISTRIBUTING, JobState.RUNNING_FOLLOWER, JobState.SHUTTING_DOWN], False),
         ])
     def test_can_claim_depends_on_state(self, state_path, expected):
-        """Verify task claiming allowed only in RUNNING states.
+        """Verify can_claim_task is True only in the two running states.
+
+        Mutation: can_claim_task returns is_leader() alone, or
+            `not is_initializing()` (True in SHUTTING_DOWN).
+        Oracle: hand-labeled expected value per lifecycle path.
         """
         sm = JobStateMachine()
         for state in state_path:
@@ -291,7 +348,11 @@ class TestCanClaimTask:
             f'can_claim_task should be {expected} in {sm.state}'
 
     def test_can_claim_follows_state_changes(self):
-        """Verify can_claim_task reflects current state correctly.
+        """Verify can_claim_task tracks promotion, demotion and shutdown.
+
+        Mutation: can_claim_task returns is_follower() alone, so the
+            promoted leader cannot claim.
+        Oracle: hand-labeled expected value after each transition.
         """
         sm = JobStateMachine()
 
@@ -324,7 +385,10 @@ class TestErrorStateTransitions:
         [JobState.CLUSTER_FORMING, JobState.ELECTING, JobState.DISTRIBUTING],
         ])
     def test_error_state_reachable(self, state_path):
-        """Verify transition to ERROR from pre-running states.
+        """Verify ERROR is reachable from each pre-running state.
+
+        Mutation: dropping any pre-running X -> ERROR edge, e.g. from ELECTING.
+        Oracle: the four pre-running states, listed by hand.
         """
         sm = JobStateMachine()
         for state in state_path:
@@ -334,7 +398,10 @@ class TestErrorStateTransitions:
         assert sm.state == JobState.ERROR
 
     def test_error_to_shutting_down_transition(self):
-        """Verify transition from ERROR to SHUTTING_DOWN state.
+        """Verify ERROR -> SHUTTING_DOWN succeeds.
+
+        Mutation: dropping the ERROR -> SHUTTING_DOWN edge.
+        Oracle: SHUTTING_DOWN is the only exit from ERROR.
         """
         sm = JobStateMachine()
         sm.transition_to(JobState.CLUSTER_FORMING)
@@ -349,7 +416,10 @@ class TestErrorStateTransitions:
         JobState.RUNNING_FOLLOWER,
         ])
     def test_cannot_transition_to_error_from_running(self, running_state):
-        """Verify ERROR state cannot be reached from RUNNING states.
+        """Verify a running state rejects a transition to ERROR.
+
+        Mutation: adding a RUNNING_LEADER or RUNNING_FOLLOWER -> ERROR edge.
+        Oracle: ERROR is reachable only before the node runs.
         """
         sm = JobStateMachine()
         sm.transition_to(JobState.CLUSTER_FORMING)
@@ -362,7 +432,10 @@ class TestErrorStateTransitions:
         assert sm.state == running_state
 
     def test_is_error_returns_true_in_error_state(self):
-        """Verify is_error() returns True when in ERROR state.
+        """Verify is_error() is False in INITIALIZING and True in ERROR.
+
+        Mutation: is_error() compares against a state other than ERROR.
+        Oracle: the state reached by an explicit transition to ERROR.
         """
         sm = JobStateMachine()
         assert not sm.is_error(), 'Should not be in error state initially'
@@ -372,24 +445,26 @@ class TestErrorStateTransitions:
 
         assert sm.is_error(), 'is_error() should return True in ERROR state'
 
-    def test_is_error_returns_false_in_other_states(self):
-        """Verify is_error() returns False in non-ERROR states.
+    @pytest.mark.parametrize('state', [
+        state for state in JobState if state != JobState.ERROR
+        ])
+    def test_is_error_returns_false_in_other_states(self, state):
+        """Verify is_error() is False in every state other than ERROR.
+
+        Mutation: is_error() returns `not is_initializing()`, True in the
+            running states and SHUTTING_DOWN.
+        Oracle: every JobState member except ERROR.
         """
         sm = JobStateMachine()
-
-        states_to_test = [
-            JobState.INITIALIZING,
-            JobState.CLUSTER_FORMING,
-            JobState.ELECTING,
-            JobState.DISTRIBUTING,
-        ]
-
-        for state in states_to_test:
-            sm.state = state
-            assert not sm.is_error(), f'is_error() should return False in {state.value}'
+        sm.state = state
+        assert not sm.is_error(), f'is_error() is True in {state.value}'
 
     def test_cannot_claim_tasks_in_error_state(self):
-        """Verify task claiming is blocked in ERROR state.
+        """Verify can_claim_task is False in ERROR.
+
+        Mutation: can_claim_task excludes only the initializing states and
+            SHUTTING_DOWN, so ERROR can claim.
+        Oracle: claiming is limited to the two running states.
         """
         sm = JobStateMachine()
         sm.transition_to(JobState.CLUSTER_FORMING)
@@ -397,27 +472,28 @@ class TestErrorStateTransitions:
 
         assert not sm.can_claim_task(), 'Cannot claim tasks in ERROR state'
 
-    def test_error_state_blocks_initialization_progress(self):
-        """Verify cannot transition to running states from ERROR.
+    @pytest.mark.parametrize('to_state', [
+        state for state in JobState
+        if state not in {JobState.ERROR, JobState.SHUTTING_DOWN}
+        ])
+    def test_error_state_exits_only_to_shutting_down(self, to_state):
+        """Verify ERROR rejects a transition to every state but SHUTTING_DOWN.
+
+        Mutation: adding a recovery edge out of ERROR, e.g. to CLUSTER_FORMING.
+        Oracle: every JobState member except ERROR and SHUTTING_DOWN.
         """
         sm = JobStateMachine()
-        sm.transition_to(JobState.CLUSTER_FORMING)
         sm.transition_to(JobState.ERROR)
 
-        # Try invalid transitions from ERROR
-        result = sm.transition_to(JobState.DISTRIBUTING)
-        assert not result, 'Should not transition from ERROR to DISTRIBUTING'
-
-        result = sm.transition_to(JobState.RUNNING_LEADER)
-        assert not result, 'Should not transition from ERROR to RUNNING_LEADER'
-
-        result = sm.transition_to(JobState.RUNNING_FOLLOWER)
-        assert not result, 'Should not transition from ERROR to RUNNING_FOLLOWER'
-
-        assert sm.state == JobState.ERROR, 'Should remain in ERROR state'
+        assert not sm.transition_to(to_state), \
+            f'ERROR -> {to_state.value} was accepted'
+        assert sm.state == JobState.ERROR
 
     def test_error_state_entry_callback_invoked(self):
-        """Verify on_enter callback fires when entering ERROR state.
+        """Verify the on_enter callback for ERROR runs once on entering ERROR.
+
+        Mutation: transition_to omits the on_enter call.
+        Oracle: a call-recording callback.
         """
         sm = JobStateMachine()
         callback_invoked = []
@@ -432,7 +508,10 @@ class TestErrorStateTransitions:
         assert len(callback_invoked) == 1, 'ERROR entry callback should be invoked'
 
     def test_error_state_exit_callback_invoked(self):
-        """Verify on_exit callback fires when leaving ERROR state.
+        """Verify the on_exit callback for ERROR runs once on leaving ERROR.
+
+        Mutation: transition_to omits the on_exit call.
+        Oracle: a call-recording callback.
         """
         sm = JobStateMachine()
         callback_invoked = []
@@ -450,12 +529,17 @@ class TestErrorStateTransitions:
 class TestTransitionValidation:
     """Test transition validation logic."""
 
-    def test_all_valid_transitions_defined(self):
-        """Verify all expected valid transitions are defined in transition graph.
+    def test_transition_graph_matches_expected_edges(self):
+        """Verify transition_to accepts exactly the expected edges.
+
+        Mutation: adding an edge, e.g. ERROR -> INITIALIZING, or dropping
+            one, e.g. ELECTING -> SHUTTING_DOWN.
+        Oracle: the hand-written edge set below. Every other ordered pair
+            of distinct states must be rejected.
         """
         sm = JobStateMachine()
 
-        expected_transitions = [
+        expected_transitions = {
             (JobState.INITIALIZING, JobState.CLUSTER_FORMING),
             (JobState.INITIALIZING, JobState.ERROR),
             (JobState.CLUSTER_FORMING, JobState.ELECTING),
@@ -470,12 +554,20 @@ class TestTransitionValidation:
             (JobState.RUNNING_LEADER, JobState.SHUTTING_DOWN),
             (JobState.RUNNING_FOLLOWER, JobState.SHUTTING_DOWN),
             (JobState.ERROR, JobState.SHUTTING_DOWN),
-        ]
+            (JobState.INITIALIZING, JobState.SHUTTING_DOWN),
+            (JobState.CLUSTER_FORMING, JobState.SHUTTING_DOWN),
+            (JobState.ELECTING, JobState.SHUTTING_DOWN),
+            (JobState.DISTRIBUTING, JobState.SHUTTING_DOWN),
+            }
 
-        for from_state, to_state in expected_transitions:
-            sm.state = from_state
-            result = sm.transition_to(to_state)
-            assert result, f'Transition {from_state.value} -> {to_state.value} should be valid'
+        for from_state in JobState:
+            for to_state in JobState:
+                if from_state == to_state:
+                    continue
+                sm.state = from_state
+                expected = (from_state, to_state) in expected_transitions
+                assert sm.transition_to(to_state) == expected, \
+                    f'{from_state.value} -> {to_state.value}: expected {expected}'
 
 
 class TestTransitionThreadSafety:
@@ -483,16 +575,12 @@ class TestTransitionThreadSafety:
     """
 
     def test_concurrent_identical_transitions_fire_exit_callback_once(self):
-        """Two threads racing the same transition must only fire on_exit once.
+        """Verify two threads racing one transition run on_exit only once.
 
-        Without a mutex around transition_to, both threads can read the
-        source state, both pass validation, and both fire the on_exit
-        callback before either updates self.state. The user-visible symptom
-        is duplicate on_exit invocations for a single logical transition.
-
-        With a mutex, the second thread either sees the new state (no-op
-        short circuit) or races to a different valid transition - but the
-        on_exit for the original state fires at most once.
+        Mutation: removing `with self._lock:` from transition_to, so both
+            threads pass the check before either assigns the new state.
+        Oracle: a barrier inside on_exit that holds the first thread until
+            the second arrives or the barrier times out.
         """
         sm = JobStateMachine()
         sm.transition_to(JobState.CLUSTER_FORMING)
@@ -522,6 +610,7 @@ class TestTransitionThreadSafety:
         t2.start()
         t1.join(timeout=5)
         t2.join(timeout=5)
+        assert not t1.is_alive() and not t2.is_alive(), 'transition_to hung'
 
         assert len(exit_fires) == 1, (
             f'on_exit(DISTRIBUTING) fired {len(exit_fires)} times under '
@@ -534,21 +623,11 @@ class TestTransitionThreadSafety:
 class TestEventQueue:
     """Test EventQueue thread-safe event handling."""
 
-    def test_initialization(self):
-        """Verify event queue initializes with empty state.
-        """
-        queue = EventQueue()
-        history = queue.get_history()
-        assert history == [], 'Queue should start empty'
-
-    def test_initialization_with_custom_history_size(self):
-        """Verify event queue accepts custom history size.
-        """
-        queue = EventQueue(history_size=50)
-        assert queue._history.maxlen == 50
-
     def test_publish_single_event(self):
-        """Verify single event can be published.
+        """Verify a published event keeps its type and data.
+
+        Mutation: publish storing {} in place of the data it was given.
+        Oracle: the type and data this test passes to publish.
         """
         queue = EventQueue()
         queue.publish('test_event', {'key': 'value'})
@@ -560,6 +639,9 @@ class TestEventQueue:
 
     def test_publish_multiple_events(self):
         """Verify multiple events maintain insertion order.
+
+        Mutation: publish inserting at the front of the queue.
+        Oracle: the publish order of event1, event2, event3.
         """
         queue = EventQueue()
         queue.publish('event1', {'id': 1})
@@ -574,6 +656,9 @@ class TestEventQueue:
 
     def test_publish_without_data(self):
         """Verify publish defaults to empty dict when data omitted.
+
+        Mutation: publish storing None when data is omitted.
+        Oracle: the documented default of an empty dict.
         """
         queue = EventQueue()
         queue.publish('event_no_data')
@@ -583,27 +668,21 @@ class TestEventQueue:
         assert history[0].data == {}
 
     def test_consume_all_empty_queue(self):
-        """Verify consume_all returns empty list for empty queue.
+        """Verify consume_all returns an empty list for an empty queue.
+
+        Mutation: consume_all returning None when no event is pending.
+        Oracle: a fresh queue holds no events.
         """
         queue = EventQueue()
         events = queue.consume_all()
         assert events == []
 
-    def test_consume_all_single_event(self):
-        """Verify consume_all returns and clears single event.
-        """
-        queue = EventQueue()
-        queue.publish('test_event', {'data': 'value'})
-
-        events = queue.consume_all()
-        assert len(events) == 1
-        assert events[0].type == 'test_event'
-
-        second_consume = queue.consume_all()
-        assert second_consume == [], 'Second consume should return empty list'
-
     def test_consume_all_multiple_events(self):
-        """Verify consume_all returns and clears all events.
+        """Verify consume_all returns every pending event in order, then clears.
+
+        Mutation: consume_all keeping its events after returning them, or
+            returning the live list that its own clear() then empties.
+        Oracle: the publish order of event1, event2, event3.
         """
         queue = EventQueue()
         queue.publish('event1')
@@ -611,59 +690,30 @@ class TestEventQueue:
         queue.publish('event3')
 
         events = queue.consume_all()
-        assert len(events) == 3
+        assert [event.type for event in events] == ['event1', 'event2', 'event3']
 
         second_consume = queue.consume_all()
         assert second_consume == [], 'Second consume should return empty list'
-
-    def test_consume_all_twice(self):
-        """Verify second consume_all returns empty after first consume.
-        """
-        queue = EventQueue()
-        queue.publish('event1')
-
-        first_consume = queue.consume_all()
-        assert len(first_consume) == 1
-
-        second_consume = queue.consume_all()
-        assert second_consume == [], 'Second consume should return empty'
-
-    def test_get_history_empty_queue(self):
-        """Verify get_history returns empty list for empty queue.
-        """
-        queue = EventQueue()
-        history = queue.get_history()
-        assert history == []
-
-    def test_get_history_all_events(self):
-        """Verify get_history returns all events without limit.
-        """
-        queue = EventQueue()
-        queue.publish('event1')
-        queue.publish('event2')
-        queue.publish('event3')
-
-        history = queue.get_history()
-        assert len(history) == 3
-        assert history[0].type == 'event1'
-        assert history[1].type == 'event2'
-        assert history[2].type == 'event3'
 
     def test_get_history_does_not_clear_queue(self):
-        """Verify get_history doesn't remove events from queue.
+        """Verify get_history leaves pending events for consume_all.
+
+        Mutation: get_history moving pending events into history, as
+            consume_all does.
+        Oracle: the two events this test publishes and never consumes.
         """
         queue = EventQueue()
         queue.publish('event1')
         queue.publish('event2')
 
-        first_history = queue.get_history()
-        second_history = queue.get_history()
-
-        assert len(first_history) == 2
-        assert len(second_history) == 2, 'get_history should not clear queue'
+        assert len(queue.get_history()) == 2
+        assert [event.type for event in queue.consume_all()] == ['event1', 'event2']
 
     def test_get_history_with_limit_less_than_size(self):
         """Verify get_history with limit returns most recent events.
+
+        Mutation: slicing the oldest events, all_events[:limit].
+        Oracle: the last 3 of 5 events published, in publish order.
         """
         queue = EventQueue()
         queue.publish('event1')
@@ -679,7 +729,11 @@ class TestEventQueue:
         assert history[2].type == 'event5'
 
     def test_get_history_with_limit_equal_to_size(self):
-        """Verify get_history when limit equals queue size.
+        """Verify get_history returns every event when limit equals the count.
+
+        Mutation: an off-by-one guard that returns [] unless limit is below
+            the stored count.
+        Oracle: limit at the threshold, the 2 events published.
         """
         queue = EventQueue()
         queue.publish('event1')
@@ -691,7 +745,11 @@ class TestEventQueue:
         assert history[1].type == 'event2'
 
     def test_get_history_with_limit_greater_than_size(self):
-        """Verify get_history when limit exceeds queue size returns all.
+        """Verify get_history returns every event when limit exceeds the count.
+
+        Mutation: a guard that returns [] or raises when limit exceeds the
+            stored count.
+        Oracle: the 2 events published, below the limit of 10.
         """
         queue = EventQueue()
         queue.publish('event1')
@@ -702,6 +760,10 @@ class TestEventQueue:
 
     def test_get_history_with_zero_limit(self):
         """Verify get_history with zero limit returns empty list.
+
+        Mutation: dropping the limit > 0 guard, so all_events[-0:] returns
+            every event.
+        Oracle: limit 0 asks for no events.
         """
         queue = EventQueue()
         queue.publish('event1')
@@ -710,22 +772,11 @@ class TestEventQueue:
         history = queue.get_history(limit=0)
         assert history == [], 'Zero limit should return empty list'
 
-    def test_publish_after_consume(self):
-        """Verify publishing after consume works correctly.
-        """
-        queue = EventQueue()
-        queue.publish('event1')
-        queue.consume_all()
-
-        queue.publish('event2')
-        history = queue.get_history()
-
-        assert len(history) == 2, 'History should include both consumed and unconsumed events'
-        assert history[0].type == 'event1'
-        assert history[1].type == 'event2'
-
     def test_event_has_timestamp(self):
-        """Verify published events have timestamps.
+        """Verify a published event carries its publish time.
+
+        Mutation: CoordinationEvent.__post_init__ no longer stamping time.
+        Oracle: time.time() read on either side of publish.
         """
         queue = EventQueue()
         before = time.time()
@@ -733,36 +784,23 @@ class TestEventQueue:
         after = time.time()
 
         history = queue.get_history()
-        assert history[0].timestamp is not None
         assert before <= history[0].timestamp <= after
 
-    def test_consume_all_returns_copy(self):
-        """Verify consume_all returns independent copy.
-        """
-        queue = EventQueue()
-        queue.publish('event1', {'value': 1})
-
-        events = queue.consume_all()
-        events[0].data['value'] = 999
-
-        queue.publish('event2', {'value': 2})
-        new_events = queue.consume_all()
-
-        assert new_events[0].data['value'] == 2, 'Original data should be unchanged'
-
     def test_get_history_returns_copy(self):
-        """Verify get_history returns independent copy.
+        """Verify appending to the get_history result leaves the queue as is.
+
+        Mutation: get_history returning the live pending-event list.
+        Oracle: the 2 events published before the caller appends a third.
         """
         queue = EventQueue()
         queue.publish('event1')
         queue.publish('event2')
 
         history = queue.get_history()
-        original_len = len(history)
         history.append(CoordinationEvent('fake', {}))
 
         new_history = queue.get_history()
-        assert len(new_history) == original_len, 'Modified copy should not affect queue'
+        assert len(new_history) == 2, 'Modified copy should not affect queue'
 
 
 class TestEventQueueWithHistory:
@@ -770,6 +808,10 @@ class TestEventQueueWithHistory:
 
     def test_history_persists_after_consume(self):
         """Verify consumed events are retained in history.
+
+        Mutation: consume_all dropping its history.extend, so consumed
+            events vanish from get_history.
+        Oracle: the 2 events published and then consumed.
         """
         queue = EventQueue(history_size=10)
         queue.publish('event1', {'id': 1})
@@ -783,22 +825,12 @@ class TestEventQueueWithHistory:
         assert history[0].type == 'event1'
         assert history[1].type == 'event2'
 
-    def test_history_size_limit_enforced(self):
-        """Verify ring buffer respects maximum size.
-        """
-        queue = EventQueue(history_size=5)
-
-        for i in range(10):
-            queue.publish(f'event{i}')
-            queue.consume_all()
-
-        history = queue.get_history()
-        assert len(history) == 5
-        assert history[0].type == 'event5'
-        assert history[4].type == 'event9'
-
     def test_get_history_includes_unprocessed_events(self):
         """Verify get_history returns both processed and unprocessed events.
+
+        Mutation: get_history returning only the consumed history, or only
+            the pending events.
+        Oracle: event1 consumed, then event2 and event3 left pending.
         """
         queue = EventQueue(history_size=10)
 
@@ -815,7 +847,10 @@ class TestEventQueueWithHistory:
         assert history[2].type == 'event3'
 
     def test_get_history_with_limit_after_consume(self):
-        """Verify limit parameter works with ring buffer.
+        """Verify limit applies to consumed history when nothing is pending.
+
+        Mutation: limit applied to the pending events only.
+        Oracle: the last 3 of 10 consumed events, in publish order.
         """
         queue = EventQueue(history_size=20)
 
@@ -831,6 +866,9 @@ class TestEventQueueWithHistory:
 
     def test_multiple_consume_cycles(self):
         """Verify history accumulates across multiple consume cycles.
+
+        Mutation: consume_all replacing history with its latest batch.
+        Oracle: one event published and consumed per cycle, three cycles.
         """
         queue = EventQueue(history_size=20)
 
@@ -847,28 +885,11 @@ class TestEventQueueWithHistory:
         assert len(history) == 3
         assert [e.type for e in history] == ['event1', 'event2', 'event3']
 
-    def test_history_empty_initially(self):
-        """Verify history starts empty.
-        """
-        queue = EventQueue(history_size=10)
-        history = queue.get_history()
-        assert history == []
-
-    def test_consume_all_adds_to_history_before_clearing(self):
-        """Verify consume_all stores events before clearing queue.
-        """
-        queue = EventQueue(history_size=10)
-        queue.publish('event1')
-
-        consumed = queue.consume_all()
-        history = queue.get_history()
-
-        assert len(consumed) == 1
-        assert len(history) == 1
-        assert consumed[0].type == history[0].type
-
     def test_history_overflow_drops_oldest(self):
-        """Verify ring buffer drops oldest events when full.
+        """Verify history keeps the newest history_size events once full.
+
+        Mutation: history_size ignored, or the buffer sized one off from it.
+        Oracle: history_size=3 with 4 events consumed, so event1 drops.
         """
         queue = EventQueue(history_size=3)
 
@@ -887,7 +908,10 @@ class TestEventQueueWithHistory:
         assert history[2].type == 'event4'
 
     def test_get_history_limit_with_mixed_events(self):
-        """Verify limit works correctly with both consumed and unconsumed events.
+        """Verify limit spans the consumed history and the pending events.
+
+        Mutation: limit applied to history and pending events separately.
+        Oracle: the last 4 of 5 consumed plus 3 pending events.
         """
         queue = EventQueue(history_size=20)
 
@@ -906,47 +930,63 @@ class TestEventQueueWithHistory:
         assert history[3].type == 'unconsumed2'
 
     def test_history_thread_safe(self):
-        """Verify history operations are thread-safe.
+        """Verify concurrent publish and consume_all lose or repeat no event.
+
+        Mutation: consume_all without the lock, so an event published
+            between its copy and its clear is dropped.
+        Oracle: the event names the publishers send, each seen once in the
+            consumed batches and once in history.
         """
-        import threading
-        queue = EventQueue(history_size=1000)
-        errors = []
+        publisher_cnt, per_publisher = 8, 2500
+        expected = sorted(
+            f'p{k}-{i}' for k in range(publisher_cnt) for i in range(per_publisher))
 
-        def publisher():
-            try:
-                for i in range(100):
-                    queue.publish(f'event{i}')
-            except Exception as e:
-                errors.append(e)
+        # One round lets the unlocked race slip through now and then, so
+        # three rounds make the mutant fail reliably.
+        for _ in range(3):
+            queue = EventQueue(history_size=len(expected))
+            consumed, errors = [], []
+            publishers_done = threading.Event()
 
-        def consumer():
-            try:
-                for _ in range(10):
-                    queue.consume_all()
-                    time.sleep(0.001)
-            except Exception as e:
-                errors.append(e)
+            def publisher(k):
+                for i in range(per_publisher):
+                    queue.publish(f'p{k}-{i}')
 
-        def reader():
-            try:
-                for _ in range(10):
-                    queue.get_history(limit=10)
-                    time.sleep(0.001)
-            except Exception as e:
-                errors.append(e)
+            def consumer():
+                try:
+                    while not publishers_done.is_set():
+                        consumed.extend(queue.consume_all())
+                except Exception as e:
+                    errors.append(e)
 
-        threads = [
-            threading.Thread(target=publisher),
-            threading.Thread(target=consumer),
-            threading.Thread(target=reader)
-        ]
+            def reader():
+                try:
+                    for _ in range(50):
+                        queue.get_history(limit=10)
+                        time.sleep(0.001)
+                except Exception as e:
+                    errors.append(e)
 
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+            publishers = [
+                threading.Thread(target=publisher, args=(k,))
+                for k in range(publisher_cnt)
+                ]
+            others = [
+                threading.Thread(target=consumer),
+                threading.Thread(target=reader),
+                ]
+            for t in others + publishers:
+                t.start()
+            for t in publishers:
+                t.join()
+            publishers_done.set()
+            for t in others:
+                t.join()
+            consumed.extend(queue.consume_all())
 
-        assert errors == [], f'Thread safety errors: {errors}'
+            assert errors == [], f'Thread safety errors: {errors}'
+            assert sorted(e.type for e in consumed) == expected
+            assert sorted(e.type for e in queue.get_history()) == expected
 
 
 class TestJobCoordinationStatus:
@@ -954,6 +994,10 @@ class TestJobCoordinationStatus:
 
     def test_coordination_disabled_returns_minimal_info(self):
         """Verify status when coordination is disabled.
+
+        Mutation: the disabled branch removed, so status reads the None
+            cluster and token objects.
+        Oracle: the single-key dict a standalone job reports.
         """
         job = Job('test-node', coordination_config=None)
         status = job.get_coordination_status()
@@ -961,30 +1005,75 @@ class TestJobCoordinationStatus:
         assert status == {'coordination_enabled': False}
 
     def test_coordination_enabled_returns_full_status(self, postgres):
-        """Verify status includes all coordination information.
+        """Verify a leader with one peer reports its own share of the cluster.
+
+        Mutation: my_tokens reporting total_tokens, active_nodes counting
+            only this node, token_version left at 0, or state reported as
+            the enum in place of its value.
+        Oracle: node1's token rows and version in the Token table, and the
+            two node rows this test registers.
         """
-        coord_config = get_coordination_config()
-        job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
+        coord_config = get_coordination_config(
+            total_tokens=100,
+            heartbeat_timeout_sec=60)
+        job = create_job('node1', postgres, coordination_config=coord_config)
+        tables = schema.get_table_names('sync_')
+        insert_active_node(postgres, tables, 'node2')
 
         with job:
-            job._event_queue.publish('test_event', {'test': 'data'})
-
             status = job.get_coordination_status()
 
-            assert 'coordination_enabled' in status
+            version_sql = f'select distinct version from {tables["Token"]} where node = :node'
+            with postgres.connect() as conn:
+                rows = conn.execute(text(version_sql), {'node': 'node1'})
+                versions = rows.scalars().all()
+            assignments = get_token_assignments(postgres, tables)
+            node1_tokens = [
+                token_id for token_id, node in assignments.items() if node == 'node1'
+                ]
+            assert 0 < len(node1_tokens) < 100, 'node2 should own part of the tokens'
+            assert len(versions) == 1
+
+            assert status['coordination_enabled'] is True
             assert status['node_name'] == 'node1'
-            assert status['state'] in [s.value for s in JobState]
-            assert isinstance(status['is_leader'], bool)
-            assert isinstance(status['my_tokens'], int)
-            assert isinstance(status['token_version'], int)
-            assert status['total_tokens'] == coord_config.total_tokens
-            assert isinstance(status['active_nodes'], int)
-            assert isinstance(status['recent_events'], list)
-            assert 'monitors' in status
+            assert status['state'] == 'running_leader'
+            assert status['is_leader'] is True
+            assert status['my_tokens'] == len(node1_tokens)
+            assert status['token_version'] == versions[0]
+            assert status['total_tokens'] == 100
+            assert status['active_nodes'] == 2
             assert status['last_heartbeat'] is not None
 
+    def test_follower_reports_not_leader(self, postgres):
+        """Verify a follower reports is_leader False and its follower state.
+
+        Mutation: is_leader computed as is_running(), which a leader alone
+            cannot tell apart from is_leader().
+        Oracle: node0 registered before node1 exists, so node1 follows, and
+            the 3 tokens this test assigns to node1.
+        """
+        coord_config = get_coordination_config(
+            total_tokens=10,
+            heartbeat_timeout_sec=60)
+        tables = schema.get_table_names('sync_')
+        insert_active_node(postgres, tables, 'node0')
+        for token_id in range(3):
+            insert_token(postgres, tables, token_id, 'node1')
+        job = create_job('node1', postgres, coordination_config=coord_config)
+
+        with job:
+            status = job.get_coordination_status()
+
+            assert status['state'] == 'running_follower'
+            assert status['is_leader'] is False
+            assert status['my_tokens'] == 3
+
     def test_recent_events_limited_to_20(self, postgres):
-        """Verify recent_events respects limit of 20.
+        """Verify recent_events holds the 20 newest events, oldest first.
+
+        Mutation: a limit other than 20, or the oldest events kept in place
+            of the newest.
+        Oracle: event10 to event29, the last 20 of 30 events published.
         """
         coord_config = get_coordination_config()
         job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
@@ -995,29 +1084,39 @@ class TestJobCoordinationStatus:
 
             status = job.get_coordination_status()
 
-            assert len(status['recent_events']) <= 20
+            recent_types = [event['type'] for event in status['recent_events']]
+            assert recent_types == [f'event{i}' for i in range(10, 30)]
 
     def test_recent_events_includes_metadata(self, postgres):
         """Verify event entries include type, timestamp, and data.
+
+        Mutation: an entry dropping a key, or filling data or timestamp from
+            the wrong event field.
+        Oracle: the type and data published, and time.time() read on
+            either side of publish.
         """
         coord_config = get_coordination_config()
         job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
 
         with job:
+            before = time.time()
             job._event_queue.publish('test_event', {'key': 'value'})
+            after = time.time()
 
             status = job.get_coordination_status()
 
-            assert len(status['recent_events']) >= 1
             event = status['recent_events'][-1]
-            assert 'type' in event
-            assert 'timestamp' in event
-            assert 'data' in event
+            assert set(event) == {'type', 'timestamp', 'data'}
             assert event['type'] == 'test_event'
             assert event['data'] == {'key': 'value'}
+            assert before <= event['timestamp'] <= after
 
     def test_monitors_list_present(self, postgres):
-        """Verify monitors list is included in status.
+        """Verify monitors lists the names of the running monitors.
+
+        Mutation: monitors listing the monitor objects in place of their
+            names, or returning the dict view in place of a list.
+        Oracle: every coordinated job starts a monitor named coordination.
         """
         coord_config = get_coordination_config()
         job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
@@ -1025,296 +1124,181 @@ class TestJobCoordinationStatus:
         with job:
             status = job.get_coordination_status()
 
-            assert 'monitors' in status
             assert isinstance(status['monitors'], list)
             assert 'coordination' in status['monitors']
-
-    def test_status_captures_state_transitions(self, postgres):
-        """Verify status reflects current state machine state.
-        """
-        coord_config = get_coordination_config()
-        job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
-
-        with job:
-            status = job.get_coordination_status()
-
-            assert status['state'] in {'running_leader', 'running_follower'}
-            assert status['is_leader'] == (status['state'] == 'running_leader')
-
-    def test_status_includes_token_metrics(self, postgres):
-        """Verify status includes token ownership metrics.
-        """
-        coord_config = get_coordination_config()
-        job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
-
-        with job:
-            status = job.get_coordination_status()
-
-            assert 'my_tokens' in status
-            assert 'token_version' in status
-            assert 'total_tokens' in status
-            assert status['my_tokens'] <= status['total_tokens']
-            assert status['token_version'] >= 0
-
-    def test_status_includes_cluster_info(self, postgres):
-        """Verify status includes cluster membership info.
-        """
-        coord_config = get_coordination_config()
-        job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
-
-        with job:
-            status = job.get_coordination_status()
-
-            assert 'active_nodes' in status
-            assert status['active_nodes'] >= 1
-
-    def test_status_available_without_coordination(self):
-        """Verify status method works even when coordination disabled.
-        """
-        job = Job('standalone-node', coordination_config=None)
-
-        status = job.get_coordination_status()
-
-        assert status is not None
-        assert isinstance(status, dict)
-        assert not status['coordination_enabled']
 
 
 class TestTaskTokenMapping:
     """Test task-to-token mapping and related methods."""
 
-    @pytest.mark.parametrize('hash_function', ['md5', 'sha256', 'double_sha256'])
-    def test_consistent_hashing(self, postgres, hash_function):
-        """Verify task IDs consistently map to same token and handle various ID types."""
-        coord_config = get_coordination_config(hash_function=hash_function)
-        job = create_job('node1', postgres, coordination_config=coord_config)
+    @pytest.mark.parametrize(('hash_function', 'int_token', 'str_token'), [
+        ('md5', 5808, 8672),
+        ('sha256', 6717, 3581),
+        ('double_sha256', 107, 9302),
+        ])
+    def test_consistent_hashing(self, hash_function, int_token, str_token):
+        """Verify every process maps a task ID to the same pinned token.
 
-        task_id = 'test-task-123'
-        token1 = job.task_to_token(task_id)
-        token2 = job.task_to_token(task_id)
-
-        assert token1 == token2, f'Same task should map to same token ({hash_function})'
-        assert 0 <= token1 < coord_config.total_tokens, f'Token should be in valid range ({hash_function})'
-
-        tokens = {job.task_to_token(f'task-{i}') for i in range(20)}
-        assert len(tokens) >= 15, f'Most tasks should map to different tokens ({hash_function})'
-
-        numeric_token = job.task_to_token(123)
-        string_token = job.task_to_token('abc-def-ghi')
-        assert 0 <= numeric_token < 10000, f'Numeric ID should produce valid token ({hash_function})'
-        assert 0 <= string_token < 10000, f'String ID should produce valid token ({hash_function})'
+        Mutation: Python's per-process hash() in place of the digest, a
+            changed digest slice or byte order, or ints hashed apart from
+            their str() form.
+        Oracle: tokens worked out with hashlib by hand for 10000 tokens.
+        """
+        assert task_to_token(123, 10000, hash_function) == int_token
+        assert task_to_token('123', 10000, hash_function) == int_token
+        assert task_to_token('test-task-123', 10000, hash_function) == str_token
 
     @pytest.mark.parametrize('hash_function', ['md5', 'sha256', 'double_sha256'])
     def test_task_to_token_matches_module_function(self, postgres, hash_function):
-        """Verify Job.task_to_token() matches module-level function.
+        """Verify Job.task_to_token() uses the configured tokens and hash.
+
+        Mutation: Job.task_to_token dropping the configured hash_function
+            or total_tokens for the module defaults.
+        Oracle: the module-level task_to_token with the configured values.
         """
         coord_config = CoordinationConfig(total_tokens=100, hash_function=hash_function)
         job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
 
-        for task_id in [0, 1, 99, 'string-task', 'another-task']:
-            job_result = job.task_to_token(task_id)
-            module_result = task_to_token(task_id, job.tokens.total_tokens, hash_function)
-            assert job_result == module_result, f'Results should match for task {task_id} ({hash_function})'
+        with job:
+            for task_id in [0, 1, 99, 'string-task', 'another-task']:
+                job_result = job.task_to_token(task_id)
+                module_result = task_to_token(task_id, 100, hash_function)
+                assert job_result == module_result, \
+                    f'Results should match for task {task_id} ({hash_function})'
 
     @pytest.mark.parametrize('hash_function', ['md5', 'sha256', 'double_sha256'])
-    def test_distribution_quality_with_clustered_ids(self, postgres, hash_function):
-        """Verify even distribution with clustered sequential task IDs.
-        """
-        coord_config = CoordinationConfig(total_tokens=10000, hash_function=hash_function)
-        job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
+    def test_distribution_quality_with_clustered_ids(self, hash_function):
+        """Verify sequential task IDs spread over distinct tokens.
 
+        Mutation: the token taken from too few digest bits, such as one
+            byte, so tokens collide.
+        Oracle: 1000 IDs into 10000 tokens leave about 952 distinct by the
+            birthday bound.
+        """
         task_ids = range(20001, 21001)
-        tokens = [job.task_to_token(tid) for tid in task_ids]
+        tokens = [task_to_token(tid, 10000, hash_function) for tid in task_ids]
 
         unique_tokens = len(set(tokens))
-        assert unique_tokens >= 950, f'1000 clustered tasks should use ≥950 unique tokens, got {unique_tokens} ({hash_function})'
+        assert unique_tokens >= 950, \
+            f'1000 clustered tasks should use >=950 unique tokens, got {unique_tokens} ({hash_function})'
 
     @pytest.mark.parametrize('hash_function', ['md5', 'sha256', 'double_sha256'])
-    def test_distribution_quality_across_token_space(self, postgres, hash_function):
+    def test_distribution_quality_across_token_space(self, hash_function):
         """Verify tokens spread evenly across the full token range.
-        """
-        coord_config = CoordinationConfig(total_tokens=10000, hash_function=hash_function)
-        job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
 
+        Mutation: the token taken from too few digest bits, or from the
+            task ID itself, so tokens crowd the low buckets.
+        Oracle: 1000 tasks over 10 equal buckets, 100 expected in each.
+        """
         task_ids = range(0, 5000, 5)
-        tokens = [job.task_to_token(tid) for tid in task_ids]
+        tokens = [task_to_token(tid, 10000, hash_function) for tid in task_ids]
 
         buckets = [0] * 10
-        bucket_size = coord_config.total_tokens // 10
         for token in tokens:
-            bucket_idx = min(token // bucket_size, 9)
-            buckets[bucket_idx] += 1
+            buckets[token // 1000] += 1
 
-        max_bucket = max(buckets)
-        min_bucket = min(buckets)
-        imbalance = max_bucket - min_bucket
+        imbalance = max(buckets) - min(buckets)
         expected_per_bucket = len(tokens) / 10
 
         logger.debug(f'Token bucket distribution ({hash_function}): {buckets}')
-        logger.debug(f'Expected per bucket: {expected_per_bucket:.1f}, imbalance: {imbalance}')
 
         assert imbalance <= expected_per_bucket * 0.40, \
             f'Bucket imbalance {imbalance} exceeds 40% of expected {expected_per_bucket:.1f} ({hash_function})'
 
     @pytest.mark.parametrize('hash_function', ['md5', 'sha256', 'double_sha256'])
-    def test_distribution_quality_simulated_cluster(self, postgres, hash_function):
-        """Verify even task distribution across simulated 8-node cluster.
+    def test_distribution_with_string_ids(self, hash_function):
+        """Verify string task IDs spread over distinct, evenly filled tokens.
+
+        Mutation: the token taken from too few digest bits, so string IDs
+            collide and crowd the low buckets.
+        Oracle: 500 IDs into 10000 tokens leave about 488 distinct by the
+            birthday bound, and 100 expected in each of 5 buckets.
         """
-        coord_config = CoordinationConfig(total_tokens=10000, hash_function=hash_function)
-        job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
-
-        task_ids = range(20001, 21001)
-        node_task_counts = {}
-
-        for task_id in task_ids:
-            token_id = job.task_to_token(task_id)
-            node_id = token_id % 8
-            node_task_counts[node_id] = node_task_counts.get(node_id, 0) + 1
-
-        counts = list(node_task_counts.values())
-        expected_per_node = 1000 / 8
-        max_count = max(counts)
-        min_count = min(counts)
-        imbalance = max_count - min_count
-
-        logger.debug(f'Tasks per node ({hash_function}): {sorted(counts)}')
-        logger.debug(f'Expected per node: {expected_per_node:.1f}, imbalance: {imbalance}')
-
-        assert imbalance <= expected_per_node * 0.35, \
-            f'Node imbalance {imbalance} exceeds 35% of expected {expected_per_node:.1f} ({hash_function})'
-
-    @pytest.mark.parametrize('hash_function', ['md5', 'sha256', 'double_sha256'])
-    def test_distribution_with_string_ids(self, postgres, hash_function):
-        """Verify distribution quality with string task IDs.
-        """
-        coord_config = CoordinationConfig(total_tokens=10000, hash_function=hash_function)
-        job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
-
         task_ids = [f'task-{i:05d}' for i in range(500)]
-        tokens = [job.task_to_token(tid) for tid in task_ids]
+        tokens = [task_to_token(tid, 10000, hash_function) for tid in task_ids]
 
         unique_tokens = len(set(tokens))
-        assert unique_tokens >= 450, f'500 string tasks should use ≥450 unique tokens, got {unique_tokens} ({hash_function})'
+        assert unique_tokens >= 450, \
+            f'500 string tasks should use >=450 unique tokens, got {unique_tokens} ({hash_function})'
 
         buckets = [0] * 5
-        bucket_size = coord_config.total_tokens // 5
         for token in tokens:
-            bucket_idx = min(token // bucket_size, 4)
-            buckets[bucket_idx] += 1
+            buckets[token // 2000] += 1
 
-        max_bucket = max(buckets)
-        min_bucket = min(buckets)
-        imbalance = max_bucket - min_bucket
+        imbalance = max(buckets) - min(buckets)
         expected_per_bucket = len(tokens) / 5
 
         assert imbalance <= expected_per_bucket * 0.3, \
             f'String ID bucket imbalance {imbalance} exceeds 30% threshold ({hash_function})'
 
     @pytest.mark.parametrize('hash_function', ['md5', 'sha256', 'double_sha256'])
-    def test_edge_case_task_ids(self, postgres, hash_function):
-        """Verify edge case task IDs are handled correctly.
+    @pytest.mark.parametrize('task_id', [
+        0,
+        -1,
+        -999999,
+        999999999,
+        '',
+        'unicode-\u03c4\u03b5\u03c3\u03c4-\u65e5\u672c',
+        None,
+        (1, 2, 3),
+        ])
+    def test_edge_case_task_ids(self, task_id, hash_function):
+        """Verify unusual hashable task IDs map to a token in range.
+
+        Mutation: the ID encoded as ASCII, or hashed without str(), so a
+            non-ASCII, None, or tuple ID raises.
+        Oracle: the valid token range 0 to 9999.
         """
-        coord_config = CoordinationConfig(total_tokens=10000, hash_function=hash_function)
-        job = create_job('node1', postgres, coordination_config=coord_config, wait_on_enter=0)
-
-        edge_cases = [
-            (0, 'zero'),
-            (-1, 'negative'),
-            (-999999, 'large negative'),
-            (999999999, 'large positive'),
-            ('', 'empty string'),
-            ('unicode-τεστ-日本', 'unicode'),
-            (None, 'none'),
-            ((1, 2, 3), 'tuple'),
-        ]
-
-        results = {}
-        for task_id, label in edge_cases:
-            token = job.task_to_token(task_id)
-            results[label] = token
-            assert 0 <= token < 10000, f'{label} task_id={task_id} produced invalid token {token} ({hash_function})'
-
-        logger.debug(f'Edge case tokens ({hash_function}): {results}')
-
-        repeated_tokens = []
-        for task_id, label in edge_cases:
-            token1 = job.task_to_token(task_id)
-            token2 = job.task_to_token(task_id)
-            assert token1 == token2, f'{label} should hash consistently ({hash_function})'
-            repeated_tokens.append(token1)
-
-        assert repeated_tokens == list(results.values()), f'Repeated hashing should be deterministic ({hash_function})'
+        token = task_to_token(task_id, 10000, hash_function)
+        assert 0 <= token < 10000
 
 
 class TestCoordinationConfig:
     """Test CoordinationConfig validation and consistency."""
 
-    def test_default_values_sensible(self):
-        """Verify default CoordinationConfig values are sensible.
+    def test_task_mapping_defaults_pinned(self):
+        """Verify the defaults that fix the task-to-token mapping stay put.
+
+        Mutation: total_tokens or hash_function default changed, so nodes
+            on two releases map one task to different tokens.
+        Oracle: 10000 tokens and double_sha256, the defaults README.md and
+            docs/USAGE_GUIDE.md document.
         """
         config = CoordinationConfig()
-
         assert config.total_tokens == 10000
-        assert config.heartbeat_interval_sec == 5
-        assert config.heartbeat_timeout_sec > config.heartbeat_interval_sec
+        assert config.hash_function == 'double_sha256'
 
     def test_heartbeat_timeout_greater_than_interval(self):
-        """Verify default heartbeat timeout exceeds interval.
+        """Verify the default timeout outlasts one missed heartbeat.
+
+        Mutation: heartbeat_timeout_sec default cut to 2 intervals or less.
+        Oracle: heartbeat_interval_sec, the default send interval.
         """
         config = CoordinationConfig()
-        assert config.heartbeat_timeout_sec > config.heartbeat_interval_sec, \
-            'Timeout should exceed interval to allow for network delays'
+        assert config.heartbeat_timeout_sec > 2 * config.heartbeat_interval_sec, \
+            'Timeout should outlast one missed heartbeat'
 
     def test_token_refresh_steady_exceeds_initial(self):
-        """Verify steady refresh interval equals or exceeds initial.
+        """Verify the steady refresh interval is no shorter than the initial.
+
+        Mutation: the two refresh interval defaults swapped.
+        Oracle: token_refresh_initial_interval_sec, the default used while
+            a node starts.
         """
         config = CoordinationConfig()
         assert config.token_refresh_steady_interval_sec >= config.token_refresh_initial_interval_sec, \
             'Steady interval should be >= initial interval'
 
     def test_stale_lock_ages_are_reasonable(self):
-        """Verify stale lock ages are much greater than operation timeouts.
+        """Verify a leader lock counts as stale only long after its timeout.
+
+        Mutation: stale_leader_lock_age_sec default cut below ten lock
+            timeouts.
+        Oracle: leader_lock_timeout_sec, the default acquisition window.
         """
         config = CoordinationConfig()
         assert config.stale_leader_lock_age_sec >= 10 * config.leader_lock_timeout_sec, \
             'Stale lock age should be much greater than lock timeout'
-
-    def test_invalid_coordination_config_values(self):
-        """Verify CoordinationConfig handles invalid values appropriately.
-
-        Tests edge cases and invalid configurations that could cause runtime issues:
-        - Zero or negative token counts
-        - Zero or negative timing intervals
-        - Heartbeat timeout less than interval
-        - Invalid database parameters
-        """
-        # Test zero tokens - should work but is edge case
-        config = CoordinationConfig(total_tokens=1)
-        assert config.total_tokens == 1, 'Single token should be valid'
-
-        # Test very small intervals - should work but may cause issues
-        config = CoordinationConfig(heartbeat_interval_sec=0.1)
-        assert config.heartbeat_interval_sec == 0.1, 'Small interval should be accepted'
-
-        # Test that timeout must be greater than interval for reliable detection
-        # This is a logical constraint that should be documented
-        config = CoordinationConfig(
-            heartbeat_interval_sec=5,
-            heartbeat_timeout_sec=6
-        )
-        assert config.heartbeat_timeout_sec > config.heartbeat_interval_sec, \
-            'Timeout should exceed interval'
-
-        # Test very large values - should work
-        config = CoordinationConfig(total_tokens=1000000)
-        assert config.total_tokens == 1000000, 'Large token count should be valid'
-
-        # Test edge case: timeout equals interval (not recommended but technically valid)
-        config = CoordinationConfig(
-            heartbeat_interval_sec=5,
-            heartbeat_timeout_sec=5
-        )
-        # This should work but may cause false positives in production
 
 
 class TestTaskComparison:
@@ -1322,16 +1306,22 @@ class TestTaskComparison:
 
     def test_task_equality(self):
         """Verify tasks with same ID are equal.
+
+        Mutation: __eq__ comparing names, or object identity.
+        Oracle: two tasks sharing id 1 under different names.
         """
         task1 = create_task(1, 'task_a')
         task2 = create_task(1, 'task_b')
         assert task1 == task2
 
     def test_task_inequality(self):
-        """Verify tasks with different IDs are not equal.
+        """Verify tasks with different IDs are unequal even with one name.
+
+        Mutation: __eq__ comparing names in place of IDs.
+        Oracle: ids 1 and 2 under the same name.
         """
-        task1 = create_task(1, 'task_a')
-        task2 = create_task(2, 'task_b')
+        task1 = create_task(1, 'same_name')
+        task2 = create_task(2, 'same_name')
         assert task1 != task2
 
     @pytest.mark.parametrize(('id1', 'id2', 'expected_lt', 'expected_gt'), [
@@ -1340,42 +1330,35 @@ class TestTaskComparison:
         (1, 1, False, False),
     ])
     def test_task_comparisons(self, id1, id2, expected_lt, expected_gt):
-        """Verify task comparison operators work correctly.
+        """Verify < and > order tasks by ID and are both false on a tie.
+
+        Mutation: __gt__ written as not __lt__, or either operator flipped.
+        Oracle: integer order of the ids, with a tie at 1, 1.
         """
         task1 = create_task(id1, f'task_{id1}')
         task2 = create_task(id2, f'task_{id2}')
 
         assert (task1 < task2) == expected_lt
         assert (task1 > task2) == expected_gt
-        assert (task2 < task1) == (not expected_lt and id1 != id2)
-        assert (task2 > task1) == (not expected_gt and id1 != id2)
 
     def test_task_sorting(self):
-        """Verify tasks can be sorted correctly.
+        """Verify sorted() orders tasks by ascending ID.
+
+        Mutation: __lt__ comparing in reverse or by name.
+        Oracle: ids 1, 2, 3 given out of order with names in reverse order.
         """
-        task3 = create_task(3, 'task_c')
-        task1 = create_task(1, 'task_a')
+        task3 = create_task(3, 'task_a')
+        task1 = create_task(1, 'task_c')
         task2 = create_task(2, 'task_b')
         tasks = [task3, task1, task2]
         sorted_tasks = sorted(tasks)
-        assert sorted_tasks == [task1, task2, task3]
-
-    def test_task_sorting_with_duplicates(self):
-        """Verify sorting handles duplicate IDs correctly.
-        """
-        task1a = create_task(1, 'task_1a')
-        task1b = create_task(1, 'task_1b')
-        task2 = create_task(2, 'task_2')
-        task3 = create_task(3, 'task_3')
-        tasks = [task3, task1a, task2, task1b]
-        sorted_tasks = sorted(tasks)
-        assert sorted_tasks[0].id == 1
-        assert sorted_tasks[1].id == 1
-        assert sorted_tasks[2].id == 2
-        assert sorted_tasks[3].id == 3
+        assert [task.id for task in sorted_tasks] == [1, 2, 3]
 
     def test_task_string_ids(self):
-        """Verify tasks work with string IDs.
+        """Verify tasks with string IDs compare in string order.
+
+        Mutation: __lt__ or __gt__ casting IDs to int, which raises on 'a'.
+        Oracle: 'a' sorts before 'b'.
         """
         task_a = create_task('a', 'task_a')
         task_b = create_task('b', 'task_b')
@@ -1384,7 +1367,10 @@ class TestTaskComparison:
         assert not task_a > task_b
 
     def test_task_mixed_comparison(self):
-        """Verify all comparison operators work together consistently.
+        """Verify <= and >= agree with < and == on unequal and equal IDs.
+
+        Mutation: @total_ordering removed, so <= and >= raise TypeError.
+        Oracle: ids 1 and 2, and two tasks sharing id 1.
         """
         task1 = create_task(1, 'task_1')
         task2 = create_task(2, 'task_2')
@@ -1413,7 +1399,12 @@ class TestBasicDistribution:
         (100, ['node1', 'node2', 'node3'], {'node1': 34, 'node2': 33, 'node3': 33}),
     ])
     def test_basic_token_distribution(self, total_tokens, nodes, expected_counts):
-        """Verify token distribution across varying numbers of nodes.
+        """Verify a fresh distribution splits tokens evenly, remainder first.
+
+        Mutation: the remainder token given to the last sorted node, or the
+            empty-nodes guard dropped (division by zero).
+        Oracle: hand-computed 100 // n per node with 100 % n extra to the
+            first nodes; from an empty start every assigned token is a move.
         """
         assignments, moved = compute_minimal_move_distribution(
             total_tokens=total_tokens,
@@ -1423,27 +1414,23 @@ class TestBasicDistribution:
             pattern_matcher=exact_match
         )
 
-        if not nodes:
-            assert assignments == {}
-            assert moved == 0
-        else:
-            assert len(assignments) == total_tokens
-            actual_counts = {}
-            for node in assignments.values():
-                actual_counts[node] = actual_counts.get(node, 0) + 1
-            assert actual_counts == expected_counts
-            assert moved == total_tokens
+        counts = {}
+        for node in assignments.values():
+            counts[node] = counts.get(node, 0) + 1
+        assert counts == expected_counts
+        assert moved == sum(expected_counts.values())
 
     def test_remainder_tokens_distributed_alphabetically(self):
-        """Verify remainder tokens are assigned to first N nodes alphabetically.
+        """Verify remainder tokens go to the first nodes by sorted name.
 
-        This is Bug #2: The algorithm should give remainder tokens to the first
-        nodes alphabetically, but was comparing against global average instead
-        of per-node targets.
+        Mutation: sorted() dropped from the receivers loop, so the remainder
+            follows the caller's node order (node-e, node-a, node-d).
+        Oracle: hand-computed 103 = 5 * 20 + 3, extra token to node-a,
+            node-b and node-c.
         """
-        nodes = ['node-c', 'node-a', 'node-b', 'node-d', 'node-e']
+        nodes = ['node-e', 'node-a', 'node-d', 'node-b', 'node-c']
 
-        assignments, moved = compute_minimal_move_distribution(
+        assignments, _ = compute_minimal_move_distribution(
             total_tokens=103,
             active_nodes=nodes,
             current_assignments={},
@@ -1454,21 +1441,21 @@ class TestBasicDistribution:
         counts = dict.fromkeys(nodes, 0)
         for node in assignments.values():
             counts[node] += 1
-
-        sorted_nodes = sorted(nodes)
-        logger.debug(f'Token counts by node: {[(n, counts[n]) for n in sorted_nodes]}')
-
-        assert counts['node-a'] == 21, 'First alphabetically should get 21 tokens (20 + 1 remainder)'
-        assert counts['node-b'] == 21, 'Second alphabetically should get 21 tokens (20 + 1 remainder)'
-        assert counts['node-c'] == 21, 'Third alphabetically should get 21 tokens (20 + 1 remainder)'
-        assert counts['node-d'] == 20, 'Fourth alphabetically should get 20 tokens (base amount)'
-        assert counts['node-e'] == 20, 'Fifth alphabetically should get 20 tokens (base amount)'
+        assert counts == {
+            'node-a': 21,
+            'node-b': 21,
+            'node-c': 21,
+            'node-d': 20,
+            'node-e': 20,
+            }
 
     def test_remainder_distribution_minimizes_moves_from_correct_nodes(self):
-        """Verify algorithm correctly identifies which nodes are over-target when rebalancing.
+        """Verify a rebalance takes only the token over a node's own target.
 
-        This test specifically checks that the algorithm uses per-node targets (not global
-        average) when deciding whether to move tokens away from current owner.
+        Mutation: is_over_target compares with >= instead of >, so node-c,
+            already at its target, gives up its highest token.
+        Oracle: hand-computed targets 56/55/55 for 166 tokens over three
+            nodes; only node-b holds one token too many.
         """
         current = {
             **dict.fromkeys(range(55), 'node-a'),
@@ -1490,11 +1477,8 @@ class TestBasicDistribution:
         for node in assignments.values():
             counts[node] += 1
 
-        assert counts['node-a'] == 56, 'node-a should have 56 tokens (55 + 1 remainder)'
-        assert counts['node-b'] == 55, 'node-b should have 55 tokens (base amount)'
-        assert counts['node-c'] == 55, 'node-c should have 55 tokens (base amount)'
-
-        assert moved == 1, 'Should move exactly 1 token from node-b (over-target) to node-a (under-target)'
+        assert counts == {'node-a': 56, 'node-b': 55, 'node-c': 55}
+        assert moved == 1
 
 
 class TestMinimalMovement:
@@ -1502,6 +1486,9 @@ class TestMinimalMovement:
 
     def test_no_movement_when_balanced(self):
         """Verify no tokens move when distribution is already balanced.
+
+        Mutation: count_assignment_changes compares with == instead of !=.
+        Oracle: an interleaved 50/50 split already meets both targets.
         """
         current = {i: f'node{i % 2 + 1}' for i in range(100)}
 
@@ -1513,12 +1500,15 @@ class TestMinimalMovement:
             pattern_matcher=exact_match
         )
 
-        assert len(assignments) == 100
         assert moved == 0
         assert assignments == current
 
     def test_minimal_movement_on_rebalance(self):
-        """Verify minimal tokens move when slight rebalance needed.
+        """Verify a 60/40 split rebalances by moving exactly 10 tokens.
+
+        Mutation: the over-target check dropped from the keep condition, so
+            node2's own tokens use up node2's deficit and nothing moves.
+        Oracle: hand-computed 50/50 targets; node1 holds 10 over.
         """
         current = dict.fromkeys(range(60), 'node1')
         current.update(dict.fromkeys(range(60, 100), 'node2'))
@@ -1539,44 +1529,38 @@ class TestMinimalMovement:
         assert node1_count == 50
         assert node2_count == 50
 
-    def test_movement_preserves_existing_where_possible(self):
-        """Verify existing assignments preserved when within target range.
-        """
-        current = {0: 'node1', 1: 'node1', 2: 'node2', 3: 'node2'}
-
-        assignments, moved = compute_minimal_move_distribution(
-            total_tokens=4,
-            active_nodes=['node1', 'node2'],
-            current_assignments=current,
-            locked_tokens={},
-            pattern_matcher=exact_match
-        )
-
-        assert moved == 0
-        assert assignments == current
-
 
 class TestLockedTokenBehavior:
     """Test locked token constraint handling and strict enforcement."""
 
     def test_locked_token_assigned_to_pattern(self):
-        """Verify locked tokens assigned to matching node.
+        """Verify locked tokens go to their matching node.
+
+        Mutation: locks ignored in categorize_tokens_by_locks, so token 0
+            goes to the first receiver, node1.
+        Oracle: the lock map; it pins token 0 to node2, against the default
+            ascending fill that starts with node1.
         """
-        assignments, moved = compute_minimal_move_distribution(
+        assignments, _ = compute_minimal_move_distribution(
             total_tokens=10,
             active_nodes=['node1', 'node2'],
             current_assignments={},
-            locked_tokens={0: 'node1', 1: 'node2'},
+            locked_tokens={0: 'node2', 1: 'node1'},
             pattern_matcher=exact_match
         )
 
-        assert assignments[0] == 'node1'
-        assert assignments[1] == 'node2'
+        assert assignments[0] == 'node2'
+        assert assignments[1] == 'node1'
 
     def test_locked_tokens_exclude_from_balancing(self):
-        """Verify locked tokens don't participate in balancing.
+        """Verify unlocked tokens balance among themselves, apart from locks.
+
+        Mutation: total_distributable counts locked tokens too, so node1
+            gets 5 unlocked tokens and node2 gets 2.
+        Oracle: hand-computed 7 unlocked tokens over two nodes: 4 and 3,
+            extra to node1.
         """
-        assignments, moved = compute_minimal_move_distribution(
+        assignments, _ = compute_minimal_move_distribution(
             total_tokens=10,
             active_nodes=['node1', 'node2'],
             current_assignments={},
@@ -1589,16 +1573,21 @@ class TestLockedTokenBehavior:
         assert assignments[2] == 'node1'
 
         unlocked_node1 = sum(1 for tid, node in assignments.items()
-                            if node == 'node1' and tid >= 3)
+                             if node == 'node1' and tid >= 3)
         unlocked_node2 = sum(1 for tid, node in assignments.items()
-                            if node == 'node2' and tid >= 3)
+                             if node == 'node2' and tid >= 3)
 
-        assert abs(unlocked_node1 - unlocked_node2) <= 1
+        assert unlocked_node1 == 4
+        assert unlocked_node2 == 3
 
     def test_wildcard_pattern_matching(self):
         """Verify wildcard patterns match multiple nodes.
+
+        Mutation: locks ignored, so token 0 goes to manager1, the first
+            receiver by sorted name.
+        Oracle: only worker1 and worker2 start with 'worker'.
         """
-        assignments, moved = compute_minimal_move_distribution(
+        assignments, _ = compute_minimal_move_distribution(
             total_tokens=10,
             active_nodes=['worker1', 'worker2', 'manager1'],
             current_assignments={},
@@ -1610,12 +1599,12 @@ class TestLockedTokenBehavior:
         assert assignments[5] == 'manager1'
 
     def test_no_matching_node_for_locked_token(self):
-        """Verify locked token is NEVER assigned when no nodes match pattern.
+        """Verify a token locked to an inactive node is never assigned.
 
-        Critical contract: Locked tokens must NEVER be assigned to nodes outside
-        their pattern constraints, even if unlocked tokens need balancing.
+        Mutation: blocked tokens added to the distributable list.
+        Oracle: node3 is not active, so token 0 has no eligible node.
         """
-        assignments, moved = compute_minimal_move_distribution(
+        assignments, _ = compute_minimal_move_distribution(
             total_tokens=10,
             active_nodes=['node1', 'node2'],
             current_assignments={},
@@ -1631,6 +1620,11 @@ class TestLockedTokenBehavior:
 
     def test_locked_tokens_never_assigned_to_non_matching_nodes(self):
         """Verify locked tokens are NEVER assigned outside their patterns.
+
+        Mutation: find_nodes_matching_patterns returns every active node
+            when no pattern matches.
+        Oracle: node names against the prefixes; no node starts with
+            'admin'.
         """
         assignments, _ = compute_minimal_move_distribution(
             total_tokens=20,
@@ -1648,10 +1642,15 @@ class TestLockedTokenBehavior:
             'Token 15 locked to admin% should not be assigned (no admin nodes active)'
 
     def test_locked_token_stays_with_matching_current_owner(self):
-        """Verify locked token preserves current owner when pattern matches.
+        """Verify a locked token keeps a matching current owner.
+
+        Mutation: assign_locked_token skips the current-owner check, so
+            token 5 goes to worker1, the least-loaded worker by name.
+        Oracle: current owners from the input; 17 unlocked tokens start
+            unowned, so they are the only moves.
         """
         current = {
-            5: 'worker1',
+            5: 'worker2',
             10: 'worker2',
             15: 'manager1'
         }
@@ -1664,13 +1663,18 @@ class TestLockedTokenBehavior:
             pattern_matcher=wildcard_match
         )
 
-        assert assignments[5] == 'worker1', 'Token 5 should stay with worker1 (matches pattern)'
-        assert assignments[10] == 'worker2', 'Token 10 should stay with worker2 (matches pattern)'
-        assert assignments[15] == 'manager1', 'Token 15 should stay with manager1 (matches pattern)'
-        assert moved >= 0, 'Should count moves for unlocked tokens only'
+        assert assignments[5] == 'worker2'
+        assert assignments[10] == 'worker2'
+        assert assignments[15] == 'manager1'
+        assert moved == 17
 
     def test_locked_token_moves_when_current_owner_not_matching(self):
-        """Verify locked token moves when current owner doesn't match pattern.
+        """Verify locked token moves when its current owner fails the pattern.
+
+        Mutation: assign_locked_token keeps any current owner without the
+            eligibility check, so token 5 stays on manager1.
+        Oracle: 18 unlocked tokens start unowned and both locked tokens
+            change owner, so all 20 tokens move.
         """
         current = {
             5: 'manager1',
@@ -1689,10 +1693,14 @@ class TestLockedTokenBehavior:
             'Token 5 must move from manager1 to worker node (pattern mismatch)'
         assert assignments[10] == 'manager1', \
             'Token 10 must move from worker1 to manager1 (pattern mismatch)'
-        assert moved >= 2, 'Should count at least 2 moves for reassigned locked tokens'
+        assert moved == 20
 
     def test_multiple_fallback_patterns_first_succeeds(self):
         """Verify first matching fallback pattern is used.
+
+        Mutation: matches from every pattern pooled, so the least-loaded
+            tie-break by name picks backup-beta.
+        Oracle: only primary-alpha matches the first pattern.
         """
         assignments, _ = compute_minimal_move_distribution(
             total_tokens=20,
@@ -1707,6 +1715,10 @@ class TestLockedTokenBehavior:
 
     def test_multiple_fallback_patterns_skip_to_second(self):
         """Verify fallback to second pattern when first fails.
+
+        Mutation: fallback patterns tried in reverse order, so token 5 goes
+            to tertiary-gamma.
+        Oracle: no node starts with 'primary-'; two start with 'backup-'.
         """
         assignments, _ = compute_minimal_move_distribution(
             total_tokens=20,
@@ -1721,6 +1733,10 @@ class TestLockedTokenBehavior:
 
     def test_multiple_fallback_patterns_skip_to_third(self):
         """Verify fallback to third pattern when first and second fail.
+
+        Mutation: only the first pattern of a list tried, so token 5 is
+            blocked and missing from the result.
+        Oracle: only tertiary-alpha matches any of the patterns.
         """
         assignments, _ = compute_minimal_move_distribution(
             total_tokens=20,
@@ -1730,11 +1746,14 @@ class TestLockedTokenBehavior:
             pattern_matcher=wildcard_match
         )
 
-        assert assignments[5] == 'tertiary-alpha', \
+        assert assignments.get(5) == 'tertiary-alpha', \
             'Should use third pattern (tertiary-%) when first two patterns fail'
 
     def test_all_fallback_patterns_fail_no_assignment(self):
         """Verify no assignment when all fallback patterns fail.
+
+        Mutation: blocked tokens added to the distributable list.
+        Oracle: no node name starts with any of the three prefixes.
         """
         assignments, _ = compute_minimal_move_distribution(
             total_tokens=20,
@@ -1749,6 +1768,11 @@ class TestLockedTokenBehavior:
 
     def test_locked_tokens_dont_affect_unlocked_balance(self):
         """Verify locked tokens don't affect unlocked token distribution.
+
+        Mutation: total_distributable counts locked tokens too, so the
+            unlocked split becomes 34/33/30.
+        Oracle: hand-computed 97 unlocked tokens over three nodes:
+            33/32/32, extra to node1.
         """
         assignments, _ = compute_minimal_move_distribution(
             total_tokens=100,
@@ -1764,14 +1788,17 @@ class TestLockedTokenBehavior:
 
         unlocked_counts = {'node1': 0, 'node2': 0, 'node3': 0}
         for token_id in range(3, 100):
-            if token_id in assignments:
-                unlocked_counts[assignments[token_id]] += 1
+            unlocked_counts[assignments[token_id]] += 1
 
-        assert max(unlocked_counts.values()) - min(unlocked_counts.values()) <= 1, \
-            'Unlocked tokens should be evenly distributed despite locked token imbalance'
+        assert unlocked_counts == {'node1': 33, 'node2': 32, 'node3': 32}
 
     def test_mixed_locked_and_unlocked_distribution(self):
         """Verify correct distribution with mix of locked and unlocked tokens.
+
+        Mutation: locks ignored, so tokens 0-9 fill manager1 first and
+            token 5 lands there.
+        Oracle: node names against the prefixes; no node starts with
+            'admin'.
         """
         assignments, _ = compute_minimal_move_distribution(
             total_tokens=30,
@@ -1797,7 +1824,12 @@ class TestLockedTokenBehavior:
             'All unlocked tokens should be assigned'
 
     def test_locked_token_reassignment_minimizes_moves(self):
-        """Verify locked token reassignment prefers least-loaded matching node.
+        """Verify a displaced locked token goes to the least-loaded match.
+
+        Mutation: assign_locked_token picks the first eligible node by name,
+            ignoring load, so token 10 joins token 5 on worker1.
+        Oracle: worker1 keeps token 5; worker2 and worker3 hold none, and
+            worker2 sorts first.
         """
         current = {
             5: 'worker1',
@@ -1814,11 +1846,15 @@ class TestLockedTokenBehavior:
 
         assert assignments[5] == 'worker1', \
             'Token 5 should stay with worker1 (current owner matches pattern)'
-        assert assignments[10] in {'worker1', 'worker2', 'worker3'}, \
-            'Token 10 must move to worker node (manager1 no longer active)'
+        assert assignments[10] == 'worker2'
 
     def test_multiple_tokens_locked_to_same_pattern_balanced(self):
-        """Verify multiple tokens locked to same pattern are balanced across matching nodes.
+        """Verify tokens locked to one pattern spread across its nodes.
+
+        Mutation: assign_locked_token picks the first eligible node by name,
+            ignoring load, so all ten land on worker1.
+        Oracle: hand-computed round robin of 10 tokens over three workers:
+            4/3/3, extra to worker1.
         """
         assignments, _ = compute_minimal_move_distribution(
             total_tokens=50,
@@ -1830,13 +1866,9 @@ class TestLockedTokenBehavior:
 
         locked_counts = {'worker1': 0, 'worker2': 0, 'worker3': 0}
         for tid in range(10, 20):
-            assert tid in assignments, f'Locked token {tid} should be assigned'
-            assert assignments[tid] in {'worker1', 'worker2', 'worker3'}, \
-                f'Locked token {tid} must be assigned to worker node'
             locked_counts[assignments[tid]] += 1
 
-        assert max(locked_counts.values()) - min(locked_counts.values()) <= 2, \
-            'Locked tokens should be reasonably balanced across matching nodes'
+        assert locked_counts == {'worker1': 4, 'worker2': 3, 'worker3': 3}
 
 
 class TestNodeFailure:
@@ -1844,6 +1876,11 @@ class TestNodeFailure:
 
     def test_dead_node_tokens_redistributed(self):
         """Verify tokens from dead nodes get redistributed.
+
+        Mutation: receiver deficit computed from the target alone, ignoring
+            current load, so node1 takes the dead node's tokens.
+        Oracle: node1 already holds its 50-token target, so all 50 dead-node
+            tokens go to node2.
         """
         current = dict.fromkeys(range(50), 'dead_node')
         current.update(dict.fromkeys(range(50, 100), 'node1'))
@@ -1866,9 +1903,18 @@ class TestNodeFailure:
         assert node2_count == 50
 
     def test_new_node_gets_fair_share(self):
-        """Verify new node receives balanced token allocation.
+        """Verify a new node takes its share and each giver stops at target.
+
+        Mutation: the giver's load decrement dropped, so node2 gives all 33
+            tokens and node1 keeps 50; or the remainder token given to the
+            last sorted node, so node3 ends with 34.
+        Oracle: hand-computed targets 34/33/33; reverse order takes node2's
+            top 17 ids (83-99), then node1's top 16 ids (34-49).
         """
-        current = {i: f'node{i % 2 + 1}' for i in range(100)}
+        current = {
+            **dict.fromkeys(range(50), 'node1'),
+            **dict.fromkeys(range(50, 100), 'node2'),
+            }
 
         assignments, moved = compute_minimal_move_distribution(
             total_tokens=100,
@@ -1878,37 +1924,28 @@ class TestNodeFailure:
             pattern_matcher=exact_match
         )
 
-        assert len(assignments) == 100
         counts = {}
         for node in assignments.values():
             counts[node] = counts.get(node, 0) + 1
 
-        assert set(counts.values()) == {33, 34}
-        assert counts['node3'] == 33
-        assert moved >= 33
+        assert counts == {'node1': 34, 'node2': 33, 'node3': 33}
+        assert moved == 33
+        node3_tokens = {tid for tid, node in assignments.items() if node == 'node3'}
+        assert node3_tokens == set(range(34, 50)) | set(range(83, 100))
 
 
 class TestDistributionEdgeCases:
     """Test edge cases and boundary conditions for token distribution."""
 
-    def test_empty_nodes_list(self):
-        """Verify distribution handles empty nodes gracefully.
-        """
-        assignments, moves = compute_minimal_move_distribution(
-            total_tokens=100,
-            active_nodes=[],
-            current_assignments={},
-            locked_tokens={},
-            pattern_matcher=exact_match
-        )
-
-        assert len(assignments) == 0, 'No assignments with no nodes'
-        assert moves == 0, 'No moves with no nodes'
-
     def test_more_nodes_than_tokens(self):
         """Verify handling when nodes outnumber tokens.
+
+        Mutation: the remainder tokens given to the last sorted nodes, so
+            node6 gets one and node1 none.
+        Oracle: hand-computed 5 // 6 = 0 per node, with the 5 remainder
+            tokens to node1..node5.
         """
-        assignments, moved = compute_minimal_move_distribution(
+        assignments, _ = compute_minimal_move_distribution(
             total_tokens=5,
             active_nodes=['node1', 'node2', 'node3', 'node4', 'node5', 'node6'],
             current_assignments={},
@@ -1916,15 +1953,17 @@ class TestDistributionEdgeCases:
             pattern_matcher=exact_match
         )
 
-        assert len(assignments) == 5
-        assert len(set(assignments.values())) == 5
+        assert sorted(assignments.values()) == ['node1', 'node2', 'node3', 'node4', 'node5']
 
     def test_all_tokens_locked(self):
         """Verify behavior when all tokens are locked.
+
+        Mutation: locks ignored, so tokens 0-4 all go to node1.
+        Oracle: the lock map; odd tokens are locked to node2.
         """
         locked = {i: f'node{i % 2 + 1}' for i in range(10)}
 
-        assignments, moved = compute_minimal_move_distribution(
+        assignments, _ = compute_minimal_move_distribution(
             total_tokens=10,
             active_nodes=['node1', 'node2'],
             current_assignments={},
@@ -1932,16 +1971,17 @@ class TestDistributionEdgeCases:
             pattern_matcher=exact_match
         )
 
-        assert len(assignments) == 10
-        for tid, pattern in locked.items():
-            assert assignments[tid] == pattern
+        assert assignments == locked
 
     def test_all_tokens_locked_to_nonexistent_pattern(self):
-        """Verify behavior when all tokens locked to pattern with no matching nodes.
+        """Verify no token is assigned when every lock matches no node.
+
+        Mutation: blocked tokens added to the distributable list.
+        Oracle: no node name starts with 'missing-'.
         """
         locked = {i: ['missing-%'] for i in range(10)}
 
-        assignments, moves = compute_minimal_move_distribution(
+        assignments, _ = compute_minimal_move_distribution(
             total_tokens=10,
             active_nodes=['node1', 'node2'],
             current_assignments={},
@@ -1952,23 +1992,29 @@ class TestDistributionEdgeCases:
         assert len(assignments) == 0, 'No assignments when locks match no nodes'
 
     def test_single_token(self):
-        """Verify single token distribution.
+        """Verify a single token goes to the first node by sorted name.
+
+        Mutation: the remainder token given to the last sorted node.
+        Oracle: hand-computed 1 // 2 = 0 per node, remainder to node1.
         """
-        assignments, moved = compute_minimal_move_distribution(
+        assignments, _ = compute_minimal_move_distribution(
             total_tokens=1,
-            active_nodes=['node1', 'node2'],
+            active_nodes=['node2', 'node1'],
             current_assignments={},
             locked_tokens={},
             pattern_matcher=exact_match
         )
 
-        assert len(assignments) == 1
-        assert assignments[0] in {'node1', 'node2'}
+        assert assignments == {0: 'node1'}
 
     def test_deterministic_sorting(self):
-        """Verify distribution is deterministic with same inputs.
+        """Verify the result does not depend on the order of active_nodes.
+
+        Mutation: sorted() dropped from the receivers loop, so the remainder
+            token follows the caller's node order.
+        Oracle: the same call with the node list in sorted order.
         """
-        result1 = compute_minimal_move_distribution(
+        sorted_result = compute_minimal_move_distribution(
             total_tokens=100,
             active_nodes=['node1', 'node2', 'node3'],
             current_assignments={},
@@ -1976,25 +2022,29 @@ class TestDistributionEdgeCases:
             pattern_matcher=exact_match
         )
 
-        result2 = compute_minimal_move_distribution(
+        shuffled_result = compute_minimal_move_distribution(
             total_tokens=100,
-            active_nodes=['node1', 'node2', 'node3'],
+            active_nodes=['node3', 'node1', 'node2'],
             current_assignments={},
             locked_tokens={},
             pattern_matcher=exact_match
         )
 
-        assert result1[0] == result2[0]
-        assert result1[1] == result2[1]
+        assert shuffled_result == sorted_result
 
     def test_fallback_patterns_used(self):
         """Verify fallback patterns are tried when primary pattern fails.
+
+        Mutation: matches from every pattern pooled, so the least-loaded
+            tie-break by name picks node1.
+        Oracle: no node starts with 'missing-'; only special-alpha matches
+            the second pattern.
         """
         locked = {
             5: ['missing-%', 'special-%', 'node%']
         }
 
-        assignments, moves = compute_minimal_move_distribution(
+        assignments, _ = compute_minimal_move_distribution(
             total_tokens=10,
             active_nodes=['node1', 'special-alpha'],
             current_assignments={},
@@ -2004,14 +2054,17 @@ class TestDistributionEdgeCases:
 
         assert assignments[5] == 'special-alpha', 'Should use second fallback pattern when first fails'
 
-    def test_reverse_iteration_minimizes_moves(self):
-        """Verify reverse iteration helps minimize token movement.
+    def test_reverse_iteration_moves_only_excess(self):
+        """Verify a rebalance moves only node1's excess, highest ids first.
 
-        This test documents the behavior of the reverse iteration optimization.
+        Mutation: forward iteration on rebalance, so node1's lowest ids
+            (0-35) move instead.
+        Oracle: hand-computed targets 34/33/33; node1 gives 36 tokens,
+            69-67 to node2 (deficit 3) and 66-34 to node3.
         """
         current = {i: 'node1' if i < 70 else 'node2' for i in range(100)}
 
-        assignments_reverse, moves_reverse = compute_minimal_move_distribution(
+        assignments, moved = compute_minimal_move_distribution(
             total_tokens=100,
             active_nodes=['node1', 'node2', 'node3'],
             current_assignments=current,
@@ -2019,20 +2072,29 @@ class TestDistributionEdgeCases:
             pattern_matcher=exact_match
         )
 
-        assert moves_reverse >= 30, 'Should require rebalancing moves'
-        assert moves_reverse <= 45, 'Reverse iteration should minimize moves'
+        expected = {
+            **dict.fromkeys(range(34), 'node1'),
+            **dict.fromkeys(range(34, 67), 'node3'),
+            **dict.fromkeys(range(67, 100), 'node2'),
+            }
+        assert assignments == expected
+        assert moved == 36
 
 
 class TestTokenIterationOrder:
     """Test token iteration order logic during rebalancing."""
 
     def test_reverse_iteration_when_rebalancing_imbalance(self):
-        """Verify tokens processed in reverse order when nodes are over/under quota.
+        """Verify an over-quota node gives up its highest token ids.
+
+        Mutation: forward iteration on rebalance, so tokens 0-29 move.
+        Oracle: node1 holds 80 against a 50 target, so its top 30 ids
+            (50-79) move.
         """
         current = dict.fromkeys(range(80), 'node1')
         current.update(dict.fromkeys(range(80, 100), 'node2'))
 
-        assignments, moved = compute_minimal_move_distribution(
+        assignments, _ = compute_minimal_move_distribution(
             total_tokens=100,
             active_nodes=['node1', 'node2'],
             current_assignments=current,
@@ -2040,96 +2102,63 @@ class TestTokenIterationOrder:
             pattern_matcher=exact_match
         )
 
-        moved_tokens = [tid for tid, node in assignments.items()
-                       if current.get(tid) != node]
+        moved_tokens = {tid for tid, node in assignments.items()
+                        if current.get(tid) != node}
 
-        assert len(moved_tokens) == 30
-        assert all(tid >= 50 for tid in moved_tokens)
-
-    def test_normal_iteration_when_balanced(self):
-        """Verify normal iteration order when already balanced.
-        """
-        current = {i: f'node{i % 2 + 1}' for i in range(100)}
-
-        assignments, moved = compute_minimal_move_distribution(
-            total_tokens=100,
-            active_nodes=['node1', 'node2'],
-            current_assignments=current,
-            locked_tokens={},
-            pattern_matcher=exact_match
-        )
-
-        assert moved == 0
+        assert moved_tokens == set(range(50, 80))
 
     def test_normal_iteration_when_adding_nodes(self):
-        """Verify normal iteration order when no nodes are over quota.
-        """
-        current = {}
+        """Verify ascending fill order when no node is over quota.
 
-        assignments, moved = compute_minimal_move_distribution(
+        Mutation: reverse iteration always, so tokens 99-50 fill node1.
+        Oracle: hand-computed 50/50 targets filled in ascending token order,
+            node1 first.
+        """
+        assignments, _ = compute_minimal_move_distribution(
             total_tokens=100,
             active_nodes=['node1', 'node2'],
-            current_assignments=current,
+            current_assignments={},
             locked_tokens={},
             pattern_matcher=exact_match
         )
 
-        assigned_tids = sorted(assignments.keys())
-        assert assigned_tids == list(range(100))
-
-    def test_reverse_iteration_moves_high_tokens_from_overloaded_node(self):
-        """Verify reverse iteration moves high tokens from over-quota nodes.
-        """
-        current = dict.fromkeys(range(70), 'node1')
-        current.update(dict.fromkeys(range(70, 100), 'node2'))
-
-        assignments, moved = compute_minimal_move_distribution(
-            total_tokens=100,
-            active_nodes=['node1', 'node2'],
-            current_assignments=current,
-            locked_tokens={},
-            pattern_matcher=exact_match
-        )
-
-        moved_tokens = [tid for tid in range(70)
-                       if assignments.get(tid) != 'node1']
-
-        assert len(moved_tokens) == 20
-        assert all(tid >= 50 for tid in moved_tokens)
+        expected = {
+            **dict.fromkeys(range(50), 'node1'),
+            **dict.fromkeys(range(50, 100), 'node2'),
+            }
+        assert assignments == expected
 
 
 class TestLargeScale:
     """Test algorithm performance and correctness at scale."""
 
     def test_large_token_count(self):
-        """Verify distribution works with large token counts.
+        """Verify 10,000 tokens split exactly evenly over ten nodes.
+
+        Mutation: receiver deficit one short (target - load - 1), so the
+            leftover ten tokens fall back to node0.
+        Oracle: hand-computed 10,000 / 10 = 1,000 per node.
         """
-        assignments, moved = compute_minimal_move_distribution(
+        nodes = [f'node{i}' for i in range(10)]
+
+        assignments, _ = compute_minimal_move_distribution(
             total_tokens=10000,
-            active_nodes=[f'node{i}' for i in range(10)],
+            active_nodes=nodes,
             current_assignments={},
             locked_tokens={},
             pattern_matcher=exact_match
         )
 
-        assert len(assignments) == 10000
-        counts = {}
+        counts = dict.fromkeys(nodes, 0)
         for node in assignments.values():
-            counts[node] = counts.get(node, 0) + 1
-
-        for count in counts.values():
-            assert 950 <= count <= 1050
+            counts[node] += 1
+        assert counts == dict.fromkeys(nodes, 1000)
 
     def test_large_scale_remainder_distribution(self):
         """Verify remainder tokens distributed alphabetically at scale.
 
-        With 10,000 tokens and 9 nodes:
-        - target_per_node = 1,111
-        - remainder = 1
-        - First node alphabetically should get 1,112
-        - Other 8 nodes should get 1,111
-
-        This is the exact scenario from Bug #2 report.
+        Mutation: the remainder token given to the last sorted node.
+        Oracle: hand-computed 10,000 = 9 * 1,111 + 1, extra to node0.
         """
         nodes = [f'node{i}' for i in range(9)]
 
@@ -2145,44 +2174,41 @@ class TestLargeScale:
         for node in assignments.values():
             counts[node] += 1
 
-        sorted_nodes = sorted(nodes)
-        logger.debug(f'Token distribution: {[(n, counts[n]) for n in sorted_nodes]}')
-
-        assert counts[sorted_nodes[0]] == 1112, \
-            f'First node ({sorted_nodes[0]}) should get 1,112 tokens (1,111 + 1 remainder), got {counts[sorted_nodes[0]]}'
-
-        for i in range(1, 9):
-            assert counts[sorted_nodes[i]] == 1111, \
-                f'Node {sorted_nodes[i]} should get 1,111 tokens (base amount), got {counts[sorted_nodes[i]]}'
-
-        assert sum(counts.values()) == 10000, 'Total should be 10,000 tokens'
+        assert counts == {'node0': 1112, **dict.fromkeys(nodes[1:], 1111)}
         assert moved == 10000, 'All tokens assigned from empty initial state'
 
     def test_many_nodes(self):
-        """Verify distribution with many nodes.
+        """Verify 1,000 tokens split exactly evenly over 100 nodes.
+
+        Mutation: receiver deficit one short (target - load - 1), so the
+            leftover 100 tokens fall back to node0.
+        Oracle: hand-computed 1,000 / 100 = 10 per node.
         """
-        assignments, moved = compute_minimal_move_distribution(
+        nodes = [f'node{i}' for i in range(100)]
+
+        assignments, _ = compute_minimal_move_distribution(
             total_tokens=1000,
-            active_nodes=[f'node{i}' for i in range(100)],
+            active_nodes=nodes,
             current_assignments={},
             locked_tokens={},
             pattern_matcher=exact_match
         )
 
-        assert len(assignments) == 1000
-        counts = {}
+        counts = dict.fromkeys(nodes, 0)
         for node in assignments.values():
-            counts[node] = counts.get(node, 0) + 1
-
-        for count in counts.values():
-            assert 8 <= count <= 12
+            counts[node] += 1
+        assert counts == dict.fromkeys(nodes, 10)
 
     def test_locked_tokens_at_scale(self):
         """Verify locked token handling at scale.
+
+        Mutation: locks ignored, so token 10 (locked to node1) falls in
+            node0's ascending block.
+        Oracle: the lock map, token i to node{i % 3}.
         """
         locked = {i: f'node{i % 3}' for i in range(0, 1000, 10)}
 
-        assignments, moved = compute_minimal_move_distribution(
+        assignments, _ = compute_minimal_move_distribution(
             total_tokens=1000,
             active_nodes=['node0', 'node1', 'node2'],
             current_assignments={},
@@ -2213,15 +2239,17 @@ class TestPatternMatching:
         ('node1', 'node_', True),
         ('node2', 'node_', True),
         ('node10', 'node_', False),
+        ('nodeX1', 'node.1', False),
     ])
-    def test_pattern_matching(self, postgres, node_name, pattern, should_match):
-        """Test SQL LIKE pattern matching with various patterns."""
+    def test_pattern_matching(self, node_name, pattern, should_match):
+        """Verify matches_pattern follows SQL LIKE semantics.
 
-        result = matches_pattern(node_name, pattern)
-        if should_match:
-            assert result, f'{node_name} should match pattern {pattern}'
-        else:
-            assert not result, f'{node_name} should not match pattern {pattern}'
+        Mutation: '_' translated to '.*', the '$' anchor dropped, or '.' left
+            unescaped so it matches any character.
+        Oracle: hand-applied LIKE rules: '%' any run, '_' one character,
+            every other character literal.
+        """
+        assert matches_pattern(node_name, pattern) is should_match
 
 
 class TestTaskHashableValidation:
@@ -2229,6 +2257,10 @@ class TestTaskHashableValidation:
 
     def test_hashable_ids_accepted(self):
         """Verify hashable types are accepted as task IDs.
+
+        Mutation: the hashable check narrowed to int and str, rejecting
+            tuple and frozenset ids.
+        Oracle: each value is hashable by Python's own rules.
         """
         valid_ids = [
             42,
@@ -2248,12 +2280,19 @@ class TestTaskHashableValidation:
         ])
     def test_non_hashable_rejected(self, task_id):
         """Verify non-hashable IDs are rejected.
+
+        Mutation: the hashable assert dropped from Task.__init__.
+        Oracle: list, dict and set are unhashable by Python's own rules.
         """
         with pytest.raises(AssertionError, match='must be hashable'):
             Task(task_id, 'test-task')
 
     def test_none_is_hashable(self):
         """Verify None is accepted as a hashable ID.
+
+        Mutation: the check written as a truthiness test on id, which
+            rejects None.
+        Oracle: hash(None) is defined in Python.
         """
         task = Task(None, 'none-task')
         assert task.id is None, 'None should be accepted (it is hashable)'
@@ -2262,7 +2301,7 @@ class TestTaskHashableValidation:
 class TestSetClaimEdgeCases:
     """Test TaskManager.set_claim edge cases."""
 
-    @pytest.fixture()
+    @pytest.fixture
     def claim_job(self, postgres):
         """Create and enter a job, yield it, then exit.
         """
@@ -2278,6 +2317,10 @@ class TestSetClaimEdgeCases:
     @pytest.mark.parametrize('empty_input', [[], ()])
     def test_empty_iterable_handled(self, postgres, claim_job, empty_input):
         """Verify empty iterables are handled without errors.
+
+        Mutation: an empty iterable routed to the single-item branch, which
+            claims the string '[]' or '()'.
+        Oracle: zero items in, zero rows out.
         """
         tables = schema.get_table_names()
         claim_job.set_claim(empty_input)
@@ -2291,13 +2334,16 @@ class TestSetClaimEdgeCases:
     @clean_tables('Claim')
     def test_large_iterable(self, postgres, claim_job):
         """Verify large iterables are processed correctly.
+
+        Mutation: conn.commit() dropped from set_claim, so no row persists.
+        Oracle: 1,000 distinct ids in.
         """
         tables = schema.get_table_names()
         claim_job.set_claim(list(range(1000)))
 
         with postgres.connect() as conn:
             result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Claim"]} WHERE node = :node'),
-                                 {'node': 'node1'})
+                                  {'node': 'node1'})
             count = result.scalar()
 
         assert count == 1000, 'All 1000 items should be claimed'
@@ -2305,6 +2351,10 @@ class TestSetClaimEdgeCases:
     @clean_tables('Claim')
     def test_mixed_type_iterable(self, postgres, claim_job):
         """Verify iterables with mixed types are handled correctly.
+
+        Mutation: repr() in place of str() for the stored task_id, so
+            strings gain quotes.
+        Oracle: hand-written str() of each input.
         """
         tables = schema.get_table_names()
         claim_job.set_claim([1, 'string-item', (2, 3), 42, 'another-string'])
@@ -2321,7 +2371,11 @@ class TestSetClaimEdgeCases:
 
     @clean_tables('Claim')
     def test_single_string_not_treated_as_iterable(self, postgres, claim_job):
-        """Verify single string is treated as single item, not iterable of characters.
+        """Verify a single string is one claim, not one per character.
+
+        Mutation: the str exclusion dropped from the iterable check, so
+            each character becomes a claim.
+        Oracle: one string in, one row holding that string out.
         """
         tables = schema.get_table_names()
         claim_job.set_claim('single-string-item')
@@ -2332,12 +2386,15 @@ class TestSetClaimEdgeCases:
             """), {'node': 'node1'})
             items = [row[0] for row in result]
 
-        assert len(items) == 1, 'Should create single claim'
-        assert items[0] == 'single-string-item', 'Should claim entire string, not characters'
+        assert items == ['single-string-item']
 
     @clean_tables('Claim')
     def test_single_integer_handled(self, postgres, claim_job):
         """Verify single integer is claimed correctly.
+
+        Mutation: the single-item branch removed, so set_claim iterates the
+            int and raises TypeError.
+        Oracle: str(42) == '42'.
         """
         tables = schema.get_table_names()
         claim_job.set_claim(42)
@@ -2348,19 +2405,22 @@ class TestSetClaimEdgeCases:
             """), {'node': 'node1'})
             items = [row[0] for row in result]
 
-        assert len(items) == 1, 'Should create single claim'
-        assert items[0] == '42', 'Integer should be converted to string'
+        assert items == ['42']
 
     @clean_tables('Claim')
     def test_generator_expression_handled(self, postgres, claim_job):
         """Verify generator expressions are handled correctly.
+
+        Mutation: the iterable check narrowed to list, tuple and set, so the
+            generator is claimed as one str(generator) row.
+        Oracle: the generator yields 10 distinct values.
         """
         tables = schema.get_table_names()
         claim_job.set_claim(i * 2 for i in range(10))
 
         with postgres.connect() as conn:
             result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Claim"]} WHERE node = :node'),
-                                 {'node': 'node1'})
+                                  {'node': 'node1'})
             count = result.scalar()
 
         assert count == 10, 'All 10 generated items should be claimed'
@@ -2368,13 +2428,17 @@ class TestSetClaimEdgeCases:
     @clean_tables('Claim')
     def test_range_object_handled(self, postgres, claim_job):
         """Verify range objects are handled correctly.
+
+        Mutation: the iterable check narrowed to list, tuple and set, so the
+            range is claimed as one 'range(0, 20)' row.
+        Oracle: range(20) holds 20 distinct values.
         """
         tables = schema.get_table_names()
         claim_job.set_claim(range(20))
 
         with postgres.connect() as conn:
             result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Claim"]} WHERE node = :node'),
-                                 {'node': 'node1'})
+                                  {'node': 'node1'})
             count = result.scalar()
 
         assert count == 20, 'All 20 range items should be claimed'
@@ -2382,33 +2446,39 @@ class TestSetClaimEdgeCases:
     @clean_tables('Claim')
     def test_duplicate_items_in_iterable(self, postgres, claim_job):
         """Verify duplicate items in iterable are handled by ON CONFLICT.
+
+        Mutation: ON CONFLICT DO NOTHING dropped from the insert, so the
+            second '2' raises an IntegrityError.
+        Oracle: four distinct ids among the seven inputs.
         """
         tables = schema.get_table_names()
         claim_job.set_claim([1, 2, 3, 2, 1, 4, 3])
 
         with postgres.connect() as conn:
             result = conn.execute(text(f"""
-                SELECT task_id FROM {tables["Claim"]} WHERE node = :node ORDER BY task_id
+                SELECT task_id FROM {tables["Claim"]} WHERE node = :node
             """), {'node': 'node1'})
             items = [row[0] for row in result]
 
-        assert set(items) == {'1', '2', '3', '4'}, 'Should have unique items (duplicates handled by ON CONFLICT)'
+        assert sorted(items) == ['1', '2', '3', '4']
 
     @clean_tables('Claim')
     def test_none_in_iterable(self, postgres, claim_job):
-        """Verify None values in iterable are handled.
+        """Verify None values in iterable are claimed as the string 'None'.
+
+        Mutation: None filtered out of the iterable before insert.
+        Oracle: str(None) == 'None'; four distinct ids among the inputs.
         """
         tables = schema.get_table_names()
         claim_job.set_claim([1, None, 2, None, 3])
 
         with postgres.connect() as conn:
             result = conn.execute(text(f"""
-                SELECT task_id FROM {tables["Claim"]} WHERE node = :node ORDER BY task_id
+                SELECT task_id FROM {tables["Claim"]} WHERE node = :node
             """), {'node': 'node1'})
             items = [row[0] for row in result]
 
-        assert 'None' in items, 'None should be converted to string "None"'
-        assert len(items) == 4, 'Should have 4 unique items (1, 2, 3, None)'
+        assert sorted(items) == ['1', '2', '3', 'None']
 
 
 if __name__ == '__main__':

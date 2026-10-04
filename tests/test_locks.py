@@ -8,9 +8,7 @@ USE THIS FILE FOR:
 - Leader lock coordination
 """
 import datetime
-import logging
 import threading
-import time
 from dataclasses import replace
 
 import pytest
@@ -20,20 +18,40 @@ from sqlalchemy import text
 from jobsync import schema
 from jobsync.client import CoordinationConfig, JobState, LockNotAcquired
 
-logger = logging.getLogger(__name__)
+
+@pytest.fixture
+def jobs_to_exit():
+    """Jobs a test builds without entering, exited at teardown.
+
+    Yields
+    ------
+    list[Job]
+        The test appends each job it never enters. Teardown calls __exit__ on
+        each, which stops the coordination thread the Job constructor starts.
+    """
+    jobs = []
+    yield jobs
+    for job in jobs:
+        job.__exit__(None, None, None)
 
 
 class TestLockRegistration:
     """Test lock registration API."""
 
     @clean_tables('Lock')
-    def test_register_single_lock(self, postgres):
-        """Test registering a single lock."""
+    def test_register_single_lock(self, postgres, jobs_to_exit):
+        """Verify register_lock stores a str pattern as a one-item list.
+
+        Mutation: _build_lock_row stops wrapping a str pattern in a list, or
+            records a creator other than the job's node name.
+        Oracle: the literal arguments passed to register_lock.
+        """
 
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
 
         job = create_job('node1', postgres, coordination_config=config, wait_on_enter=0)
+        jobs_to_exit.append(job)
 
         task_id = 'task-123'
         job.register_lock(task_id, 'special-%', 'test reason')
@@ -53,12 +71,18 @@ class TestLockRegistration:
         assert lock[0]['created_by'] == 'node1'
 
     @clean_tables('Lock')
-    def test_register_bulk_locks(self, postgres):
-        """Test registering multiple locks in bulk."""
+    def test_register_bulk_locks(self, postgres, jobs_to_exit):
+        """Verify register_locks_bulk stores each tuple's pattern and reason.
+
+        Mutation: register_locks_bulk unpacks the tuple in the wrong order
+            (pattern and reason swapped), or writes only the first row.
+        Oracle: the literal (task_id, pattern, reason) tuples passed in.
+        """
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
 
         job = create_job('node1', postgres, coordination_config=config, wait_on_enter=0)
+        jobs_to_exit.append(job)
 
         locks = [
             ('task-1', 'pattern-1', 'reason-1'),
@@ -69,22 +93,36 @@ class TestLockRegistration:
         job.register_locks_bulk(locks)
 
         with postgres.connect() as conn:
-            result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Lock"]}'))
-            lock_count = result.scalar()
-        assert lock_count == 3, 'All 3 locks should be created'
+            result = conn.execute(text(f"""
+                SELECT task_id, node_patterns, reason, created_by
+                FROM {tables["Lock"]}
+                ORDER BY task_id
+            """))
+            rows = [tuple(row) for row in result]
+        assert rows == [
+            ('task-1', ['pattern-1'], 'reason-1', 'node1'),
+            ('task-2', ['pattern-2'], 'reason-2', 'node1'),
+            ('task-3', ['pattern-3'], 'reason-3', 'node1'),
+            ]
 
     @clean_tables('Lock')
-    def test_lock_idempotency(self, postgres):
-        """Test that registering same lock twice updates to latest patterns."""
+    def test_lock_idempotency(self, postgres, jobs_to_exit):
+        """Verify re-registering a task keeps one row with the latest pattern.
+
+        Mutation: the Lock upsert uses ON CONFLICT DO NOTHING in place of
+            DO UPDATE.
+        Oracle: the pattern passed on the second call.
+        """
 
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
 
         job = create_job('node1', postgres, coordination_config=config, wait_on_enter=0)
+        jobs_to_exit.append(job)
 
         task_id = 'task-123'
         job.register_lock(task_id, 'pattern-1', 'reason-1')
-        job.register_lock(task_id, 'pattern-2', 'reason-2')  # Different pattern, same token
+        job.register_lock(task_id, 'pattern-2', 'reason-2')
 
         with postgres.connect() as conn:
             result = conn.execute(text(f"""
@@ -102,14 +140,19 @@ class TestConcurrentLockRegistration:
     """Test concurrent lock registration from multiple nodes."""
 
     @clean_tables('Lock')
-    def test_same_lock_from_multiple_nodes_sequential(self, postgres):
-        """Verify multiple nodes registering same lock sequentially (idempotent).
+    def test_same_lock_from_multiple_nodes_sequential(self, postgres, jobs_to_exit):
+        """Verify the last of ten registering nodes is the recorded creator.
+
+        Mutation: the Lock upsert's DO UPDATE SET omits created_by, or the
+            insert loses its ON CONFLICT clause so node2's call raises.
+        Oracle: node10 is the last caller.
         """
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
 
         for i in range(1, 11):
             job = create_job(f'node{i}', postgres, coordination_config=config, wait_on_enter=0)
+            jobs_to_exit.append(job)
             job.register_lock('task-X1', 'Node1', 'lock X1 to Node1')
 
         with postgres.connect() as conn:
@@ -126,54 +169,50 @@ class TestConcurrentLockRegistration:
         assert lock[0]['created_by'] == 'node10', 'Last node should be recorded as creator (DO UPDATE)'
 
     @clean_tables('Lock')
-    def test_same_lock_from_multiple_nodes_simulated_concurrent(self, postgres):
-        """Verify multiple nodes can safely register same lock (simulated concurrency).
+    def test_same_lock_from_multiple_nodes_simulated_concurrent(self, postgres, jobs_to_exit):
+        """Verify ten simultaneous registrations of one task all succeed.
+
+        Mutation: register_lock replaced by a check-then-insert (SELECT, then
+            INSERT or UPDATE) that races under concurrency.
+        Oracle: ten threads released by one barrier, every call expected to
+            return without raising.
         """
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
 
-        def register_lock(node_name):
-            job = create_job(node_name, postgres, coordination_config=config, wait_on_enter=0)
-            job.register_lock('task-X1', 'Node1', f'lock from {node_name}')
+        jobs = [create_job(f'node{i}', postgres, coordination_config=config, wait_on_enter=0)
+                for i in range(1, 11)]
+        jobs_to_exit.extend(jobs)
+        barrier = threading.Barrier(len(jobs))
+        errors = []
 
-        threads = []
-        for i in range(1, 11):
-            t = threading.Thread(target=register_lock, args=(f'node{i}',))
-            threads.append(t)
+        def register_lock(job):
+            barrier.wait()
+            try:
+                job.register_lock('task-X1', 'Node1', f'lock from {job.node_name}')
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=register_lock, args=(job,)) for job in jobs]
+        for t in threads:
             t.start()
 
         for t in threads:
             t.join()
 
+        assert errors == [], f'Concurrent registration raised: {errors}'
         with postgres.connect() as conn:
             result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Lock"]}'))
             lock_count = result.scalar()
         assert lock_count == 1, 'Only 1 lock should exist despite concurrent registration'
 
     @clean_tables('Lock')
-    def test_same_lock_provider_across_cluster(self, postgres):
-        """Verify all nodes using same lock_provider callback doesn't cause issues.
-        """
-        config = get_coordination_config()
-        tables = schema.get_table_names(config.appname)
+    def test_bulk_lock_registration_idempotency(self, postgres, jobs_to_exit):
+        """Verify repeated bulk registration keeps one row per task.
 
-        def shared_lock_provider(job):
-            job.register_lock('task-X1', 'special-node', 'lock X1')
-            job.register_lock('task-X2', 'special-node', 'lock X2')
-            job.register_lock('task-X3', 'special-node', 'lock X3')
-
-        for i in range(1, 6):
-            job = create_job(f'node{i}', postgres, coordination_config=config, wait_on_enter=0)
-            shared_lock_provider(job)
-
-        with postgres.connect() as conn:
-            result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Lock"]}'))
-            lock_count = result.scalar()
-        assert lock_count == 3, 'Should have exactly 3 locks (deduplicated)'
-
-    @clean_tables('Lock')
-    def test_bulk_lock_registration_idempotency(self, postgres):
-        """Verify bulk lock registration is idempotent across multiple nodes.
+        Mutation: register_locks_bulk uses a plain INSERT without the upsert
+            clause, so the second node's batch raises.
+        Oracle: three distinct task ids registered.
         """
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
@@ -186,6 +225,7 @@ class TestConcurrentLockRegistration:
 
         for i in range(1, 8):
             job = create_job(f'node{i}', postgres, coordination_config=config, wait_on_enter=0)
+            jobs_to_exit.append(job)
             job.register_locks_bulk(locks_to_register)
 
         with postgres.connect() as conn:
@@ -198,13 +238,18 @@ class TestLockClearing:
     """Test lock clearing functionality."""
 
     @clean_tables('Lock')
-    def test_clear_locks_by_creator(self, postgres):
-        """Verify clearing locks by creator removes only that creator's locks.
+    def test_clear_locks_by_creator(self, postgres, jobs_to_exit):
+        """Verify clear_locks_by_creator deletes and counts a creator's locks.
+
+        Mutation: clear_locks_by_creator returns a constant in place of
+            result.rowcount.
+        Oracle: three locks registered by node1.
         """
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
 
         job = create_job('node1', postgres, coordination_config=config, wait_on_enter=0)
+        jobs_to_exit.append(job)
 
         job.register_lock('task-1', 'pattern-1', 'reason-1')
         job.register_lock('task-2', 'pattern-2', 'reason-2')
@@ -222,14 +267,18 @@ class TestLockClearing:
         assert count_after == 0, 'Should have 0 locks remaining'
 
     @clean_tables('Lock')
-    def test_clear_locks_by_creator_selective(self, postgres):
-        """Verify clearing only removes specified creator's locks.
+    def test_clear_locks_by_creator_selective(self, postgres, jobs_to_exit):
+        """Verify clear_locks_by_creator keeps another creator's locks.
+
+        Mutation: the DELETE drops its WHERE created_by filter.
+        Oracle: two locks by node1 and one by node2.
         """
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
 
         job1 = create_job('node1', postgres, coordination_config=config, wait_on_enter=0)
         job2 = create_job('node2', postgres, coordination_config=config, wait_on_enter=0)
+        jobs_to_exit.extend([job1, job2])
 
         job1.register_lock('task-1', 'pattern-1', 'from node1')
         job1.register_lock('task-2', 'pattern-2', 'from node1')
@@ -249,14 +298,18 @@ class TestLockClearing:
         assert remaining[0]['created_by'] == 'node2', 'Remaining lock should be from node2'
 
     @clean_tables('Lock')
-    def test_clear_all_locks(self, postgres):
+    def test_clear_all_locks(self, postgres, jobs_to_exit):
         """Verify clear_all_locks removes all locks regardless of creator.
+
+        Mutation: clear_all_locks filters by the calling node's name.
+        Oracle: one lock each from node1 and node2.
         """
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
 
         job1 = create_job('node1', postgres, coordination_config=config, wait_on_enter=0)
         job2 = create_job('node2', postgres, coordination_config=config, wait_on_enter=0)
+        jobs_to_exit.extend([job1, job2])
 
         job1.register_lock('task-1', 'pattern-1', 'from node1')
         job2.register_lock('task-2', 'pattern-2', 'from node2')
@@ -277,25 +330,16 @@ class TestLockListing:
     """Test lock listing functionality."""
 
     @clean_tables('Lock')
-    def test_list_locks_empty(self, postgres):
-        """Verify list_locks returns empty list when no locks exist.
+    def test_list_locks_content(self, postgres, jobs_to_exit):
+        """Verify list_locks returns patterns, reason, creator and expiry.
+
+        Mutation: list_locks drops reason or created_by from its SELECT.
+        Oracle: the literal arguments passed to register_lock.
         """
         config = get_coordination_config()
-        tables = schema.get_table_names(config.appname)
 
         job = create_job('node1', postgres, coordination_config=config, wait_on_enter=0)
-        locks = job.list_locks()
-
-        assert locks == [], 'Should return empty list'
-
-    @clean_tables('Lock')
-    def test_list_locks_content(self, postgres):
-        """Verify list_locks returns correct lock information.
-        """
-        config = get_coordination_config()
-        tables = schema.get_table_names(config.appname)
-
-        job = create_job('node1', postgres, coordination_config=config, wait_on_enter=0)
+        jobs_to_exit.append(job)
 
         job.register_lock('task-1', 'pattern-1', 'reason-1')
         job.register_lock('task-2', 'pattern-2', 'reason-2')
@@ -309,20 +353,25 @@ class TestLockListing:
         assert lock1['expires_at'] is None
 
     @clean_tables('Lock')
-    def test_list_locks_filters_expired(self, postgres):
-        """Verify list_locks filters out expired locks.
+    def test_list_locks_filters_expired(self, postgres, jobs_to_exit):
+        """Verify list_locks omits an expired lock and keeps unexpired ones.
+
+        Mutation: list_locks drops the expires_at > NOW() filter, or flips
+            the comparison.
+        Oracle: expiries one day ahead, two days past, and NULL.
         """
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
 
         job = create_job('node1', postgres, coordination_config=config, wait_on_enter=0)
+        jobs_to_exit.append(job)
 
         job.register_lock('task-1', 'pattern-1', 'not expired')
         job.register_lock('task-2', 'pattern-2', 'expires soon', expires_in_days=1)
 
         expired_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=2)
         insert_lock(postgres, tables, 999, ['pattern-expired'],
-                   created_by='node1', expires_at=expired_time, reason='already expired')
+                    created_by='node1', expires_at=expired_time, reason='already expired')
 
         locks = job.list_locks()
 
@@ -337,7 +386,11 @@ class TestClearExistingLocks:
 
     @clean_tables('Lock')
     def test_clear_existing_locks_true(self, postgres):
-        """Verify clear_existing_locks=True clears this node's locks before lock_provider.
+        """Verify clear_existing_locks=True clears old locks before the provider.
+
+        Mutation: _on_enter_cluster_forming ignores the flag, or clears
+            after calling lock_provider.
+        Oracle: two locks from the first run, one from the second.
         """
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
@@ -347,26 +400,26 @@ class TestClearExistingLocks:
             job.register_lock('task-2', 'pattern-OLD', 'first run')
 
         with create_job('node1', postgres, coordination_config=config,
-                 lock_provider=first_lock_provider, clear_existing_locks=False,
-                 wait_on_enter=0, wait_on_exit=0):
+                        lock_provider=first_lock_provider, clear_existing_locks=False,
+                        wait_on_enter=0, wait_on_exit=0):
             pass
 
         with postgres.connect() as conn:
             count_after_first = conn.execute(text(f'SELECT COUNT(*) FROM {tables["Lock"]} WHERE created_by = :creator'),
-                                            {'creator': 'node1'}).scalar()
+                                             {'creator': 'node1'}).scalar()
         assert count_after_first == 2, 'Should have 2 locks after first run'
 
         def second_lock_provider(job):
             job.register_lock('task-3', 'pattern-NEW', 'second run')
 
         with create_job('node1', postgres, coordination_config=config,
-                 lock_provider=second_lock_provider, clear_existing_locks=True,
-                 wait_on_enter=0, wait_on_exit=0):
+                        lock_provider=second_lock_provider, clear_existing_locks=True,
+                        wait_on_enter=0, wait_on_exit=0):
             pass
 
         with postgres.connect() as conn:
             result = conn.execute(text(f'SELECT node_patterns FROM {tables["Lock"]} WHERE created_by = :creator'),
-                                 {'creator': 'node1'})
+                                  {'creator': 'node1'})
             locks = [dict(row._mapping) for row in result]
 
         patterns = [l['node_patterns'][0] for l in locks]
@@ -377,6 +430,10 @@ class TestClearExistingLocks:
     @clean_tables('Lock')
     def test_clear_existing_locks_false(self, postgres):
         """Verify clear_existing_locks=False preserves existing locks.
+
+        Mutation: _on_enter_cluster_forming clears the node's locks whatever
+            the flag says.
+        Oracle: one lock from each of two runs.
         """
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
@@ -385,21 +442,21 @@ class TestClearExistingLocks:
             job.register_lock('task-1', 'pattern-OLD', 'first run')
 
         with create_job('node1', postgres, coordination_config=config,
-                 lock_provider=first_lock_provider, clear_existing_locks=False,
-                 wait_on_enter=0, wait_on_exit=0):
+                        lock_provider=first_lock_provider, clear_existing_locks=False,
+                        wait_on_enter=0, wait_on_exit=0):
             pass
 
         def second_lock_provider(job):
             job.register_lock('task-2', 'pattern-NEW', 'second run')
 
         with create_job('node1', postgres, coordination_config=config,
-                 lock_provider=second_lock_provider, clear_existing_locks=False,
-                 wait_on_enter=0, wait_on_exit=0):
+                        lock_provider=second_lock_provider, clear_existing_locks=False,
+                        wait_on_enter=0, wait_on_exit=0):
             pass
 
         with postgres.connect() as conn:
             result = conn.execute(text(f'SELECT node_patterns FROM {tables["Lock"]} WHERE created_by = :creator ORDER BY task_id'),
-                                 {'creator': 'node1'})
+                                  {'creator': 'node1'})
             locks = [dict(row._mapping) for row in result]
 
         patterns = [l['node_patterns'][0] for l in locks]
@@ -414,7 +471,11 @@ class TestLockProviderTiming:
 
     @clean_tables('Lock')
     def test_lock_provider_called_during_cluster_forming(self, postgres):
-        """Verify lock_provider is invoked during CLUSTER_FORMING state entry.
+        """Verify lock_provider runs in CLUSTER_FORMING, before distribution.
+
+        Mutation: lock_provider invoked from _on_enter_distributing or a
+            running-state entry action.
+        Oracle: JobState.CLUSTER_FORMING recorded by the callback.
         """
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
@@ -442,13 +503,15 @@ class TestLockProviderTiming:
 
             assert lock_count == 1, 'Lock should be registered'
 
-            logger.info('✓ lock_provider invoked at correct state')
-
         finally:
             job.__exit__(None, None, None)
 
     def test_lock_provider_not_called_without_coordination(self, postgres):
         """Verify lock_provider not invoked when coordination disabled.
+
+        Mutation: __enter__ invokes lock_provider before its standalone-mode
+            early return.
+        Oracle: zero calls recorded by the callback.
         """
         callback_invoked = []
 
@@ -463,8 +526,6 @@ class TestLockProviderTiming:
         try:
             assert len(callback_invoked) == 0, 'lock_provider should not be invoked when coordination disabled'
 
-            logger.info('✓ lock_provider skipped when coordination disabled')
-
         finally:
             job.__exit__(None, None, None)
 
@@ -475,6 +536,11 @@ class TestLockFallbackPatterns:
     @clean_tables('Node', 'Lock', 'Token')
     def test_fallback_to_second_pattern(self, postgres):
         """Verify lock uses second pattern when first has no match.
+
+        Mutation: find_nodes_matching_patterns returns the union of every
+            pattern's matches, or uses only the first pattern.
+        Oracle: special-node is the one node matching special-%; the union
+            would tie-break to node1.
         """
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
@@ -489,7 +555,7 @@ class TestLockFallbackPatterns:
 
         coord_config = CoordinationConfig(total_tokens=30)
         job = create_job('node1', postgres, wait_on_enter=5,
-                        coordination_config=coord_config, lock_provider=register_fallback_locks)
+                         coordination_config=coord_config, lock_provider=register_fallback_locks)
         job.__enter__()
 
         try:
@@ -506,14 +572,15 @@ class TestLockFallbackPatterns:
             assert assigned_node == 'special-node', \
                 'Should use second pattern (special-%) when first (missing-%) has no match'
 
-            logger.info('✓ Lock fallback to second pattern successful')
-
         finally:
             job.__exit__(None, None, None)
 
     @clean_tables('Node', 'Lock', 'Token')
     def test_fallback_to_third_pattern(self, postgres):
         """Verify lock falls back to third pattern when first two fail.
+
+        Mutation: the fallback loop stops after the second pattern.
+        Oracle: only node% matches, and node1 and node2 are its matches.
         """
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
@@ -527,7 +594,7 @@ class TestLockFallbackPatterns:
 
         coord_config = CoordinationConfig(total_tokens=30)
         job = create_job('node1', postgres, wait_on_enter=5,
-                        coordination_config=coord_config, lock_provider=register_fallback_locks)
+                         coordination_config=coord_config, lock_provider=register_fallback_locks)
         job.__enter__()
 
         try:
@@ -544,14 +611,16 @@ class TestLockFallbackPatterns:
             assert assigned_node in {'node1', 'node2'}, \
                 'Should use third pattern (node%) when first two fail'
 
-            logger.info('✓ Lock fallback to third pattern successful')
-
         finally:
             job.__exit__(None, None, None)
 
     @clean_tables('Node', 'Lock', 'Token')
     def test_all_fallback_patterns_fail(self, postgres):
         """Verify token not assigned when all fallback patterns fail.
+
+        Mutation: categorize_tokens_by_locks puts a token whose patterns
+            match no node into the distributable list.
+        Oracle: no active node matches any of the three patterns.
         """
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
@@ -565,7 +634,7 @@ class TestLockFallbackPatterns:
 
         coord_config = CoordinationConfig(total_tokens=30)
         job = create_job('node1', postgres, wait_on_enter=5,
-                        coordination_config=coord_config, lock_provider=register_failed_fallback_locks)
+                         coordination_config=coord_config, lock_provider=register_failed_fallback_locks)
         job.__enter__()
 
         try:
@@ -581,14 +650,16 @@ class TestLockFallbackPatterns:
 
             assert count == 0, 'Token should not be assigned when all patterns fail'
 
-            logger.info('✓ All fallback patterns failed as expected')
-
         finally:
             job.__exit__(None, None, None)
 
     @clean_tables('Node', 'Lock', 'Token')
     def test_first_pattern_used_when_matches(self, postgres):
         """Verify first pattern is used when it matches (no fallback needed).
+
+        Mutation: find_nodes_matching_patterns skips the first pattern, or
+            tries the patterns in reverse order.
+        Oracle: primary-node is the one node matching primary-%.
         """
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
@@ -602,7 +673,7 @@ class TestLockFallbackPatterns:
 
         coord_config = CoordinationConfig(total_tokens=30)
         job = create_job('primary-node', postgres, wait_on_enter=5,
-                        coordination_config=coord_config, lock_provider=register_primary_locks)
+                         coordination_config=coord_config, lock_provider=register_primary_locks)
         job.__enter__()
 
         try:
@@ -619,14 +690,16 @@ class TestLockFallbackPatterns:
             assert assigned_node == 'primary-node', \
                 'Should use first pattern (primary-%) when it matches'
 
-            logger.info('✓ First pattern used when matching')
-
         finally:
             job.__exit__(None, None, None)
 
     @clean_tables('Node', 'Lock', 'Token')
     def test_fallback_survives_node_death(self, postgres):
-        """Verify fallback patterns work correctly when primary pattern node dies.
+        """Verify a locked token moves to the fallback node after primary dies.
+
+        Mutation: the dead-node redistribution keeps the token on its current
+            owner, or ignores the fallback pattern and leaves it unowned.
+        Oracle: backup-node is the one live node matching backup-%.
         """
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
@@ -658,8 +731,8 @@ class TestLockFallbackPatterns:
         heartbeat_thread.start()
 
         coord_config = CoordinationConfig(total_tokens=30, dead_node_check_interval_sec=1)
-        leader = create_job('leader', postgres, wait_on_enter=10,
-                           coordination_config=coord_config, lock_provider=register_failover_locks)
+        leader = create_job('leader', postgres, wait_on_enter=2,
+                            coordination_config=coord_config, lock_provider=register_failover_locks)
         leader.__enter__()
 
         try:
@@ -685,18 +758,14 @@ class TestLockFallbackPatterns:
 
             assert wait_for_dead_node_removal(postgres, tables, 'primary-node', timeout_sec=15)
 
-            assert wait_for_rebalance(postgres, tables, min_count=2, timeout_sec=20)
+            def token_owner():
+                with postgres.connect() as conn:
+                    return conn.execute(text(f"""
+                        SELECT node FROM {tables["Token"]} WHERE token_id = :token_id
+                    """), {'token_id': token_id}).scalar()
 
-            with postgres.connect() as conn:
-                result = conn.execute(text(f"""
-                    SELECT node FROM {tables["Token"]} WHERE token_id = :token_id
-                """), {'token_id': token_id})
-                final_assignment = result.scalar()
-
-            assert final_assignment == 'backup-node', \
-                'Should fallback to backup-node when primary-node dies'
-
-            logger.info('✓ Fallback pattern used after primary node died')
+            assert wait_for(lambda: token_owner() == 'backup-node', timeout_sec=20), \
+                f'Should fallback to backup-node when primary-node dies, owner is {token_owner()}'
 
         finally:
             keep_alive.set()
@@ -705,7 +774,11 @@ class TestLockFallbackPatterns:
 
     @clean_tables('Node', 'Lock', 'Token')
     def test_multiple_locks_with_different_fallbacks(self, postgres):
-        """Verify multiple locks with different fallback patterns work independently.
+        """Verify locks with different fallback lists resolve independently.
+
+        Mutation: find_nodes_matching_patterns skips the first pattern, which
+            sends task-3 to alpha-node.
+        Oracle: each task's first matching pattern has exactly one node.
         """
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
@@ -722,7 +795,7 @@ class TestLockFallbackPatterns:
 
         coord_config = CoordinationConfig(total_tokens=50)
         job = create_job('node1', postgres, wait_on_enter=5,
-                        coordination_config=coord_config, lock_provider=register_multiple_fallbacks)
+                         coordination_config=coord_config, lock_provider=register_multiple_fallbacks)
         job.__enter__()
 
         try:
@@ -741,8 +814,6 @@ class TestLockFallbackPatterns:
             assert assignments['task-2'] == 'beta-node', 'task-2 should use beta-node'
             assert assignments['task-3'] == 'node1', 'task-3 should use node1 (first match)'
 
-            logger.info('✓ Multiple independent fallback patterns work correctly')
-
         finally:
             job.__exit__(None, None, None)
 
@@ -751,45 +822,55 @@ class TestConcurrentLeaderLockAcquisition:
     """Test concurrent leader lock acquisition from multiple nodes."""
 
     @clean_tables('LeaderLock')
-    def test_only_one_node_acquires_leader_lock(self, postgres):
-        """Verify only one node can acquire leader lock when multiple try simultaneously.
+    def test_only_one_node_acquires_leader_lock(self, postgres, jobs_to_exit):
+        """Verify one of five simultaneous contenders gets the leader lock.
+
+        Mutation: the LeaderLock insert uses ON CONFLICT DO UPDATE, or
+            acquisition ignores result.rowcount.
+        Oracle: five contenders released by one barrier. The winner holds
+            the lock until the other four are refused.
         """
         lock_config = replace(get_coordination_config(), leader_lock_timeout_sec=0.2)
-        tables = schema.get_table_names('sync_')
 
+        jobs = [create_job(f'node{i}', postgres, coordination_config=lock_config, wait_on_enter=0)
+                for i in range(1, 6)]
+        jobs_to_exit.extend(jobs)
         acquired_by = []
-        lock = threading.Lock()
-        barrier = threading.Barrier(5)
+        refused_by = []
+        outcome_lock = threading.Lock()
+        all_refused = threading.Event()
+        barrier = threading.Barrier(len(jobs))
 
-        def try_acquire(node_name):
-            job = create_job(node_name, postgres, coordination_config=lock_config, wait_on_enter=0)
-            job.__enter__()
+        def try_acquire(job):
+            barrier.wait()
             try:
-                barrier.wait()
-
                 with job.locks.acquire_leader_lock('concurrent-test'):
-                    with lock:
-                        acquired_by.append(node_name)
-                    time.sleep(0.5)
+                    with outcome_lock:
+                        acquired_by.append(job.node_name)
+                    all_refused.wait(timeout=30)
             except LockNotAcquired:
-                pass
-            finally:
-                job.__exit__(None, None, None)
+                with outcome_lock:
+                    refused_by.append(job.node_name)
+                    if len(refused_by) == len(jobs) - 1:
+                        all_refused.set()
 
-        threads = []
-        for i in range(1, 6):
-            t = threading.Thread(target=try_acquire, args=(f'node{i}',))
-            threads.append(t)
+        threads = [threading.Thread(target=try_acquire, args=(job,)) for job in jobs]
+        for t in threads:
             t.start()
 
         for t in threads:
             t.join()
 
         assert len(acquired_by) == 1, f'Only 1 node should acquire lock, but {len(acquired_by)} did: {acquired_by}'
+        assert len(refused_by) == 4, f'The other 4 nodes should be refused, got {refused_by}'
 
     @clean_tables('LeaderLock')
     def test_leader_lock_released_after_operation(self, postgres):
-        """Verify leader lock is released after operation completes.
+        """Verify the leader lock row is deleted when the block ends or raises.
+
+        Mutation: _release_leader_lock no longer runs in the finally clause,
+            or deletes by a value other than this node's name.
+        Oracle: an empty LeaderLock table after each block.
         """
         lock_config = get_coordination_config()
         tables = schema.get_table_names('sync_')
@@ -801,65 +882,69 @@ class TestConcurrentLeaderLockAcquisition:
             with job1.locks.acquire_leader_lock('operation-1'):
                 pass
 
-            # Verify lock released
             with postgres.connect() as conn:
                 result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["LeaderLock"]}'))
                 lock_count = result.scalar()
 
             assert lock_count == 0, 'Lock should be released after context manager exit'
 
+            with pytest.raises(RuntimeError), job1.locks.acquire_leader_lock('operation-2'):
+                raise RuntimeError('operation failed')
+
+            with postgres.connect() as conn:
+                result = conn.execute(text(f'SELECT COUNT(*) FROM {tables["LeaderLock"]}'))
+                lock_count = result.scalar()
+
+            assert lock_count == 0, 'Lock should be released when the operation raises'
+
         finally:
             job1.__exit__(None, None, None)
 
     @clean_tables('LeaderLock')
-    def test_second_node_waits_for_lock_release(self, postgres):
-        """Verify second node waits when lock is held.
+    def test_second_node_waits_for_lock_release(self, postgres, jobs_to_exit):
+        """Verify a blocked node gets the leader lock once the holder releases.
+
+        Mutation: _try_acquire_leader_lock makes one INSERT attempt and gives
+            up without retrying, or overwrites the holder's row.
+        Oracle: release_holder, set one second after node2 starts waiting,
+            inside node2's 15 s timeout.
         """
-        lock_config = replace(get_coordination_config(), leader_lock_timeout_sec=2)
-        tables = schema.get_table_names(lock_config.appname)
+        lock_config = replace(get_coordination_config(), leader_lock_timeout_sec=15)
 
         job1 = create_job('node1', postgres, coordination_config=lock_config, wait_on_enter=0)
         job2 = create_job('node2', postgres, coordination_config=lock_config, wait_on_enter=0)
-        job1.__enter__()
-        job2.__enter__()
+        jobs_to_exit.extend([job1, job2])
+        holder_has_lock = threading.Event()
+        release_holder = threading.Event()
+
+        def node1_holds_lock():
+            with job1.locks.acquire_leader_lock('long-operation'):
+                holder_has_lock.set()
+                release_holder.wait(timeout=10)
+
+        holder = threading.Thread(target=node1_holds_lock)
+        releaser = threading.Timer(1.0, release_holder.set)
+        holder.start()
 
         try:
-            assert wait_for_running_state(job1, timeout_sec=5)
-            assert wait_for_running_state(job2, timeout_sec=5)
+            assert holder_has_lock.wait(timeout=15), 'node1 should have acquired lock'
+            releaser.start()
 
-            assert wait_for_rebalance(postgres, tables, min_count=1, timeout_sec=10)
-            assert wait_for_no_leader_lock(postgres, tables, timeout_sec=5)
-
-            acquired_node2 = False
-            lock_acquired = threading.Event()
-
-            def node1_holds_lock():
-                with job1.locks.acquire_leader_lock('long-operation'):
-                    lock_acquired.set()
-                    time.sleep(4)
-
-            t1 = threading.Thread(target=node1_holds_lock)
-            t1.start()
-
-            assert lock_acquired.wait(timeout=5), 'node1 should have acquired lock'
-
-            try:
-                with job2.locks.acquire_leader_lock('waiting-operation'):
-                    acquired_node2 = True
-            except LockNotAcquired:
-                pass
-
-            t1.join()
-
-            assert not acquired_node2, 'node2 should timeout waiting for lock'
+            with job2.locks.acquire_leader_lock('waiting-operation'):
+                assert release_holder.is_set(), 'node2 acquired the lock while node1 still held it'
 
         finally:
-            job1.__exit__(None, None, None)
-            job2.__exit__(None, None, None)
+            release_holder.set()
+            releaser.cancel()
+            holder.join(timeout=10)
 
     @clean_tables('LeaderLock')
     def test_lock_holder_recorded_in_database(self, postgres):
         """Verify lock holder is recorded correctly in database.
+
+        Mutation: the LeaderLock insert binds the operation or a constant in
+            place of the node name.
+        Oracle: the job's node name and the operation string passed in.
         """
         lock_config = get_coordination_config()
         tables = schema.get_table_names(lock_config.appname)
@@ -883,31 +968,27 @@ class TestConcurrentLeaderLockAcquisition:
             job.__exit__(None, None, None)
 
     @clean_tables('LeaderLock')
-    def test_sequential_acquisitions_after_release(self, postgres):
+    def test_sequential_acquisitions_after_release(self, postgres, jobs_to_exit):
         """Verify multiple nodes can acquire lock sequentially after release.
+
+        Mutation: _release_leader_lock deletes nothing, so the next node
+            times out.
+        Oracle: three nodes, each expected to acquire in turn.
         """
-        lock_config = get_coordination_config()
-        tables = schema.get_table_names(lock_config.appname)
+        lock_config = replace(get_coordination_config(), leader_lock_timeout_sec=2)
 
         nodes = [create_job(f'node{i}', postgres, coordination_config=lock_config, wait_on_enter=0) for i in range(1, 4)]
+        jobs_to_exit.extend(nodes)
 
         for node in nodes:
-            node.__enter__()
+            acquired = False
+            try:
+                with node.locks.acquire_leader_lock(f'operation-{node.node_name}'):
+                    acquired = True
+            except LockNotAcquired:
+                pass
 
-        try:
-            for node in nodes:
-                acquired = False
-                try:
-                    with node.locks.acquire_leader_lock(f'operation-{node.node_name}'):
-                        acquired = True
-                except LockNotAcquired:
-                    pass
-
-                assert acquired, f'{node.node_name} should acquire lock after previous release'
-
-        finally:
-            for node in nodes:
-                node.__exit__(None, None, None)
+            assert acquired, f'{node.node_name} should acquire lock after previous release'
 
 
 if __name__ == '__main__':

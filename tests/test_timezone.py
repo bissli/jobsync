@@ -8,19 +8,14 @@ USE THIS FILE FOR:
 """
 import datetime
 import logging
-import time
 from zoneinfo import ZoneInfo
 
 import pytest
+from fixtures import *  # noqa: F401, F403
 from sqlalchemy import text
 
 from jobsync import schema
 from jobsync.client import CoordinationConfig, LockNotAcquired
-
-logger = logging.getLogger(__name__)
-
-
-from fixtures import *  # noqa: F401, F403
 
 logger = logging.getLogger(__name__)
 
@@ -30,35 +25,42 @@ class TestHeartbeatTimezoneHandling:
 
     @clean_tables('Node')
     def test_heartbeat_timeout_different_timezones(self, postgres):
-        """Verify heartbeat timeout works when nodes use different timezones.
+        """Verify heartbeats written in any zone are aged as instants.
+
+        Mutation: active_nodes_sql using heartbeat_interval_sec in place of
+            heartbeat_timeout_sec, or the comparison flipped.
+        Oracle: 10s timeout; heartbeats 0s and 5s old are active, 20s old
+            are dead, each written in a different zone.
         """
-        config = get_coordination_config()
+        config = get_coordination_config(heartbeat_timeout_sec=10)
         tables = schema.get_table_names(config.appname)
 
-        # Simulate nodes in different timezones
-        timezones = ['UTC', 'America/New_York', 'Asia/Tokyo', 'Europe/London']
-        current_time = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        heartbeat_age_by_zone = {
+            'UTC': 20,
+            'America/New_York': 20,
+            'Asia/Tokyo': 5,
+            'Europe/London': 0,
+            }
 
-        for tz in timezones:
-            tz_time = current_time.astimezone(ZoneInfo(tz))
-            insert_active_node(postgres, tables, f'node-{tz.replace("/", "-")}', created_on=tz_time)
+        with postgres.connect() as conn:
+            for zone, age_sec in heartbeat_age_by_zone.items():
+                heartbeat = (now - datetime.timedelta(seconds=age_sec)).astimezone(ZoneInfo(zone))
+                conn.execute(text(f"""
+                    INSERT INTO {tables["Node"]} (name, created_on, last_heartbeat)
+                    VALUES (:name, :heartbeat, :heartbeat)
+                """), {'name': f'node-{zone}', 'heartbeat': heartbeat})
+            conn.commit()
 
-        job = create_job('test', postgres, coordination_config=config, wait_on_enter=0)
+        job = create_job('test', postgres, coordination_config=config)
 
         try:
-            active_nodes = job.get_active_nodes()
-            active_names = [n['name'] for n in active_nodes]
+            active_names = {node['name'] for node in job.get_active_nodes()}
 
-            # All nodes should be active (heartbeat within timeout)
-            for tz in timezones:
-                node_name = f'node-{tz.replace("/", "-")}'
-                assert node_name in active_names, f'{node_name} should be active'
+            assert active_names == {'node-Asia/Tokyo', 'node-Europe/London'}
 
         finally:
-            with postgres.connect() as conn:
-                for tz in timezones:
-                    delete_rows(postgres, tables, 'Node', 'name = :name',
-                               {'name': f'node-{tz.replace("/", "-")}'})
+            job.__exit__(None, None, None)
 
 
 class TestLockExpirationTimezones:
@@ -66,36 +68,35 @@ class TestLockExpirationTimezones:
 
     @clean_tables('Lock')
     def test_lock_expiration_utc_vs_local(self, postgres):
-        """Verify lock expiration works with different timezone timestamps.
+        """Verify lock expiry compares instants, not wall-clock readings.
+
+        Mutation: the expired-lock DELETE in get_active_locks dropped or its
+            comparison flipped.
+        Oracle: an expiry one hour past written in Tokyo (wall clock reads
+            ahead) and one hour ahead written in New York (reads behind).
         """
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
 
-        # Create locks with different timezone timestamps
         utc_now = datetime.datetime.now(datetime.timezone.utc)
-        ny_now = datetime.datetime.now(ZoneInfo('America/New_York'))
+        expired_tokyo = (utc_now - datetime.timedelta(hours=1)).astimezone(ZoneInfo('Asia/Tokyo'))
+        expired_utc = utc_now - datetime.timedelta(hours=1)
+        valid_ny = (utc_now + datetime.timedelta(hours=1)).astimezone(ZoneInfo('America/New_York'))
 
-        expired_utc = utc_now - datetime.timedelta(days=2)
-        expired_ny = ny_now - datetime.timedelta(days=2)
-        valid_utc = utc_now + datetime.timedelta(days=1)
+        insert_lock(postgres, tables, 1, ['pattern-tokyo'], created_by='test', expires_at=expired_tokyo)
+        insert_lock(postgres, tables, 2, ['pattern-utc'], created_by='test', expires_at=expired_utc)
+        insert_lock(postgres, tables, 3, ['pattern-valid'], created_by='test', expires_at=valid_ny)
 
-        insert_lock(postgres, tables, 1, ['pattern-utc'], created_by='test', expires_at=expired_utc)
-        insert_lock(postgres, tables, 2, ['pattern-ny'], created_by='test', expires_at=expired_ny)
-        insert_lock(postgres, tables, 3, ['pattern-valid'], created_by='test', expires_at=valid_utc)
+        job = create_job('test', postgres, coordination_config=config)
 
-        job = create_job('test', postgres, coordination_config=config, wait_on_enter=0)
+        try:
+            active_locks = job.locks.get_active_locks()
 
-        active_locks = job.locks.get_active_locks()
+            assert active_locks == {job.task_to_token(3): ['pattern-valid']}, \
+                'Only the lock expiring in the future should remain'
 
-        # Convert task_ids to token_ids for comparison (get_active_locks returns token_ids as keys)
-        token_1 = job.task_to_token(1)
-        token_2 = job.task_to_token(2)
-        token_3 = job.task_to_token(3)
-
-        # Only valid lock should remain
-        assert token_1 not in active_locks, 'Expired UTC lock should be removed'
-        assert token_2 not in active_locks, 'Expired NY lock should be removed'
-        assert token_3 in active_locks, 'Valid lock should remain'
+        finally:
+            job.__exit__(None, None, None)
 
 
 class TestLeaderLockTimezones:
@@ -103,70 +104,78 @@ class TestLeaderLockTimezones:
 
     @clean_tables('LeaderLock')
     def test_stale_leader_lock_detection_different_timezones(self, postgres):
-        """Verify stale lock detection works with timezone-aware timestamps.
+        """Verify a New York leader lock is stolen past 300s and kept before.
+
+        Mutation: _check_and_clear_stale_lock clearing whatever lock it
+            finds, or its age comparison flipped.
+        Oracle: stale_leader_lock_age_sec=300 with locks 200s and 400s old,
+            one on either side of it.
         """
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
-
-        # Create stale lock with NY timezone timestamp
-        ny_time = datetime.datetime.now(ZoneInfo('America/New_York'))
-        stale_time = ny_time - datetime.timedelta(seconds=400)
-
-        insert_leader_lock(postgres, tables, 'stale-node', 'stale-operation', acquired_at=stale_time)
 
         coord_config = CoordinationConfig(
             total_tokens=100,
             heartbeat_interval_sec=1,
-            stale_leader_lock_age_sec=300
+            stale_leader_lock_age_sec=300,
+            leader_lock_timeout_sec=2
         )
 
-        job = create_job('test', postgres, wait_on_enter=0, coordination_config=coord_config)
+        job = create_job('test', postgres, coordination_config=coord_config)
 
-        # Should be able to acquire lock (stale lock removed)
         try:
+            ny_now = datetime.datetime.now(ZoneInfo('America/New_York'))
+
+            insert_leader_lock(postgres, tables, 'fresh-node', 'fresh-operation',
+                               acquired_at=ny_now - datetime.timedelta(seconds=200))
+            with pytest.raises(LockNotAcquired), job.locks.acquire_leader_lock('test-operation'):
+                pass
+
+            delete_rows(postgres, tables, 'LeaderLock', 'singleton = 1')
+            insert_leader_lock(postgres, tables, 'stale-node', 'stale-operation',
+                               acquired_at=ny_now - datetime.timedelta(seconds=400))
             with job.locks.acquire_leader_lock('test-operation'):
-                acquired = True
-        except LockNotAcquired:
-            acquired = False
-        assert acquired, 'Should acquire lock after removing stale NY timezone lock'
+                with postgres.connect() as conn:
+                    holder = conn.execute(text(f'select node from {tables["LeaderLock"]}')).scalar_one()
+
+            assert holder == 'test', 'Should acquire lock after removing stale NY timezone lock'
+
+        finally:
+            job.__exit__(None, None, None)
 
     @clean_tables('LeaderLock')
     def test_leader_lock_acquired_time_across_timezones(self, postgres):
-        """Verify leader lock timing works when nodes are in different timezones.
+        """Verify a held leader lock is fresh by DB time and blocks others.
+
+        Mutation: acquired_at bound from naive datetime.datetime.utcnow() in
+            _try_acquire_leader_lock, which the America/New_York session
+            reads as hours off.
+        Oracle: NOW() - acquired_at from the database clock must be under 5s
+            while the lock is held.
         """
-        config = get_coordination_config()
+        config = get_coordination_config(leader_lock_timeout_sec=1)
         tables = schema.get_table_names(config.appname)
 
-        # Node1 in Tokyo timezone acquires lock
-        tokyo_time = datetime.datetime.now(ZoneInfo('Asia/Tokyo'))
-
-        job1 = create_job('node-tokyo', postgres, config)
+        job1 = create_job('node-tokyo', postgres, coordination_config=config)
+        job2 = create_job('node-ny', postgres, coordination_config=config)
 
         try:
             with job1.locks.acquire_leader_lock('tokyo-operation'):
-                acquired_tokyo = True
+                with postgres.connect() as conn:
+                    lock_age_sec = conn.execute(text(
+                        f'select extract(epoch from now() - acquired_at) from {tables["LeaderLock"]}')).scalar_one()
 
-                # Node2 in NY timezone tries to acquire immediately
-                job2 = create_job('node-ny', postgres, config)
+                assert abs(lock_age_sec) < 5, f'Held lock should be fresh, age {lock_age_sec}s'
 
-                try:
-                    with job2.locks.acquire_leader_lock('ny-operation'):
-                        acquired_ny = True
-                except LockNotAcquired:
-                    acquired_ny = False
-                assert not acquired_ny, 'NY node should not acquire lock held by Tokyo node'
-        except LockNotAcquired:
-            acquired_tokyo = False
+                with pytest.raises(LockNotAcquired), job2.locks.acquire_leader_lock('ny-operation'):
+                    pass
 
-        assert acquired_tokyo, 'Tokyo node should acquire lock'
-
-        # Now NY node should be able to acquire
-        try:
             with job2.locks.acquire_leader_lock('ny-operation-after'):
-                acquired_ny_after = True
-        except LockNotAcquired:
-            acquired_ny_after = False
-        assert acquired_ny_after, 'NY node should acquire after Tokyo released'
+                pass
+
+        finally:
+            job1.__exit__(None, None, None)
+            job2.__exit__(None, None, None)
 
 
 class TestLeaderElectionTimezones:
@@ -174,9 +183,13 @@ class TestLeaderElectionTimezones:
 
     @clean_tables('Node')
     def test_leader_election_with_mixed_timezones(self, postgres):
-        """Verify leader election works correctly when nodes registered in different timezones.
+        """Verify the first-created node wins whatever zone recorded it.
+
+        Mutation: elect_leader ordering by created_on DESC, or by name first.
+        Oracle: Tokyo 30s old, London 20s, New York 10s; by wall clock New
+            York reads earliest and London sorts first by name.
         """
-        config = get_coordination_config()
+        config = get_coordination_config(heartbeat_timeout_sec=60)
         tables = schema.get_table_names(config.appname)
 
         base_utc = datetime.datetime.now(datetime.timezone.utc)
@@ -190,57 +203,26 @@ class TestLeaderElectionTimezones:
         for name, created_on in nodes:
             insert_active_node(postgres, tables, name, created_on=created_on)
 
-        with postgres.connect() as conn:
-            conn.execute(text(f"""
-                UPDATE {tables["Node"]} SET last_heartbeat = :heartbeat
-            """), {'heartbeat': base_utc})
-            conn.commit()
+        job = create_job('test', postgres, coordination_config=config)
 
-        job = create_job('test', postgres, config)
+        try:
+            leader = job.cluster.elect_leader()
+            assert leader == 'node-tokyo', 'Oldest node (Tokyo) should be elected regardless of timezone'
 
-        leader = job.cluster.elect_leader()
-        assert leader == 'node-tokyo', 'Oldest node (Tokyo) should be elected regardless of timezone'
+        finally:
+            job.__exit__(None, None, None)
 
 
 class TestTokenDistributionTimezones:
     """Test token distribution timestamp handling across timezones."""
 
     @clean_tables('Node', 'Token')
-    def test_token_assigned_at_different_timezones(self, postgres):
-        """Verify token assignment timestamps work with mixed timezones.
-        """
-        config = get_coordination_config()
-        tables = schema.get_table_names(config.appname)
-
-        # Register nodes in different timezones
-        timezones = ['UTC', 'America/New_York', 'Asia/Tokyo']
-        base_time = datetime.datetime.now(datetime.timezone.utc)
-
-        for i, tz in enumerate(timezones):
-            tz_time = base_time.astimezone(ZoneInfo(tz))
-            insert_active_node(postgres, tables, f'node-{i+1}', created_on=tz_time)
-
-        coord_config = CoordinationConfig(total_tokens=30)
-        job = create_job('node-1', postgres, coordination_config=coord_config, wait_on_enter=0)
-
-        job.tokens.distribute(job.locks, job.cluster)
-
-        # Verify all tokens have assigned_at timestamps
-        with postgres.connect() as conn:
-            result = conn.execute(text(f"""
-                SELECT token_id, node, assigned_at
-                FROM {tables["Token"]}
-                ORDER BY token_id
-            """))
-            tokens = [dict(row._mapping) for row in result]
-
-        assert len(tokens) == 30, 'All tokens should be assigned'
-        for token in tokens:
-            assert token['assigned_at'] is not None, f'Token {token["token_id"]} should have assigned_at timestamp'
-
-    @clean_tables('Node', 'Token')
     def test_token_version_increment_across_timezones(self, postgres):
-        """Verify token version increments work correctly with timezone-aware times.
+        """Verify each distribution writes every token at the next version.
+
+        Mutation: new_version left at MAX(version) with no + 1, or a stale
+            row kept at the old version.
+        Oracle: hand count of versions 1 then 2 from an empty Token table.
         """
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
@@ -251,24 +233,24 @@ class TestTokenDistributionTimezones:
             insert_active_node(postgres, tables, f'node{i}', created_on=base_time)
 
         coord_config = CoordinationConfig(total_tokens=30)
-        job = create_job('node1', postgres, wait_on_enter=0, coordination_config=coord_config)
+        job = create_job('node1', postgres, coordination_config=coord_config)
 
-        # First distribution
-        job.tokens.distribute(job.locks, job.cluster)
+        try:
+            versions_sql = f'select distinct version from {tables["Token"]}'
 
-        with postgres.connect() as conn:
-            result = conn.execute(text(f'SELECT MAX(version) FROM {tables["Token"]}'))
-            version1 = result.scalar()
+            job.tokens.distribute(job.locks, job.cluster)
+            with postgres.connect() as conn:
+                versions_first = {row[0] for row in conn.execute(text(versions_sql))}
 
-        # Second distribution (simulating rebalance)
-        time.sleep(1)
-        job.tokens.distribute(job.locks, job.cluster)
+            job.tokens.distribute(job.locks, job.cluster)
+            with postgres.connect() as conn:
+                versions_second = {row[0] for row in conn.execute(text(versions_sql))}
 
-        with postgres.connect() as conn:
-            result = conn.execute(text(f'SELECT MAX(version) FROM {tables["Token"]}'))
-            version2 = result.scalar()
+            assert versions_first == {1}
+            assert versions_second == {2}, 'Token version should increment on redistribution'
 
-        assert version2 > version1, 'Token version should increment on redistribution'
+        finally:
+            job.__exit__(None, None, None)
 
 
 class TestRebalanceTimingTimezones:
@@ -276,7 +258,13 @@ class TestRebalanceTimingTimezones:
 
     @clean_tables('Node', 'Rebalance')
     def test_rebalance_log_timestamps_consistent(self, postgres):
-        """Verify rebalance log timestamps are consistent across timezone changes.
+        """Verify _distribute_tokens_safe logs one row with its reason.
+
+        Mutation: trigger_reason not forwarded to distribute(), or
+            duration_ms recorded in whole seconds.
+        Oracle: the 'membership_change' reason passed in, leader 'node1',
+            two active nodes, and a triggered_at between real-clock
+            readings taken around the call.
         """
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
@@ -287,55 +275,29 @@ class TestRebalanceTimingTimezones:
             insert_active_node(postgres, tables, f'node{i}', created_on=base_time)
 
         coord_config = CoordinationConfig(total_tokens=30)
-        job = create_job('node1', postgres, wait_on_enter=0, coordination_config=coord_config)
+        job = create_job('node1', postgres, coordination_config=coord_config)
 
-        # Trigger rebalance
-        job._distribute_tokens_safe()
+        try:
+            before = datetime.datetime.now(datetime.timezone.utc)
+            job._distribute_tokens_safe('membership_change')
+            after = datetime.datetime.now(datetime.timezone.utc)
 
-        with postgres.connect() as conn:
-            result = conn.execute(text(f"""
-                SELECT triggered_at, leader_node, duration_ms
-                FROM {tables["Rebalance"]}
-                ORDER BY triggered_at DESC
-                LIMIT 1
-            """))
-            rebalance = [dict(row._mapping) for row in result]
+            with postgres.connect() as conn:
+                result = conn.execute(text(f"""
+                    SELECT triggered_at, trigger_reason, leader_node, nodes_after, duration_ms
+                    FROM {tables["Rebalance"]}
+                """))
+                rebalance = [dict(row._mapping) for row in result]
 
-        assert len(rebalance) == 1, 'Rebalance should be logged'
-        assert rebalance[0]['triggered_at'] is not None, 'Rebalance triggered_at should have timestamp'
-        assert rebalance[0]['duration_ms'] > 0, 'Rebalance should have measurable duration'
+            assert len(rebalance) == 1, 'Rebalance should be logged once'
+            assert rebalance[0]['trigger_reason'] == 'membership_change'
+            assert rebalance[0]['leader_node'] == 'node1'
+            assert rebalance[0]['nodes_after'] == 2
+            assert before <= rebalance[0]['triggered_at'] <= after
+            assert rebalance[0]['duration_ms'] > 0, 'Rebalance should have measurable duration'
 
-    @clean_tables('Node')
-    def test_membership_change_detection_across_timezones(self, postgres):
-        """Verify membership change detection works with nodes in different timezones.
-        """
-        config = get_coordination_config()
-        tables = schema.get_table_names(config.appname)
-
-        # Initial nodes in different timezones
-        utc_time = datetime.datetime.now(datetime.timezone.utc)
-        tokyo_time = datetime.datetime.now(ZoneInfo('Asia/Tokyo'))
-
-        insert_active_node(postgres, tables, 'node-utc', created_on=utc_time)
-        insert_active_node(postgres, tables, 'node-tokyo', created_on=tokyo_time)
-
-        job = create_job('test', postgres, config)
-
-        active_nodes = job.get_active_nodes()
-        assert len(active_nodes) == 2, 'Both nodes should be detected as active'
-
-        # Simulate one node dying (old heartbeat in another timezone)
-        old_heartbeat = utc_time - datetime.timedelta(seconds=20)
-        with postgres.connect() as conn:
-            conn.execute(text(f"""
-                UPDATE {tables["Node"]}
-                SET last_heartbeat = :heartbeat
-                WHERE name = 'node-tokyo'
-            """), {'heartbeat': old_heartbeat})
-            conn.commit()
-
-        active_nodes_after = job.get_active_nodes()
-        assert len(active_nodes_after) == 1, 'Only UTC node should remain active'
+        finally:
+            job.__exit__(None, None, None)
 
 
 class TestDatabaseTimezoneConsistency:
@@ -343,36 +305,28 @@ class TestDatabaseTimezoneConsistency:
 
     @clean_tables('Audit')
     def test_audit_timestamps_use_database_timezone(self, postgres):
-        """Verify audit logging timestamps are stored in database's local timezone.
+        """Verify audit created_on is the true write instant.
 
-        Database is configured for America/New_York timezone in conftest.py.
-        This test ensures audit records preserve timezone information correctly.
+        Mutation: write_audit binding created_on from naive
+            datetime.datetime.utcnow(), which the session reads as hours
+            off.
+        Oracle: real-clock readings taken around write_audit(); tasks
+            queued with UTC and Tokyo timestamps.
         """
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
 
-        with postgres.connect() as conn:
-            result = conn.execute(text('SHOW timezone'))
-            db_timezone = result.scalar()
-            logger.info(f'Database timezone: {db_timezone}')
-
-        job = create_job('audit-tz-test', postgres, coordination_config=config, wait_on_enter=0)
-        job.__enter__()
+        job = create_job('audit-tz-test', postgres, coordination_config=config)
 
         try:
-            task1 = create_task(1, 'task-1')
-            task2 = create_task(2, 'task-2')
-
-            client_time_utc = datetime.datetime.now(datetime.timezone.utc)
-            client_time_tokyo = datetime.datetime.now(ZoneInfo('Asia/Tokyo'))
-            client_time_db = datetime.datetime.now(ZoneInfo(db_timezone))
-
+            before = datetime.datetime.now(datetime.timezone.utc)
             job.tasks._tasks = [
-                (task1, client_time_utc),
-                (task2, client_time_tokyo),
+                (create_task(1, 'task-1'), datetime.datetime.now(datetime.timezone.utc)),
+                (create_task(2, 'task-2'), datetime.datetime.now(ZoneInfo('Asia/Tokyo'))),
             ]
 
             job.write_audit()
+            after = datetime.datetime.now(datetime.timezone.utc)
 
             with postgres.connect() as conn:
                 result = conn.execute(text(f"""
@@ -381,65 +335,50 @@ class TestDatabaseTimezoneConsistency:
                     WHERE node = 'audit-tz-test'
                     ORDER BY task_id
                 """))
-                audit_records = [dict(row._mapping) for row in result]
+                created_on_by_task = {row[0]: row[1] for row in result}
 
-            assert len(audit_records) == 2, 'Should have 2 audit records'
-
-            for record in audit_records:
-                stored_time = record['created_on']
-                logger.info(f"Task {record['task_id']}: stored as {stored_time}")
-
-                age_seconds = abs((datetime.datetime.now(datetime.timezone.utc) - stored_time).total_seconds())
-                assert age_seconds < 30, f'Audit timestamp should be recent (age: {age_seconds}s)'
-
-            utc_stored = audit_records[0]['created_on']
-            tokyo_stored = audit_records[1]['created_on']
-
-            try:
-                utc_to_tokyo_diff = abs((client_time_utc - client_time_tokyo).total_seconds())
-            except:
-                utc_to_tokyo_diff = abs((datetime.datetime.fromisoformat(str(client_time_utc)) - datetime.datetime.fromisoformat(str(client_time_tokyo))).total_seconds())
-            stored_diff = abs((utc_stored - tokyo_stored).total_seconds())
-
-            assert abs(stored_diff - utc_to_tokyo_diff) < 2, 'Time differences should be preserved across different input timezones'
-
-            logger.info('✓ Audit timestamps correctly stored with timezone information')
+            assert set(created_on_by_task) == {'1', '2'}, 'Should have 2 audit records'
+            for task_id, created_on in created_on_by_task.items():
+                assert before <= created_on <= after, f'Task {task_id} created_on {created_on} outside the write'
 
         finally:
             job.__exit__(None, None, None)
 
 
 class TestDatetimeParameterTimezones:
-    """Test Job initialization with datetime objects in various timezone configurations."""
+    """Test Job initialization with datetimes in various zones."""
 
     @pytest.mark.parametrize(('label', 'datetime_factory'), [
-        ('naive', lambda: datetime.datetime(2024, 3, 15, 14, 30, 0)),
-        ('utc', lambda: datetime.datetime(2024, 3, 15, 14, 30, 0, tzinfo=datetime.timezone.utc)),
-        ('tokyo', lambda: datetime.datetime(2024, 3, 15, 14, 0, 0, tzinfo=ZoneInfo('Asia/Tokyo'))),
-        ('local', lambda: datetime.datetime(2024, 3, 15, 14, 0, 0, tzinfo=datetime.timezone.utc)),
+        ('naive', lambda: datetime.datetime(2024, 3, 15, 23, 30, 0)),
+        ('utc', lambda: datetime.datetime(2024, 3, 15, 0, 30, 0, tzinfo=datetime.timezone.utc)),
+        ('tokyo', lambda: datetime.datetime(2024, 3, 15, 2, 0, 0, tzinfo=ZoneInfo('Asia/Tokyo'))),
+        ('new_york', lambda: datetime.datetime(2024, 3, 15, 22, 0, 0, tzinfo=ZoneInfo('America/New_York'))),
     ])
     def test_datetime_with_various_timezones(self, postgres, label, datetime_factory):
-        """Verify datetime objects with various timezone configurations are handled correctly.
+        """Verify a datetime date keeps its own wall-clock day.
+
+        Mutation: Job.__init__ converting with astimezone() (local or UTC)
+            before taking .date().
+        Oracle: inputs within three hours of midnight, so converting to UTC
+            or New York lands on the 14th or 16th.
         """
         config = get_coordination_config()
 
-        dt = datetime_factory()
-        job = create_job(f'test-{label}', postgres, config, date=dt)
+        job = create_job(f'test-{label}', postgres, coordination_config=config, date=datetime_factory())
 
-        assert job.tasks.date is not None, f'{label}: Date should be set'
-        assert job.tasks.date.year == 2024, f'{label}: Year should match'
-        assert job.tasks.date.month == 3, f'{label}: Month should match'
-        assert job.tasks.date.day == 15, f'{label}: Day should match'
-
-        job.__enter__()
         try:
-            assert job.am_i_healthy(), f'{label}: Job should be healthy'
+            assert job.tasks.date == datetime.date(2024, 3, 15), f'{label}: date should be 2024-03-15'
         finally:
             job.__exit__(None, None, None)
 
     @clean_tables('Audit')
     def test_datetime_timezone_preserved_in_audit(self, postgres):
-        """Verify timezone information is correctly handled in audit writes.
+        """Verify the audit row stores the job date's own wall-clock day.
+
+        Mutation: Job.__init__ keeping the datetime, so the date column
+            casts it in the America/New_York session.
+        Oracle: Tokyo 10:00 is 21:00 the day before in New York; every
+            case must store 2024-03-15.
         """
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
@@ -452,91 +391,75 @@ class TestDatetimeParameterTimezones:
         ]
 
         for label, dt in test_cases:
-            job = create_job(f'audit-{label}', postgres, coordination_config=config, wait_on_enter=0, date=dt)
-            job.__enter__()
+            job = create_job(f'audit-{label}', postgres, coordination_config=config, date=dt)
 
             try:
-                task = create_task(1)
-                job.tasks._tasks.append((task, datetime.datetime.now(datetime.timezone.utc)))
+                job.tasks._tasks.append((create_task(1), datetime.datetime.now(datetime.timezone.utc)))
                 job.write_audit()
 
                 with postgres.connect() as conn:
                     result = conn.execute(text(f"""
-                        SELECT date, node, task_id, created_on
+                        SELECT date
                         FROM {tables["Audit"]}
                         WHERE node = :node
                     """), {'node': f'audit-{label}'})
-                    audit_record = result.first()
+                    stored_date = result.scalar_one()
 
-                assert audit_record is not None, f'Audit record should exist for {label}'
-
-                stored_date = audit_record[0]
-                assert stored_date.year == 2024, f'Year should match for {label}'
-                assert stored_date.month == 3, f'Month should match for {label}'
-                assert stored_date.day == 15, f'Day should match for {label}'
-
-                logger.info(f'✓ {label}: date stored correctly as {stored_date}')
+                assert stored_date == datetime.date(2024, 3, 15), f'{label}: stored {stored_date}'
 
             finally:
                 job.__exit__(None, None, None)
 
 
 class TestDateConsistency:
-    """Test that self._date is always a date-only object (datetime.date), never datetime."""
+    """Test that the job date is always a plain datetime.date."""
 
     def test_date_none_returns_date_not_datetime(self, postgres):
-        """Verify date=None results in date-only object (datetime.date), not datetime.
+        """Verify date=None gives today's date as a plain date.
+
+        Mutation: Job.__init__ defaulting to datetime.datetime.now() with
+            no .date().
+        Oracle: datetime.date.today() in the test process's zone.
         """
         config = get_coordination_config()
 
-        job = create_job('test-none', postgres, coordination_config=config, wait_on_enter=0, date=None)
+        job = create_job('test-none', postgres, coordination_config=config, date=None)
 
-        assert isinstance(job.tasks.date, datetime.date), \
-                   f'date=None should create date object, got {type(job.tasks.date).__name__}'
-        assert not isinstance(job.tasks.date, datetime.datetime), \
-                   f'date=None should NOT create datetime object, got {type(job.tasks.date).__name__}'
+        try:
+            assert type(job.tasks.date) is datetime.date, \
+                f'date=None should create date object, got {type(job.tasks.date).__name__}'
+            assert job.tasks.date == datetime.date.today()
+        finally:
+            job.__exit__(None, None, None)
 
     def test_all_date_inputs_return_date_type(self, postgres):
-        """Verify all date initialization paths result in date-only objects (datetime.date).
+        """Verify every accepted date input is stored as a plain date.
+
+        Mutation: the isinstance(date, datetime.datetime) branch in
+            Job.__init__ dropped, so a datetime is stored as given; or the
+            type guard narrowed to datetime.datetime, so a plain date raises
+            TypeError.
+        Oracle: type() is datetime.date, which a datetime instance fails;
+            the plain-date case must construct without raising.
         """
         config = get_coordination_config()
 
         test_cases = [
             ('none', None),
-            ('date', datetime.datetime(2024, 3, 15).date()),
+            ('date', datetime.date(2024, 3, 15)),
             ('datetime-naive', datetime.datetime(2024, 3, 15, 10, 0, 0)),
             ('datetime-utc', datetime.datetime(2024, 3, 15, 10, 0, 0, tzinfo=datetime.timezone.utc)),
             ('datetime-tokyo', datetime.datetime(2024, 3, 15, 10, 0, 0, tzinfo=ZoneInfo('Asia/Tokyo'))),
         ]
 
         for label, date_input in test_cases:
-            job = create_job(f'test-{label}', postgres, coordination_config=config, wait_on_enter=0, date=date_input)
+            job = create_job(f'test-{label}', postgres, coordination_config=config, date=date_input)
 
-            assert isinstance(job.tasks.date, datetime.date), \
-                       f'{label}: should create date object, got {type(job.tasks.date).__name__}'
-            assert not isinstance(job.tasks.date, datetime.datetime), \
-                       f'{label}: should NOT create datetime object, got {type(job.tasks.date).__name__}'
-
-            logger.info(f'✓ {label}: correctly creates date object (type={type(job.tasks.date).__name__})')
-
-    def test_date_type_prevents_timezone_issues(self, postgres):
-        """Verify date objects don't have timezone information that could cause issues.
-        """
-        config = get_coordination_config()
-
-        tokyo_dt = datetime.datetime(2024, 3, 15, 23, 0, 0, tzinfo=ZoneInfo('Asia/Tokyo'))
-
-        job = create_job('test-date-only', postgres, coordination_config=config, wait_on_enter=0, date=tokyo_dt)
-
-        assert isinstance(job.tasks.date, datetime.date), 'Should be date-only object'
-        assert not isinstance(job.tasks.date, datetime.datetime), 'Should NOT be datetime object'
-
-        assert job.tasks.date.year == 2024, 'Year should match'
-        assert job.tasks.date.month == 3, 'Month should match'
-        assert job.tasks.date.day == 15, 'Day should preserve input date regardless of timezone'
-
-        assert not hasattr(job.tasks.date, 'tzinfo'), \
-                   'Date objects should not have timezone information'
+            try:
+                assert type(job.tasks.date) is datetime.date, \
+                    f'{label}: should create date object, got {type(job.tasks.date).__name__}'
+            finally:
+                job.__exit__(None, None, None)
 
 
 if __name__ == '__main__':

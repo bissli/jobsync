@@ -15,9 +15,11 @@ This file sets up the test environment with:
 import logging
 import os
 import pathlib
+import socket
 import time
 
 import docker
+import psycopg
 import pytest
 from sqlalchemy import create_engine, text
 
@@ -28,17 +30,38 @@ logger = logging.getLogger(__name__)
 current_path = pathlib.Path(os.path.realpath(__file__)).parent
 
 
+def find_free_port() -> int:
+    """A TCP port on 127.0.0.1 that no process holds at the time of the call.
+
+    Returns
+    -------
+    int
+        Port number the OS picked. Another process may bind it before the
+        caller does.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(('127.0.0.1', 0))
+        return sock.getsockname()[1]
+
+
 @pytest.fixture(scope='module')
 def psql_docker():
-    """Start PostgreSQL Docker container for testing.
+    """Start a PostgreSQL Docker container on a free host port.
+
+    Yields
+    ------
+    int
+        Host port on 127.0.0.1 mapped to the container's 5432, once the
+        server answers a query.
+
+    Raises
+    ------
+    psycopg.OperationalError
+        The server did not answer within 60 seconds. The container is
+        stopped first.
     """
+    port = find_free_port()
     client = docker.from_env()
-    try:
-        existing = client.containers.get('test_postgres')
-        existing.stop()
-        existing.remove()
-    except docker.errors.NotFound:
-        pass
     container = client.containers.run(
         image='postgres:17',
         auto_remove=True,
@@ -48,14 +71,26 @@ def psql_docker():
             'POSTGRES_PASSWORD': 'postgres',
             'TZ': 'America/New_York',
             'PGTZ': 'America/New_York'},
-        name='test_postgres',
-        ports={'5432/tcp': ('127.0.0.1', 5432)},
+        name=f'test_postgres_{port}',
+        ports={'5432/tcp': ('127.0.0.1', port)},
         detach=True,
         remove=True,
     )
-    time.sleep(5)
-    yield
-    container.stop()
+    conninfo = f'host=127.0.0.1 port={port} dbname=jobsync user=postgres password=postgres connect_timeout=2'
+    try:
+        deadline = time.time() + 60
+        while True:
+            try:
+                with psycopg.connect(conninfo) as conn:
+                    conn.execute('select 1')
+                break
+            except psycopg.OperationalError:
+                if time.time() > deadline:
+                    raise
+                time.sleep(0.5)
+        yield port
+    finally:
+        container.stop()
 
 
 def drop_tables(engine, appname: str = 'sync_'):
@@ -105,7 +140,7 @@ def terminate_postgres_connections(engine):
 def postgres(psql_docker):
     """Provide SQLAlchemy engine for PostgreSQL tests.
     """
-    connection_string = 'postgresql+psycopg://postgres:postgres@localhost:5432/jobsync'
+    connection_string = f'postgresql+psycopg://postgres:postgres@127.0.0.1:{psql_docker}/jobsync'
     engine = create_engine(connection_string, pool_pre_ping=True, pool_size=10, max_overflow=5)
 
     create_extensions(engine)
