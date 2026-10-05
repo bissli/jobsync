@@ -22,9 +22,9 @@ JobSync is a Python library for coordinating task processing. Workers automatica
 
 ### Initial Deployment
 
-For **batch workloads** (all tasks known upfront), start all nodes together within the `wait_on_enter` grace period to ensure fair task distribution.
+For **batch workloads** (all tasks known upfront), all nodes start within the `wait_on_enter` grace period, so the task distribution is fair.
 
-1. **Start all nodes simultaneously** (or within the grace period):
+1. **All nodes start together** (or within the grace period):
 ```bash
 # Terminal 1
 python worker.py --node-name worker-01
@@ -36,53 +36,53 @@ python worker.py --node-name worker-02
 python worker.py --node-name worker-03
 ```
 
-2. **Verify registration**:
+2. **Registration check**:
 ```sql
 SELECT * FROM sync_node ORDER BY created_on;
 ```
 
-3. **Verify token distribution**:
+3. **Token distribution check**:
 ```sql
 SELECT node, COUNT(*) FROM sync_token GROUP BY node;
 ```
 
-4. **Verify task distribution** (for batch jobs):
+4. **Task distribution check** (for batch jobs):
 ```sql
 SELECT node, COUNT(*) FROM sync_claim GROUP BY node;
 ```
 
-**For streaming workloads** (tasks arrive continuously), startup order doesn't matter - new tasks automatically distribute to all nodes.
+**For streaming workloads** (tasks arrive continuously), startup order has no effect: new tasks distribute to all nodes.
 
 ### Rolling Update
 
-1. Start new nodes with updated code
-2. Wait for token redistribution (~60 seconds)
-3. Stop old nodes gracefully (SIGTERM)
-4. System automatically rebalances
+1. New nodes start with the updated code
+2. Token redistribution completes (~60 seconds)
+3. Old nodes stop on SIGTERM
+4. The cluster rebalances
 
 ### Scaling
 
-**Add nodes:** Just start them - automatic rebalancing
-**Remove nodes:** Stop gracefully (SIGTERM) - automatic rebalancing
-**Rule:** Always use SIGTERM, never SIGKILL
+**Adding nodes:** A started node joins and the cluster rebalances
+**Removing nodes:** A node stopped with SIGTERM leaves and the cluster rebalances
+**Rule:** SIGTERM is the stop signal. SIGKILL skips the node's cleanup, so its row stays until the leader's dead-node sweep removes it
 
 ## Monitoring
 
 ### Key Metrics
 
-Monitor these metrics for cluster health:
+Cluster health metrics:
 
-| Metric | Expected | Alert If |
-|--------|----------|----------|
-| Active nodes | Match cluster size | Count != expected |
-| Token balance | ±10% across nodes | Node has <10% or >50% |
-| Heartbeat lag | <10 seconds | Any node >10s |
-| Rebalance frequency | <1 per hour | >5 per hour |
-| Leader changes | Rare | Changed in last 5 min |
+| Metric              | Expected           | Alert If              |
+| ------------------- | ------------------ | --------------------- |
+| Active nodes        | Match cluster size | Count != expected     |
+| Token balance       | ±10% across nodes  | Node has <10% or >50% |
+| Heartbeat lag       | <10 seconds        | Any node >10s         |
+| Rebalance frequency | <1 per hour        | >5 per hour           |
+| Leader changes      | Rare               | Changed in last 5 min |
 
 ### SQL Queries
 
-See [Cheatsheet.sql](Cheatsheet.sql) for complete reference.
+[CheatSheet.sql](CheatSheet.sql) holds the complete reference.
 
 **Active nodes:**
 ```sql
@@ -113,19 +113,19 @@ SELECT COUNT(*) FROM sync_token WHERE node = 'worker-01';
 ```
 
 **Causes:**
-- Node joined after distribution (wait 30-60s for rebalance)
-- All tokens locked to other nodes (check `sync_lock` table)
-- Token version mismatch (restart node)
+- Node joined after distribution (a rebalance follows within 30-60s)
+- All tokens locked to other nodes (the `sync_lock` table shows them)
+- Token version mismatch (a node restart clears it)
 
 ### Tasks processed twice
 
 **Causes:**
 - Coordination disabled (`coordination_config=None`)
-- Network partition (check connectivity)
+- Network partition (connectivity)
 
 **Fix:**
-- Verify `CoordinationConfig` passed to Job
-- Check all nodes can reach database
+- A `CoordinationConfig` is passed to `Job`
+- Every node can reach the database
 
 ### Constant rebalancing
 
@@ -136,20 +136,20 @@ WHERE triggered_at > NOW() - INTERVAL '1 hour';
 ```
 
 **Causes (if >5 per hour):**
-- Nodes crashing (check logs)
-- Heartbeat timeout too short (increase to 30s)
-- Resource starvation (check CPU/memory)
+- Nodes crashing (the logs show it)
+- Heartbeat timeout too short (30s is a safer value)
+- Resource starvation (CPU or memory)
 
 ### Orphaned locks
 
-**Find them:**
+**Query:**
 ```sql
 SELECT * FROM sync_lock l
 LEFT JOIN sync_node n ON l.created_by = n.name
 WHERE n.name IS NULL;
 ```
 
-**Remove them:**
+**Removal:**
 ```python
 with Job('admin', coordination_config=coord_config) as job:
     job.clear_locks_by_creator('old-worker-name')
@@ -185,21 +185,21 @@ VACUUM ANALYZE sync_token;
 VACUUM ANALYZE sync_lock;
 ```
 
-Run weekly or when tables grow large.
+A weekly run, or one when tables grow large, suffices.
 
 ## Performance Tuning
 
-See [Usage Guide - Configuration](USAGE_GUIDE.md#configuration) for tuning parameters.
+The [Usage Guide - Configuration](USAGE_GUIDE.md#configuration) covers the tuning parameters.
 
 **Common scenarios:**
 
-| Scenario | Recommended Settings |
-|----------|---------------------|
-| Default (2-10 nodes) | Use defaults |
-| Large cluster (10+) | `total_tokens=50000`, `heartbeat_interval_sec=3` |
-| Stable cluster | `heartbeat_timeout_sec=30`, `rebalance_check_interval_sec=60` |
-| High churn (K8s) | `heartbeat_interval_sec=3`, `heartbeat_timeout_sec=9` |
+| Scenario             | Recommended Settings                                          |
+| -------------------- | ------------------------------------------------------------- |
+| Default (2-10 nodes) | Defaults                                                      |
+| Large cluster (10+)  | `total_tokens=50000`, `heartbeat_interval_sec=3`              |
+| Stable cluster       | `heartbeat_timeout_sec=30`, `rebalance_check_interval_sec=60` |
+| High churn (K8s)     | `heartbeat_interval_sec=3`, `heartbeat_timeout_sec=9`         |
 
 ---
 
-For usage examples and detailed API reference, see the [Usage Guide](USAGE_GUIDE.md).
+The [Usage Guide](USAGE_GUIDE.md) covers usage examples and the detailed API reference.

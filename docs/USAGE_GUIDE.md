@@ -47,7 +47,7 @@ with Job('worker-01', coordination_config=coord_config,
     for task_id in get_pending_tasks():
         task = Task(task_id)
         
-        # Only process if this task belongs to our tokens
+        # Only process if this task belongs to this node's tokens
         if job.can_claim_task(task):
             job.add_task(task)
             process_task(task_id)
@@ -55,7 +55,9 @@ with Job('worker-01', coordination_config=coord_config,
     job.write_audit()
 ```
 
-**Note for Batch Workloads**: If all tasks exist upfront (not streaming), set `minimum_nodes` to your expected cluster size and use an appropriate `wait_on_enter` grace period. The full grace period always completes to allow all nodes time to register, ensuring fair distribution - otherwise early-starting nodes claim all tasks before late joiners arrive.
+**Batch Workloads**: When all tasks exist upfront, `minimum_nodes` is the expected cluster size and `wait_on_enter` is a grace period long enough for every node to register. The full grace period always completes, so every node has time to register before distribution. Without it, early-starting nodes claim all tasks before late joiners arrive.
+
+**Database Errors**: After `__enter__` returns, a database error (a brief Postgres disconnect, restart or failover) inside `add_task`, `set_claim`, `write_audit`, `get_audit` or `get_active_nodes` logs a warning and returns a default. `add_task` leaves the task out of the audit when its claim cannot be written, `write_audit` keeps its queue for the next call, and `get_audit` and `get_active_nodes` return an empty list. `list_locks`, `clear_locks_by_creator`, `clear_all_locks`, `get_dead_nodes` and `get_coordination_status` raise the database error.
 
 ### Without Coordination
 
@@ -72,7 +74,7 @@ with Job('worker-01', coordination_config=None) as job:
 
 ### CoordinationConfig Parameters
 
-All timing parameters have sensible defaults. Only customize when needed.
+Every timing parameter has a working default. Most deployments change only the database settings.
 
 ```python
 coord_config = CoordinationConfig(
@@ -95,22 +97,22 @@ coord_config = CoordinationConfig(
 )
 ```
 
-**Critical for Batch Workloads**: Set `minimum_nodes` to your expected cluster size (e.g., 7 for a 7-node deployment) and use `wait_on_enter=60` (or higher for slow startups). The full grace period always completes to allow all nodes time to register, preventing early nodes from claiming all tasks before the cluster forms.
+**Critical for Batch Workloads**: `minimum_nodes` is the expected cluster size (e.g., 7 for a 7-node deployment) and `wait_on_enter` is 60 or higher for slow startups. The full grace period always completes, so every node has time to register before early nodes could claim all tasks.
 
 **Common Tuning Scenarios:**
 
-| Scenario | total_tokens | minimum_nodes | wait_on_enter | heartbeat_interval_sec | heartbeat_timeout_sec |
-|----------|--------------|---------------|---------------|------------------------|----------------------|
-| Default (2-10 nodes) | 10000 | 1 | 120 | 5 | 15 |
-| Batch workload (all tasks upfront) | 10000 | N (cluster size) | 60-120 | 5 | 15 |
-| Large cluster (10+ nodes) | 50000 | N (cluster size) | 120 | 3 | 10 |
-| Stable cluster | 10000 | 1 | 120 | 10 | 30 |
-| High churn (K8s/spot) | 10000 | 1 | 60 | 3 | 9 |
-| Testing/dev | 1000-5000 | 1 | 30 | 5 | 15 |
+| Scenario                           | total_tokens | minimum_nodes    | wait_on_enter | heartbeat_interval_sec | heartbeat_timeout_sec |
+| ---------------------------------- | ------------ | ---------------- | ------------- | ---------------------- | --------------------- |
+| Default (2-10 nodes)               | 10000        | 1                | 120           | 5                      | 15                    |
+| Batch workload (all tasks upfront) | 10000        | N (cluster size) | 60-120        | 5                      | 15                    |
+| Large cluster (10+ nodes)          | 50000        | N (cluster size) | 120           | 3                      | 10                    |
+| Stable cluster                     | 10000        | 1                | 120           | 10                     | 30                    |
+| High churn (K8s/spot)              | 10000        | 1                | 60            | 3                      | 9                     |
+| Testing/dev                        | 1000-5000    | 1                | 30            | 5                      | 15                    |
 
-### Choosing Token Count
+### Token Count
 
-**What Are Tokens?**
+**Tokens**
 
 Tokens are the fundamental unit of work distribution in JobSync. Each task is hashed to a specific token, and nodes claim tasks based on which tokens they own.
 
@@ -122,7 +124,7 @@ Higher token counts reduce variance in task distribution across nodes:
 
 **The Formula**
 
-For production workloads, use a 10:1 ratio of tokens to tasks:
+Production workloads take a 10:1 ratio of tokens to tasks:
 
 ```
 total_tokens = max(expected_tasks × 10, expected_nodes × 100, 10000)
@@ -131,7 +133,7 @@ total_tokens = max(expected_tasks × 10, expected_nodes × 100, 10000)
 **Lookup Table (Recommended Tokens by Task Count and Node Count)**
 
 | Expected Tasks | 2 Nodes | 5 Nodes | 10 Nodes | 20 Nodes | 50 Nodes |
-| -------------: | ------: | ------: | -------: | -------: | -------: |
+| --------------: | -------: | -------: | --------: | --------: | --------: |
 | 1,000          | 10,000  | 10,000  | 10,000   | 10,000   | 10,000   |
 | 2,500          | 25,000  | 25,000  | 25,000   | 25,000   | 25,000   |
 | 5,000          | 50,000  | 50,000  | 50,000   | 50,000   | 50,000   |
@@ -141,19 +143,19 @@ total_tokens = max(expected_tasks × 10, expected_nodes × 100, 10000)
 
 **Key Insight**: With a 10:1 token-to-task ratio, node count has minimal impact on the recommended token count. The task count dominates the calculation in all practical scenarios.
 
-**When to Use Lower Token Counts**
+**Lower Token Counts**
 
-You can use fewer tokens (1,000-5,000) for:
-- **Testing/development environments**: Reduces database rows for easier inspection
+Fewer tokens (1,000-5,000) suit:
+- **Testing/development environments**: Fewer database rows for easier inspection
 - **Very stable workloads**: Where task distribution variance is acceptable
 - **Single-node deployments**: Token count is irrelevant without coordination
 
-**When to Use Higher Token Counts**
+**Higher Token Counts**
 
-Always use 10,000+ tokens for:
-- **Production deployments**: Ensures consistent task distribution
+10,000 or more tokens suit:
+- **Production deployments**: Consistent task distribution
 - **Batch workloads**: Where uneven distribution is immediately visible
-- **Not sure**: Use default 10,000 tokens
+- **Unknown workloads**: The default of 10,000 tokens
 
 **Performance Considerations**
 
@@ -176,18 +178,18 @@ coord_config = CoordinationConfig(
 **Available Options:**
 - **`double_sha256`** (default): Best distribution quality, recommended for production
 - **`sha256`**: Good distribution, moderate variance
-- **`md5`**: Fastest but higher variance, not recommended for production
+- **`md5`**: Fastest but higher variance, unsuited to production
 
-**When to Change:**
-- Default (`double_sha256`) is recommended for all production workloads
-- Only change if you have specific performance requirements or constraints
-- See docstrings in `src/jobsync/client.py` for detailed performance characteristics
+**Choice:**
+- The default (`double_sha256`) suits all production workloads
+- A different function suits only a specific performance requirement or constraint
+- The docstrings in `src/jobsync/client.py` describe each function's distribution quality
 
-**Impact:** Hash function determines which token owns each task. Changing this after locks are registered will invalidate existing lock mappings, as task IDs will hash to different tokens.
+**Impact:** The hash function determines which token owns each task. A change after locks are registered invalidates the existing lock mappings, because task ids hash to different tokens.
 
 ## Task Locking
 
-Lock specific tasks to specific nodes using pattern matching with ordered fallback support.
+Locks pin specific tasks to specific nodes by pattern matching with ordered fallback.
 
 ### Basic Lock Usage
 
@@ -230,6 +232,18 @@ def register_locks_with_fallback(job):
     )
 ```
 
+### Token Collisions
+
+Two task ids can hash to one token. A lock whose token another task's active lock holds with different patterns is not stored, and a warning names both tasks. A lock with the same patterns as the existing one is stored. A task re-registering its own unchanged patterns renews its lock.
+
+### Bulk Registration
+
+For many locks, `register_locks_bulk` reads the Lock table once, while each `register_lock` call reads the whole table. A loop of `register_lock` calls therefore grows with the square of the lock count.
+
+### Registration Errors
+
+Inside `lock_provider`, which runs before `__enter__` finishes, a database error, patterns JSON cannot encode, or a bulk tuple without three items raises, so startup fails and cleans up. After `__enter__` returns, the same errors log a warning and store nothing.
+
 ### Lock Lifecycle
 
 **Dynamic locks** (logic changes each run):
@@ -260,17 +274,18 @@ with Job('worker-01', coordination_config=coord_config,
 
 ## Long-Running Tasks
 
-For WebSockets, subscriptions, or continuous processing, use the `on_rebalance` callback:
+For WebSockets, subscriptions, or continuous processing, the `on_rebalance` callback reports each token change:
 
 ```python
 def on_rebalance():
     """Called when cluster membership changes or tokens are rebalanced.
     
-    Re-evaluate which tasks this node should be processing and update
-    subscriptions, connections, or other long-running resources accordingly.
+    The callback re-evaluates which tasks this node should be processing
+    and updates subscriptions, connections, or other long-running
+    resources accordingly.
     """
     current_tokens = job.my_tokens
-    # Update your subscriptions/connections based on new token ownership
+    # Update subscriptions/connections from the new token ownership
     logger.info(f'Rebalance: now own {len(current_tokens)} tokens')
 
 with Job('worker-01', coordination_config=coord_config,
@@ -281,9 +296,9 @@ with Job('worker-01', coordination_config=coord_config,
 
 **Callback rules:**
 - Called on initial token assignment and whenever cluster membership changes
-- Must complete quickly (<1 second) or delegate work to background threads
-- Always handle exceptions - don't let callback failures crash the node
-- Use `job.my_tokens` to determine current token ownership
+- Completes quickly (<1 second), or hands its work to a background thread
+- An exception the callback raises is logged and never crashes the node, so the callback handles its own errors to keep its resources consistent
+- `job.my_tokens` holds the current token ownership
 
 ## Monitoring
 
@@ -301,7 +316,7 @@ def health():
 
 ### Useful SQL Queries
 
-See [Cheatsheet.sql](Cheatsheet.sql) for a complete reference.
+[CheatSheet.sql](CheatSheet.sql) holds the complete reference.
 
 **Active nodes:**
 ```sql
@@ -323,17 +338,17 @@ ORDER BY created_on LIMIT 1;
 
 ## Best Practices
 
-1. **Use graceful shutdown** - Always handle SIGTERM properly
-2. **Make processing idempotent** - Tasks might be retried if node fails
-3. **Use bulk lock registration** - More efficient than individual calls
-4. **Use descriptive node names** - Include region, hostname, or instance ID
-5. **Document lock reasons** - Explain why tasks are pinned
-6. **Use clear_existing_locks=True for dynamic locks** - Prevents stale locks
-7. **Keep on_rebalance callback fast** - Delegate heavy work to background threads
-8. **Handle callback exceptions** - Don't let callback failures crash the node
-9. **Monitor rebalance frequency** - >5/hour indicates instability
-10. **Test in staging first** - Use same node count and timing as production
+1. **Graceful shutdown** - The worker handles SIGTERM and leaves the `Job` context
+2. **Idempotent processing** - A task might be retried when a node fails
+3. **Bulk lock registration** - More efficient than individual calls
+4. **Descriptive node names** - Region, hostname, or instance ID in the name
+5. **Documented lock reasons** - The reason says why the task is pinned
+6. **`clear_existing_locks=True` for dynamic locks** - Prevents stale locks
+7. **Fast `on_rebalance` callback** - Heavy work goes to a background thread
+8. **Callback error handling** - A callback failure is logged and never crashes the node
+9. **Rebalance frequency monitoring** - >5/hour indicates instability
+10. **Staging mirrors production** - Same node count and timing as production
 
 ---
 
-For operational procedures, troubleshooting, and production maintenance, see the [Operator Guide](OPERATOR_GUIDE.md).
+The [Operator Guide](OPERATOR_GUIDE.md) covers operational procedures, troubleshooting, and production maintenance.
