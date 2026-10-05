@@ -1,4 +1,4 @@
-__version__ = '1.3.10'
+__version__ = '1.3.11'
 
 from jobsync.client import CoordinationConfig as CoordinationConfig
 from jobsync.client import Job as Job
