@@ -150,6 +150,131 @@ where task_id = :task_id
         assert patterns == ['pattern-2'], \
             'Second pattern should replace first (DO UPDATE)'
 
+    @clean_tables('Lock')
+    @pytest.mark.parametrize(
+        ('second_patterns', 'first_expired', 'expect_stored'),
+        [
+            (['other-%'], False, False),
+            (['special-%'], False, True),
+            (['other-%'], True, True),
+            ])
+    def test_register_lock_refuses_token_collision_with_other_patterns(
+            self, postgres, jobs_to_exit, caplog, second_patterns, first_expired,
+            expect_stored):
+        """Verify a lock on an already locked token is stored only on agreement.
+
+        Mutation: register_lock storing a lock whose token another task
+            locks with different patterns, refusing one with the same
+            patterns, or letting an expired lock block the token.
+        Oracle: the user's decision for this change; refuse a differing
+            lock with a warning naming both tasks, the token and both
+            pattern lists, and store a same-pattern lock as before. The
+            register_lock docstring limits the check to another task's
+            active lock.
+        """
+        config = get_coordination_config(total_tokens=4)
+        tables = schema.get_table_names(config.appname)
+        locks_sql = f'select task_id, node_patterns from {tables["Lock"]}'
+        job = create_job('node1', postgres, coordination_config=config, wait_on_enter=0)
+        jobs_to_exit.append(job)
+
+        first_task = 'task-0'
+        token_id = job.task_to_token(first_task)
+        second_task = next(
+            f'task-{i}' for i in range(1, 100)
+            if job.task_to_token(f'task-{i}') == token_id)
+        if first_expired:
+            yesterday = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)
+            insert_lock(postgres, tables, first_task, ['special-%'], expires_at=yesterday)
+        else:
+            job.register_lock(first_task, ['special-%'], 'first')
+
+        with caplog.at_level(logging.WARNING, logger='jobsync.client'):
+            job.register_lock(second_task, second_patterns, 'second')
+
+        with postgres.connect() as conn:
+            result = conn.execute(text(locks_sql))
+            stored = {row[0]: row[1] for row in result}
+
+        expected = {first_task: ['special-%']}
+        if expect_stored:
+            expected[second_task] = second_patterns
+        if first_expired:
+            stored.pop(first_task, None)
+            expected.pop(first_task)
+        assert stored == expected
+
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+            ]
+        if expect_stored:
+            assert warnings == []
+        else:
+            assert len(warnings) == 1, warnings
+            facts = [
+                first_task,
+                second_task,
+                str(token_id),
+                "['special-%']",
+                "['other-%']",
+                ]
+            for fact in facts:
+                assert fact in warnings[0], f'{fact!r} missing from {warnings[0]!r}'
+
+    @clean_tables('Lock')
+    def test_register_locks_bulk_skips_only_colliding_entries(
+            self, postgres, jobs_to_exit, caplog):
+        """Verify bulk registration skips entries colliding with any earlier lock.
+
+        Mutation: register_locks_bulk checking only the stored locks and not
+            earlier entries of its own batch, skipping the whole batch on one
+            collision, or refusing a same-pattern entry.
+        Oracle: the user's decision for this change; per entry, a differing
+            lock on an already locked token is skipped with a warning, and
+            every other entry is stored.
+        """
+        config = get_coordination_config(total_tokens=4)
+        tables = schema.get_table_names(config.appname)
+        locks_sql = f'select task_id, node_patterns from {tables["Lock"]}'
+        job = create_job('node1', postgres, coordination_config=config, wait_on_enter=0)
+        jobs_to_exit.append(job)
+
+        tasks_by_token = {}
+        for i in range(200):
+            task_id = f'task-{i}'
+            tasks_by_token.setdefault(job.task_to_token(task_id), []).append(task_id)
+        stored_token, batch_token = sorted(tasks_by_token)[:2]
+        stored_a, batch_b, batch_c = tasks_by_token[stored_token][:3]
+        batch_d, batch_e = tasks_by_token[batch_token][:2]
+
+        job.register_lock(stored_a, ['special-%'], 'stored')
+
+        with caplog.at_level(logging.WARNING, logger='jobsync.client'):
+            job.register_locks_bulk([
+                (batch_b, ['other-%'], 'collides with stored lock'),
+                (batch_c, ['special-%'], 'same patterns as stored lock'),
+                (batch_d, ['east-%'], 'first on its token'),
+                (batch_e, ['west-%'], 'collides with batch entry'),
+                ])
+
+        with postgres.connect() as conn:
+            result = conn.execute(text(locks_sql))
+            stored = {row[0]: row[1] for row in result}
+
+        assert stored == {
+            stored_a: ['special-%'],
+            batch_c: ['special-%'],
+            batch_d: ['east-%'],
+            }
+        warnings = [
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+            ]
+        assert len(warnings) == 2, warnings
+        assert batch_b in warnings[0]
+        assert stored_a in warnings[0]
+        assert batch_e in warnings[1]
+        assert batch_d in warnings[1]
+
 
 class TestConcurrentLockRegistration:
     """Test concurrent lock registration from multiple nodes.
@@ -441,9 +566,12 @@ class TestLockListing:
             no warning, or warning even when both locks name the same
             patterns.
         Oracle: get_active_locks returns one pattern list per token, so of
-            two tasks hashing to one token only one lock can apply.
+            two tasks hashing to one token only one lock can apply. The rows
+            are inserted directly, since register_lock refuses the
+            differing pair.
         """
         config = get_coordination_config(total_tokens=4)
+        tables = schema.get_table_names(config.appname)
         job = create_job('node1', postgres, coordination_config=config, wait_on_enter=0)
         jobs_to_exit.append(job)
 
@@ -451,8 +579,8 @@ class TestLockListing:
         second_task = next(
             f'task-{i}' for i in range(1, 100)
             if job.task_to_token(f'task-{i}') == job.task_to_token(first_task))
-        job.register_lock(first_task, ['special-%'], 'first')
-        job.register_lock(second_task, second_patterns, 'second')
+        insert_lock(postgres, tables, first_task, ['special-%'], reason='first')
+        insert_lock(postgres, tables, second_task, second_patterns, reason='second')
 
         with caplog.at_level(logging.WARNING, logger='jobsync.client'):
             locked_tokens = job.locks.get_active_locks()

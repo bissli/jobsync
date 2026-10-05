@@ -604,6 +604,39 @@ class TestErrorStateTransitions:
         assert bool(error_visits) is expect_error_visit
         assert job.state_machine.state == JobState.SHUTTING_DOWN
 
+    def test_refused_distributions_republish_one_retry_per_type(self, monkeypatch):
+        """Verify a batch of refused distributions leaves one retry per type.
+
+        Mutation: each refused membership_changed republished on its own, a
+            refused dead_nodes_detected dropped, or a distribution attempted
+            again in the batch after a refusal.
+        Oracle: the user's spec for this change; one retry per event type
+            per batch, and no further attempt in a batch after a refusal.
+            A stub records each attempt and refuses it.
+        """
+        job = Job('node1')
+        job.state_machine.state = JobState.RUNNING_LEADER
+        attempts = []
+
+        def refusing_distribute(trigger_reason='distribution'):
+            attempts.append(trigger_reason)
+            return False
+
+        monkeypatch.setattr(job, '_distribute_tokens_safe', refusing_distribute)
+
+        for current_count in (2, 3, 4):
+            job._event_queue.publish(
+                'membership_changed',
+                {'previous_count': 1, 'current_count': current_count})
+        job._event_queue.publish('dead_nodes_detected', {'nodes': ['ghost-1']})
+        job._event_queue.publish('dead_nodes_detected', {'nodes': ['ghost-2']})
+
+        job._coordinate_state_transitions()
+
+        assert attempts == ['membership_change']
+        retry_types = [event.type for event in job._event_queue.consume_all()]
+        assert retry_types == ['membership_changed', 'dead_nodes_detected']
+
 
 class TestTransitionValidation:
     """Test transition validation logic.

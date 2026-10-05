@@ -19,8 +19,8 @@ from fixtures import *  # noqa: F401, F403
 from sqlalchemy import text
 
 from jobsync import schema
-from jobsync.client import CoordinationConfig, DeadNodeMonitor, JobState
-from jobsync.client import LockNotAcquired, RebalanceMonitor, Task
+from jobsync.client import CoordinationConfig, DeadNodeMonitor, EventQueue
+from jobsync.client import JobState, LockNotAcquired, RebalanceMonitor, Task
 
 
 def test_3node_cluster_formation(postgres):
@@ -399,7 +399,7 @@ class TestCleanupFailureScenarios:
                 text(f'select node, task_id from {tables["Audit"]}')).all()
 
         assert (sorted(tuple(row) for row in audit_rows)
-            == [('node1', '1'), ('node1', '2')]), \
+                == [('node1', '1'), ('node1', '2')]), \
             f'Both pending tasks should be audited once, got {audit_rows}'
 
     @clean_tables('Audit')
@@ -1419,12 +1419,12 @@ class TestTokenDistributionUnderContention:
                 unlocked_count_by_node[node] = unlocked_count_by_node.get(node, 0) + 1
 
             assert ({assignments.get(token_id) for token_id in range(10)}
-                == {'special-node'}), \
+                    == {'special-node'}), \
                 'Tokens locked to special-% should all go to special-node'
             assert not set(range(10, 20)) & set(assignments), \
                 'Tokens locked to missing-% should stay unowned'
             assert (unlocked_count_by_node
-                == {'node1': 10, 'node2': 10, 'special-node': 10}), \
+                    == {'node1': 10, 'node2': 10, 'special-node': 10}), \
                 f'Unlocked tokens should split evenly, got {unlocked_count_by_node}'
         finally:
             job.__exit__(None, None, None)
@@ -1591,7 +1591,7 @@ class TestDeadNodeTokenRedistribution:
                 audit_rows = list(result)
 
             assert ({row[1] for row in audit_rows}
-                == {str(task_id) for task_id in range(30)}), \
+                    == {str(task_id) for task_id in range(30)}), \
                 'Survivors should audit every task'
             assert {row[0] for row in audit_rows} <= {'node1', 'node3'}, \
                 'Only survivors should audit tasks'
@@ -2179,7 +2179,7 @@ class TestLateNodeJoining:
                     node.node_name: len(node.my_tokens) for node in nodes_with_4
                     }
                 assert (final_distribution
-                    == {'node1': 25, 'node2': 25, 'node3': 25, 'node4': 25}), \
+                        == {'node1': 25, 'node2': 25, 'node3': 25, 'node4': 25}), \
                     f'Unexpected final distribution {final_distribution}'
 
                 with postgres.connect() as conn:
@@ -2256,6 +2256,51 @@ class TestLateNodeJoining:
         finally:
             node1.__exit__(None, None, None)
 
+    @clean_tables('Node')
+    def test_rebalance_monitor_detects_leave_and_join_between_checks(self, postgres):
+        """Verify one node leaving and another joining between checks publishes.
+
+        Mutation: RebalanceMonitor.check comparing only the live node count,
+            so {a, b, c} -> {a, b, d} reads as 3 -> 3 and publishes nothing,
+            or never moving its baseline, so the same swap publishes again.
+        Oracle: docs/OPERATOR_GUIDE.md, tokens are redistributed
+            automatically on membership changes; swapping c for d changes
+            the membership while the count stays 3.
+        """
+        config = get_coordination_config()
+        tables = schema.get_table_names(config.appname)
+        watcher = create_job('watcher', postgres, coordination_config=config)
+
+        for name in ('node-a', 'node-b', 'node-c'):
+            insert_active_node(postgres, tables, name)
+
+        event_queue = EventQueue()
+        monitor = RebalanceMonitor(
+            node_name='node-a',
+            db=watcher.db,
+            cluster=watcher.cluster,
+            event_queue=event_queue,
+            shutdown_event=threading.Event())
+
+        try:
+            monitor.check()
+            assert event_queue.consume_all() == [], \
+                'Unchanged membership should not publish'
+
+            delete_rows(postgres, tables, 'Node', 'name = :name', {'name': 'node-c'})
+            insert_active_node(postgres, tables, 'node-d')
+            monitor.check()
+
+            events = event_queue.consume_all()
+            assert [event.type for event in events] == ['membership_changed']
+            assert events[0].data == {'previous_count': 3, 'current_count': 3}
+
+            monitor.check()
+            assert event_queue.consume_all() == [], \
+                'A membership change already published should not publish again'
+        finally:
+            watcher.db.dispose()
+
     @clean_tables('Node', 'Token', 'Inst')
     def test_late_node_can_claim_tasks_immediately(self, postgres):
         """Verify a late node claims exactly its own tasks after __enter__.
@@ -2297,7 +2342,7 @@ class TestLateNodeJoining:
 
                 assert node3_db_tokens, 'node3 should own tokens after __enter__'
                 assert (claimed_by_node3
-                    == {task_ids[token_id] for token_id in node3_db_tokens}), \
+                        == {task_ids[token_id] for token_id in node3_db_tokens}), \
                     'node3 should claim exactly the tasks on its own tokens'
 
                 all_nodes = initial_nodes + [node3]
@@ -2364,7 +2409,7 @@ class TestLateNodeJoining:
 
                 final_dist = {node.node_name: len(node.my_tokens) for node in all_nodes}
                 assert (final_dist
-                    == {'node1': 25, 'node2': 25, 'node3': 25, 'node4': 25}), \
+                        == {'node1': 25, 'node2': 25, 'node3': 25, 'node4': 25}), \
                     f'Unexpected final distribution {final_dist}'
 
                 with postgres.connect() as conn:
@@ -2493,14 +2538,14 @@ class TestFollowerTimeoutBugFix:
             assert isinstance(node1_exception[0], TimeoutError), \
                 f'Node1 should get TimeoutError, got {type(node1_exception[0]).__name__}'
             assert ('Minimum nodes (10) not reached after 5s grace period'
-                in str(node1_exception[0])), \
+                    in str(node1_exception[0])), \
                 f'Node1 should timeout after wait_on_enter: {node1_exception[0]}'
 
             assert len(node2_exception) == 1, 'Node2 should have exception'
             assert isinstance(node2_exception[0], TimeoutError), \
                 f'Node2 should get TimeoutError, got {type(node2_exception[0]).__name__}'
             assert ('Minimum nodes (10) not reached after 5s grace period'
-                in str(node2_exception[0])), \
+                    in str(node2_exception[0])), \
                 f'Node2 should timeout after wait_on_enter: {node2_exception[0]}'
         finally:
             node1.__exit__(None, None, None)

@@ -148,7 +148,7 @@ class CoordinationConfig:
     heartbeat_timeout_sec : int, default 15
         Seconds without a heartbeat before a node counts as dead.
     rebalance_check_interval_sec : int, default 30
-        Seconds between the leader's live node counts.
+        Seconds between the leader's checks of the live node names.
     dead_node_check_interval_sec : int, default 10
         Seconds between the leader's dead node sweeps.
     token_refresh_initial_interval_sec : int, default 5
@@ -1448,7 +1448,8 @@ class LockManager:
         self,
         node_name: str,
         db: DatabaseContext,
-        coord_config: CoordinationConfig
+        coord_config: CoordinationConfig,
+        shutdown_event: threading.Event
     ) -> None:
         """Bind task locks and coordination locks to one node.
 
@@ -1460,9 +1461,13 @@ class LockManager:
             Shared database context.
         coord_config : CoordinationConfig
             Supplies token count, hash function and lock timeouts.
+        shutdown_event : threading.Event
+            Once set, the leader lock is never acquired, and a wait for it
+            ends at once.
         """
         self.node_name = node_name
         self.db = db
+        self.shutdown_event = shutdown_event
         self.total_tokens = coord_config.total_tokens
         self.hash_function = coord_config.hash_function
         self.leader_lock_timeout = coord_config.leader_lock_timeout_sec
@@ -1518,7 +1523,9 @@ set node_patterns = excluded.node_patterns,
             Task to pin, never a token id. Stored as str(task_id), and
             hashed to a token at each distribution.
         node_patterns : str | list[str]
-            SQL LIKE pattern, or fallback patterns tried in order.
+            SQL LIKE pattern, or fallback patterns tried in order. When
+            another task's active lock holds the same token with different
+            patterns, the lock is not stored and a warning is logged.
         reason : str, optional
             Free text stored with the lock.
         expires_in_days : int, optional
@@ -1528,9 +1535,8 @@ set node_patterns = excluded.node_patterns,
             days=expires_in_days) if expires_in_days else None
 
         row = self._build_lock_row(task_id, node_patterns, reason, expires_at)
-        self.db.execute(self._lock_upsert_sql(), row)
-
-        logger.debug(f'Registered lock: task {task_id} -> patterns {row["patterns"]}')
+        if self._store_locks([row]):
+            logger.debug(f'Registered lock: task {task_id} -> patterns {row["patterns"]}')
 
     @log_duration('register_locks_bulk')
     def register_locks_bulk(
@@ -1543,7 +1549,9 @@ set node_patterns = excluded.node_patterns,
         ----------
         locks : list[tuple[Hashable, str | list[str], str]]
             (task_id, node_patterns, reason) per lock. These locks never
-            expire. An empty list does nothing.
+            expire. An empty list does nothing. An entry that collides
+            with a stored lock or an earlier entry, as register_lock
+            defines it, is skipped with a warning.
         """
         if not locks:
             return
@@ -1552,14 +1560,71 @@ set node_patterns = excluded.node_patterns,
             self._build_lock_row(task_id, node_patterns, reason, None)
             for task_id, node_patterns, reason in locks
             ]
+        stored_cnt = self._store_locks(rows)
 
-        sql = self._lock_upsert_sql()
+        logger.debug(f'Registered {stored_cnt}/{len(locks)} locks')
+
+    def _store_locks(self, rows: list[dict]) -> int:
+        """Upsert lock rows in one transaction, skipping each collision.
+
+        A row collides when another task's active lock, stored or earlier
+        in rows, holds the same token with different patterns. The first
+        lock stays, and each skipped row logs a warning.
+
+        Parameters
+        ----------
+        rows : list[dict]
+            Rows from _build_lock_row, checked in order.
+
+        Returns
+        -------
+        int
+            Rows stored.
+        """
+        active_sql = f"""
+select task_id, node_patterns
+from {self.db.tables["Lock"]}
+where expires_at is null or expires_at > now()
+"""
+        stored_cnt = 0
         with self.db.engine.connect() as conn:
-            for row in rows:
-                conn.execute(text(sql), row)
-            conn.commit()
+            patterns_by_task_by_token = {}
+            for task_id, patterns in conn.execute(text(active_sql)):
+                if isinstance(patterns, str):
+                    try:
+                        patterns = json.loads(patterns)
+                    except json.JSONDecodeError:
+                        continue
+                if not isinstance(patterns, list):
+                    continue
+                token_id = task_to_token(task_id, self.total_tokens, self.hash_function)
+                patterns_by_task_by_token.setdefault(token_id, {})[task_id] = patterns
 
-        logger.debug(f'Registered {len(locks)} locks')
+            for row in rows:
+                patterns = json.loads(row['patterns'])
+                token_id = task_to_token(
+                    row['task_id'],
+                    self.total_tokens,
+                    self.hash_function)
+                patterns_by_task = patterns_by_task_by_token.setdefault(token_id, {})
+                conflict = next(
+                    (
+                        (other_task, other_patterns)
+                        for other_task, other_patterns in patterns_by_task.items()
+                        if other_task != row['task_id'] and other_patterns != patterns
+                        ),
+                    None)
+                if conflict is not None:
+                    logger.warning(
+                        f'Lock for task {row["task_id"]} {patterns} not stored: '
+                        f'token {token_id} is locked by task {conflict[0]} '
+                        f'{conflict[1]}')
+                    continue
+                conn.execute(text(self._lock_upsert_sql()), row)
+                patterns_by_task[row['task_id']] = patterns
+                stored_cnt += 1
+            conn.commit()
+        return stored_cnt
 
     def clear_locks_by_creator(self, creator: str) -> int:
         """Delete every lock one node created.
@@ -1677,7 +1742,8 @@ where expires_at is not null and expires_at < now()
         Raises
         ------
         LockNotAcquired
-            The lock stayed out of reach for leader_lock_timeout seconds.
+            The lock stayed out of reach for leader_lock_timeout seconds, or
+            shutdown_event was set.
         """
         if not self._try_acquire_leader_lock(operation):
             raise LockNotAcquired(f'Another leader is performing {operation}')
@@ -1718,10 +1784,12 @@ where expires_at is not null and expires_at < now()
         Returns
         -------
         bool
-            True once acquired. False after the timeout.
+            True once acquired. False after the timeout, or as soon as
+            shutdown_event is set.
         """
         start_time = time.time()
-        while time.time() - start_time < self.leader_lock_timeout:
+        while (time.time() - start_time < self.leader_lock_timeout
+               and not self.shutdown_event.is_set()):
             try:
                 sql = f"""
 insert into {self.db.tables["LeaderLock"]} (singleton, node, acquired_at, operation)
@@ -1748,11 +1816,11 @@ on conflict (singleton) do nothing
                         'leader'):
                         continue
 
-                time.sleep(0.5)
+                self.shutdown_event.wait(0.5)
 
             except Exception as e:
                 logger.error(f'Leader lock acquisition failed: {e}')
-                time.sleep(0.5)
+                self.shutdown_event.wait(0.5)
 
         logger.warning(f'Leader lock acquisition timeout for {self.node_name}')
         return False
@@ -2407,9 +2475,9 @@ class RebalanceMonitor(Monitor):
         cluster: ClusterCoordinator,
         event_queue: EventQueue,
         shutdown_event: threading.Event,
-        initial_node_count: int = None
+        initial_node_names: set[str] = None
     ) -> None:
-        """Watch the live node count at the cluster's rebalance interval.
+        """Watch the live node names at the cluster's rebalance interval.
 
         Parameters
         ----------
@@ -2423,9 +2491,9 @@ class RebalanceMonitor(Monitor):
             Receives 'membership_changed'.
         shutdown_event : threading.Event
             Ends the loop once set.
-        initial_node_count : int, optional
-            Live node count at distribution time, the baseline for the
-            first check. None queries the current count.
+        initial_node_names : set[str], optional
+            Live node names at distribution time, the baseline for the
+            first check. None queries the current names.
         """
         super().__init__(
             f'rebalance-{node_name}',
@@ -2436,32 +2504,37 @@ class RebalanceMonitor(Monitor):
         self.cluster = cluster
         self.event_queue = event_queue
 
-        if initial_node_count is not None:
-            self.last_node_count = initial_node_count
-            logger.info(f'RebalanceMonitor initialized with distribution-time node count: {initial_node_count}')
+        if initial_node_names is not None:
+            self.last_node_names = initial_node_names
+            logger.info(f'RebalanceMonitor initialized with distribution-time node count: {len(initial_node_names)}')
         else:
             with self.db.engine.connect() as conn:
                 result = conn.execute(text(self.cluster.active_nodes_sql))
-                self.last_node_count = len(list(result))
-            logger.info(f'RebalanceMonitor initialized with current node count: {self.last_node_count}')
+                self.last_node_names = {row[0] for row in result}
+            logger.info(f'RebalanceMonitor initialized with current node count: {len(self.last_node_names)}')
 
     def check(self) -> None:
-        """Publish 'membership_changed' when the live node count changes.
+        """Publish 'membership_changed' when the live node names change.
         """
         result = self.db.query(self.cluster.active_nodes_sql)
-        current_count = len(result)
+        current_names = {row[0] for row in result}
+        previous_count = len(self.last_node_names)
+        current_count = len(current_names)
 
-        logger.debug(f'Rebalance check: last={self.last_node_count}, current={current_count}')
+        logger.debug(f'Rebalance check: last={previous_count}, current={current_count}')
 
-        if current_count != self.last_node_count:
-            logger.info(f'Node count changed: {self.last_node_count} -> {current_count}')
+        if current_names != self.last_node_names:
+            logger.info(
+                f'Membership changed: {previous_count} -> {current_count} nodes, '
+                f'left {sorted(self.last_node_names - current_names)}, '
+                f'joined {sorted(current_names - self.last_node_names)}')
             self.event_queue.publish(
                 'membership_changed',
                 {
-                    'previous_count': self.last_node_count,
+                    'previous_count': previous_count,
                     'current_count': current_count,
                     })
-            self.last_node_count = current_count
+            self.last_node_names = current_names
 
 
 class CoordinationMonitor(Monitor):
@@ -2576,7 +2649,11 @@ class Job:
                 coord_cfg,
                 self._created_on)
             self.tokens = TokenDistributor(node_name, self.db, coord_cfg)
-            self.locks = LockManager(node_name, self.db, coord_cfg)
+            self.locks = LockManager(
+                node_name,
+                self.db,
+                coord_cfg,
+                self._shutdown_event)
             self.tasks = TaskManager(
                 node_name,
                 self.db,
@@ -2673,8 +2750,10 @@ class Job:
                 logger.info('This node is the leader, performing token distribution')
 
                 nodes_before_distribution = self.cluster.get_active_nodes()
-                self._nodes_at_distribution = len(nodes_before_distribution)
-                logger.info(f'Node count at distribution: {self._nodes_at_distribution}')
+                self._nodes_at_distribution = {
+                    node['name'] for node in nodes_before_distribution
+                    }
+                logger.info(f'Node count at distribution: {len(self._nodes_at_distribution)}')
                 self._distribute_tokens_safe('initial_distribution')
             else:
                 logger.info(f'Follower node detected, waiting for leader {self._elected_leader} to distribute tokens')
@@ -2712,7 +2791,7 @@ class Job:
             cluster=self.cluster,
             event_queue=self._event_queue,
             shutdown_event=self._shutdown_event,
-            initial_node_count=self._nodes_at_distribution)
+            initial_node_names=self._nodes_at_distribution)
         self._start_monitor('rebalance', rebalance_monitor)
 
     def _on_exit_running_leader(self) -> None:
@@ -2741,12 +2820,19 @@ class Job:
         self._shutdown_event.set()
 
     def _coordinate_state_transitions(self) -> None:
-        """Central coordinator for all state transitions.
+        """Drain the event queue and act on each event, oldest first.
+
+        A distribution refused by a lock held elsewhere is republished, at
+        most once per event type per batch, and the rest of the batch makes
+        no further distribution attempt.
         """
         events = self._event_queue.consume_all()
 
         if events:
             logger.info(f'Processing {len(events)} coordination events: {[e.type for e in events]}')
+
+        distribution_refused = False
+        retried_types = set()
 
         for event in events:
             logger.info(
@@ -2757,6 +2843,7 @@ class Job:
                     'current_state': self.state_machine.state.value,
                     'node_name': self.node_name,
                     })
+            trigger_reason = None
 
             if event.type == 'node_unhealthy':
                 logger.error(f'Node unhealthy: {event.data}')
@@ -2784,14 +2871,24 @@ class Job:
             elif event.type == 'dead_nodes_detected':
                 if self.state_machine.is_leader():
                     logger.info(f'Dead nodes: {event.data.get("nodes")}, rebalancing')
-                    self._distribute_tokens_safe('dead_nodes')
+                    trigger_reason = 'dead_nodes'
 
             elif event.type == 'membership_changed':
                 if self.state_machine.is_leader():
                     data = event.data
                     logger.info(f'Membership: {data.get("previous_count")} -> {data.get("current_count")}')
-                    if not self._distribute_tokens_safe('membership_change'):
-                        self._event_queue.publish(event.type, event.data)
+                    trigger_reason = 'membership_change'
+
+            if trigger_reason is None:
+                continue
+
+            if distribution_refused or not self._distribute_tokens_safe(trigger_reason):
+                distribution_refused = True
+                # A distribution reads the live node list, so one retry
+                # per type covers every refused event of that type.
+                if event.type not in retried_types:
+                    retried_types.add(event.type)
+                    self._event_queue.publish(event.type, event.data)
 
     def _wait_for_enter_time_and_minimum_nodes(self) -> bool:
         """Wait out wait_on_enter, then count the live nodes.
@@ -2823,7 +2920,26 @@ class Job:
         return not len(self._nodes) < target_nodes
 
     def __enter__(self) -> Self:
-        """Enter context and perform coordination setup.
+        """Join the cluster and wait for this node's first tokens.
+
+        Returns
+        -------
+        Self
+            This job. Standalone mode returns at once.
+
+        Raises
+        ------
+        TimeoutError
+            Fewer than minimum_nodes are live after wait_on_enter, or no
+            token arrives within twice token_distribution_timeout_sec.
+        RuntimeError
+            A state transition or the initial distribution failed.
+
+        Notes
+        -----
+        - Before any raise it runs __exit__, wait_on_exit sleep included, so
+          its threads stop and its Node row is gone. A later __exit__ call
+          is harmless.
         """
         if not self._coordination_enabled:
             logger.info(f'Starting {self.node_name} in standalone mode (no coordination)')
@@ -2875,6 +2991,7 @@ class Job:
         except Exception as e:
             logger.error(f'Initialization failed: {e}', exc_info=True)
             self.state_machine.transition_to(JobState.ERROR)
+            self.__exit__(None, None, None)
             raise
 
         return self

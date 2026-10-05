@@ -551,7 +551,7 @@ class TestFollowerJoinDistribution:
 
         Mutation: the membership_changed handler dropping a distribution
             refused by LockNotAcquired after RebalanceMonitor has advanced
-            last_node_count, so no later distribution comes.
+            last_node_names, so no later distribution comes.
         Oracle: docs/OPERATOR_GUIDE.md, tokens are redistributed
             automatically on membership changes; the follower must own a
             token once the outside holder releases the lock.
@@ -627,6 +627,200 @@ where singleton = 1
             follower_thread.join(timeout=25)
             follower.__exit__(None, None, None)
             leader.__exit__(None, None, None)
+
+
+class TestDistributionLockContention:
+    """Distributions refused or delayed by a lock held elsewhere.
+    """
+
+    def test_dead_node_tokens_move_after_rebalance_lock_released(
+        self, postgres, monkeypatch
+    ):
+        """Verify a dead-node rebalance refused by a held lock runs later.
+
+        Mutation: the dead_nodes_detected handler ignoring a False return
+            from _distribute_tokens_safe, so the deleted node keeps its
+            tokens.
+        Oracle: docs/OPERATOR_GUIDE.md, tokens are redistributed
+            automatically on membership changes; DeadNodeMonitor deletes the
+            ghost's Node row, so the ghost must own no token once the outside
+            holder releases the rebalance lock.
+        """
+        config = get_coordination_config(total_tokens=20)
+        tables = schema.get_table_names(config.appname)
+        set_lock_sql = f"""
+update {tables["RebalanceLock"]}
+set in_progress = true, started_at = now(), started_by = 'other-node'
+where singleton = 1
+"""
+        clear_lock_sql = f"""
+update {tables["RebalanceLock"]}
+set in_progress = false, started_at = null, started_by = null
+where singleton = 1
+"""
+        move_tokens_sql = f"""
+update {tables["Token"]}
+set node = 'ghost'
+where token_id < 5
+"""
+
+        def ghost_token_count():
+            return list(get_token_assignments(postgres, tables).values()).count('ghost')
+
+        leader = create_job('dead-leader', postgres, coordination_config=config)
+        leader.__enter__()
+
+        refused = threading.Event()
+        real_try_acquire = leader.locks._try_acquire_rebalance_lock
+
+        def refusing_try_acquire(started_by):
+            if started_by == 'token_distribution' and not refused.is_set():
+                with postgres.connect() as conn:
+                    conn.execute(text(set_lock_sql))
+                    conn.commit()
+                acquired = real_try_acquire(started_by)
+                if not acquired:
+                    refused.set()
+                return acquired
+            return real_try_acquire(started_by)
+
+        monkeypatch.setattr(
+            leader.locks,
+            '_try_acquire_rebalance_lock',
+            refusing_try_acquire)
+
+        try:
+            assert wait_for_state(leader, JobState.RUNNING_LEADER, timeout_sec=5)
+
+            with postgres.connect() as conn:
+                conn.execute(text(move_tokens_sql))
+                conn.commit()
+            insert_stale_node(postgres, tables, 'ghost')
+
+            assert refused.wait(timeout=10), \
+                'Leader should try to rebalance for the dead node and be refused'
+            assert ghost_token_count() == 5
+
+            with postgres.connect() as conn:
+                conn.execute(text(clear_lock_sql))
+                conn.commit()
+
+            assert wait_for(lambda: ghost_token_count() == 0, timeout_sec=8), \
+                f'Deleted ghost should own no token, owns {ghost_token_count()}'
+
+        finally:
+            leader.__exit__(None, None, None)
+
+    def test_exit_interrupts_leader_lock_wait(self, postgres, monkeypatch):
+        """Verify shutdown ends a distribution waiting on the leader lock.
+
+        Mutation: _try_acquire_leader_lock ignoring the job's shutdown
+            event, so the coordination thread waits out
+            leader_lock_timeout_sec past __exit__ and then distributes.
+        Oracle: __exit__ joins each monitor thread for 10s, under the 30s
+            leader_lock_timeout_sec default; once __exit__ has deleted the
+            node's own Node row, no distribution may run.
+        """
+        config = get_coordination_config(total_tokens=20)
+        tables = schema.get_table_names(config.appname)
+
+        leader = create_job('wait-leader', postgres, coordination_config=config)
+        leader.__enter__()
+        exited = False
+
+        waiting = threading.Event()
+        real_try_leader = leader.locks._try_acquire_leader_lock
+
+        def recording_try_leader(operation):
+            waiting.set()
+            return real_try_leader(operation)
+
+        late_distributions = []
+        real_distribute = leader.tokens.distribute
+
+        def recording_distribute(*args, **kwargs):
+            if leader._shutdown_event.is_set():
+                late_distributions.append(args)
+            return real_distribute(*args, **kwargs)
+
+        monkeypatch.setattr(
+            leader.locks,
+            '_try_acquire_leader_lock',
+            recording_try_leader)
+        monkeypatch.setattr(leader.tokens, 'distribute', recording_distribute)
+
+        try:
+            assert wait_for_state(leader, JobState.RUNNING_LEADER, timeout_sec=5)
+            coordination = leader._monitors['coordination']
+
+            insert_leader_lock(postgres, tables, 'other-node', 'outside-hold')
+            insert_active_node(postgres, tables, 'joiner')
+
+            assert waiting.wait(timeout=10), \
+                'Leader should start a distribution for the join'
+
+            start = time.time()
+            leader.__exit__(None, None, None)
+            elapsed = time.time() - start
+            exited = True
+            alive_after_exit = coordination.thread.is_alive()
+
+            delete_rows(postgres, tables, 'LeaderLock', 'singleton = 1')
+            coordination.thread.join(timeout=35)
+
+            assert not late_distributions, \
+                f'Distribution ran after shutdown: {len(late_distributions)} call(s)'
+            assert not alive_after_exit, \
+                'Coordination thread should stop within the __exit__ join'
+            assert elapsed < 10, f'__exit__ took {elapsed:.1f}s'
+
+        finally:
+            if not exited:
+                leader.__exit__(None, None, None)
+
+    def test_failed_enter_stops_monitors_and_removes_node(self, postgres):
+        """Verify a raising __enter__ stops its threads and deletes its Node row.
+
+        Mutation: __enter__ re-raising without the __exit__ shutdown, so the
+            heartbeat, health and coordination threads keep running and the
+            Node row keeps its heartbeat.
+        Oracle: PEP 343, a with statement skips __exit__ when __enter__
+            raises; the TimeoutError is the raise CoordinationConfig documents
+            for minimum_nodes.
+        """
+        config = get_coordination_config(minimum_nodes=2)
+        tables = schema.get_table_names(config.appname)
+        monitor_names = {'heartbeat-lonely', 'health-lonely', 'coordination'}
+        node_count_sql = f"""
+select count(*)
+from {tables["Node"]}
+where name = 'lonely'
+"""
+
+        job = create_job(
+            'lonely',
+            postgres,
+            coordination_config=config,
+            wait_on_enter=1)
+        threads_before = set(threading.enumerate())
+
+        try:
+            with pytest.raises(TimeoutError, match=r'Minimum nodes \(2\) not reached'):
+                with job:
+                    pass
+
+            leaked = [
+                t.name for t in threading.enumerate()
+                if t not in threads_before and t.name in monitor_names and t.is_alive()
+                ]
+            assert leaked == [], f'Threads still running after the raise: {leaked}'
+
+            with postgres.connect() as conn:
+                node_count = conn.execute(text(node_count_sql)).scalar()
+            assert node_count == 0, 'Node row should be deleted after the raise'
+
+        finally:
+            job.__exit__(None, None, None)
 
 
 class TestTimezoneAware:
