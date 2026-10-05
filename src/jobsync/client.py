@@ -22,6 +22,7 @@ from types import TracebackType
 from typing import Any, Self
 
 from sqlalchemy import Connection, CursorResult, create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
 
 from jobsync.schema import ensure_database_ready, get_table_names
 
@@ -1289,17 +1290,26 @@ values (:token_id, :node, now(), :version)
     @log_duration('wait_for_distribution')
     def wait_for_distribution(
         self,
+        shutdown_event: threading.Event,
         timeout_sec: int = None,
         check_interval: float = 0.5
-    ) -> None:
+    ) -> bool:
         """Block until the token table assigns this node at least one token.
 
         Parameters
         ----------
+        shutdown_event : threading.Event
+            Once set, the wait ends within check_interval.
         timeout_sec : int, optional
             Seconds to wait. None uses token_distribution_timeout.
         check_interval : float, default 0.5
             Seconds between polls.
+
+        Returns
+        -------
+        bool
+            True once a token arrives. False when shutdown_event ends the
+            wait.
 
         Raises
         ------
@@ -1312,6 +1322,10 @@ values (:token_id, :node, now(), :version)
         start = time.time()
 
         while time.time() - start < timeout_sec:
+            if shutdown_event.is_set():
+                logger.info(f'Token distribution wait for {self.node_name} ended by shutdown')
+                return False
+
             sql = f"""
 select count(*)
 from {self.db.tables["Token"]}
@@ -1322,9 +1336,9 @@ where node = :node
 
             if my_token_count > 0:
                 logger.info(f'Token distribution complete: {my_token_count} tokens assigned to {self.node_name}')
-                return
+                return True
 
-            time.sleep(check_interval)
+            shutdown_event.wait(check_interval)
 
         raise TimeoutError(f'Token distribution did not complete for {self.node_name} within {timeout_sec}s')
 
@@ -1525,7 +1539,8 @@ set node_patterns = excluded.node_patterns,
         node_patterns : str | list[str]
             SQL LIKE pattern, or fallback patterns tried in order. When
             another task's active lock holds the same token with different
-            patterns, the lock is not stored and a warning is logged.
+            patterns, the lock is not stored and a warning is logged,
+            unless it repeats this task's active patterns.
         reason : str, optional
             Free text stored with the lock.
         expires_in_days : int, optional
@@ -1569,7 +1584,10 @@ set node_patterns = excluded.node_patterns,
 
         A row collides when another task's active lock, stored or earlier
         in rows, holds the same token with different patterns. The first
-        lock stays, and each skipped row logs a warning.
+        lock stays, and each skipped row logs a warning. A row that repeats
+        its task's active patterns is a renewal and never collides. The
+        transaction locks the Lock table, so concurrent calls run one at a
+        time.
 
         Parameters
         ----------
@@ -1586,8 +1604,10 @@ select task_id, node_patterns
 from {self.db.tables["Lock"]}
 where expires_at is null or expires_at > now()
 """
+        lock_sql = f'lock table {self.db.tables["Lock"]} in share row exclusive mode'
         stored_cnt = 0
         with self.db.engine.connect() as conn:
+            conn.execute(text(lock_sql))
             patterns_by_task_by_token = {}
             for task_id, patterns in conn.execute(text(active_sql)):
                 if isinstance(patterns, str):
@@ -1607,7 +1627,8 @@ where expires_at is null or expires_at > now()
                     self.total_tokens,
                     self.hash_function)
                 patterns_by_task = patterns_by_task_by_token.setdefault(token_id, {})
-                conflict = next(
+                is_renewal = patterns_by_task.get(row['task_id']) == patterns
+                conflict = None if is_renewal else next(
                     (
                         (other_task, other_patterns)
                         for other_task, other_patterns in patterns_by_task.items()
@@ -1746,6 +1767,8 @@ where expires_at is not null and expires_at < now()
             shutdown_event was set.
         """
         if not self._try_acquire_leader_lock(operation):
+            if self.shutdown_event.is_set():
+                raise LockNotAcquired(f'Shutdown ended leader lock wait for {operation}')
             raise LockNotAcquired(f'Another leader is performing {operation}')
         try:
             yield
@@ -1822,6 +1845,9 @@ on conflict (singleton) do nothing
                 logger.error(f'Leader lock acquisition failed: {e}')
                 self.shutdown_event.wait(0.5)
 
+        if self.shutdown_event.is_set():
+            logger.info(f'Leader lock wait for {operation} ended by shutdown')
+            return False
         logger.warning(f'Leader lock acquisition timeout for {self.node_name}')
         return False
 
@@ -2925,7 +2951,8 @@ class Job:
         Returns
         -------
         Self
-            This job. Standalone mode returns at once.
+            This job. Standalone mode returns at once, and a shutdown during
+            startup returns without tokens.
 
         Raises
         ------
@@ -2972,7 +2999,10 @@ class Job:
 
             follower_timeout = 2 * self.tokens.token_distribution_timeout
             logger.info(f'Waiting for token distribution (timeout: {follower_timeout}s)...')
-            self.tokens.wait_for_distribution(timeout_sec=follower_timeout)
+            if not self.tokens.wait_for_distribution(
+                self._shutdown_event,
+                timeout_sec=follower_timeout):
+                return self
 
             self.tokens.my_tokens, self.tokens.token_version = (
                 self.tokens.get_my_tokens_versioned())
@@ -2991,7 +3021,10 @@ class Job:
         except Exception as e:
             logger.error(f'Initialization failed: {e}', exc_info=True)
             self.state_machine.transition_to(JobState.ERROR)
-            self.__exit__(None, None, None)
+            try:
+                self.__exit__(None, None, None)
+            except Exception as exit_error:
+                logger.error(f'Cleanup after failed initialization failed: {exit_error}')
             raise
 
         return self
@@ -3065,10 +3098,15 @@ class Job:
         task : Task | Hashable
             Task or task id, or an iterable of them. A str counts as one
             task id, but any other iterable, a tuple id included, counts
-            as a batch. Ignored in standalone mode.
+            as a batch. Ignored in standalone mode. A database error logs a
+            warning and records no claim.
         """
-        if self.tasks is not None:
+        if self.tasks is None:
+            return
+        try:
             self.tasks.set_claim(task)
+        except SQLAlchemyError as e:
+            logger.warning(f'Failed to record claim: {e}')
 
     def add_task(self, task: Task | Hashable) -> None:
         """Queue task for the audit and claim it, when this node owns it.
@@ -3077,24 +3115,36 @@ class Job:
         ----------
         task : Task | Hashable
             Task or task id. Dropped without error when this node cannot
-            claim it, and always in standalone mode.
+            claim it, and always in standalone mode. A database error on
+            the claim logs a warning and leaves the task out of the audit.
         """
         if self.tasks is None:
             return
 
+        task_id = extract_task_id(task)
         if self._coordination_enabled and not self.can_claim_task(task):
-            task_id = extract_task_id(task)
             logger.debug(f'Task {task_id} rejected (token not owned)')
             return
 
+        try:
+            self.tasks.set_claim([task])
+        except SQLAlchemyError as e:
+            logger.warning(f'Task {task_id} not added, claim failed: {e}')
+            return
         self.tasks.add_task(task)
-        self.set_claim([task])
 
     def write_audit(self) -> None:
-        """Write accumulated tasks to audit table.
+        """Write the queued tasks to the audit table and empty the queue.
+
+        A database error logs a warning and keeps the queue for the next
+        call.
         """
-        if self.tasks is not None:
+        if self.tasks is None:
+            return
+        try:
             self.tasks.write_audit()
+        except SQLAlchemyError as e:
+            logger.warning(f'Failed to write audit: {e}')
 
     def get_audit(self) -> list[dict]:
         """Audit rows for this job's date, across all nodes.
@@ -3103,11 +3153,15 @@ class Job:
         -------
         list[dict]
             One dict per row with keys 'node' and 'task_id'. Empty in
-            standalone mode.
+            standalone mode, and on a database error, which logs a warning.
         """
         if not self._coordination_enabled:
             return []
-        return self.tasks.get_audit()
+        try:
+            return self.tasks.get_audit()
+        except SQLAlchemyError as e:
+            logger.warning(f'Failed to read audit: {e}')
+            return []
 
     def can_claim_task(self, task: Task | Hashable) -> bool:
         """Whether this node may claim task now.
@@ -3167,14 +3221,23 @@ class Job:
         task_id : Hashable
             Task to pin, never a token id.
         node_patterns : str | list[str]
-            SQL LIKE pattern, or fallback patterns tried in order.
+            SQL LIKE pattern, or fallback patterns tried in order. Patterns
+            JSON cannot encode log a warning and store nothing, as does a
+            database error. Before __enter__ finishes, as in lock_provider,
+            either error raises instead.
         reason : str, optional
             Free text stored with the lock.
         expires_in_days : int, optional
             Days until the lock expires. None or 0 never expires.
         """
-        if self.locks is not None:
+        if self.locks is None:
+            return
+        try:
             self.locks.register_lock(task_id, node_patterns, reason, expires_in_days)
+        except (SQLAlchemyError, TypeError, ValueError) as e:
+            if self.state_machine.is_initializing():
+                raise
+            logger.warning(f'Lock for task {task_id} not stored: {e}')
 
     def register_locks_bulk(
         self,
@@ -3186,10 +3249,19 @@ class Job:
         ----------
         locks : list[tuple[Hashable, str | list[str], str]]
             (task_id, node_patterns, reason) per lock. These locks never
-            expire.
+            expire. An entry without exactly three items, patterns JSON
+            cannot encode, or a database error logs a warning and stores
+            no lock from the call. Before __enter__ finishes, as in
+            lock_provider, each of these raises instead.
         """
-        if self.locks is not None:
+        if self.locks is None:
+            return
+        try:
             self.locks.register_locks_bulk(locks)
+        except (SQLAlchemyError, TypeError, ValueError) as e:
+            if self.state_machine.is_initializing():
+                raise
+            logger.warning(f'No bulk lock stored: {e}')
 
     def clear_locks_by_creator(self, creator: str) -> int:
         """Delete every lock one node created.
@@ -3307,11 +3379,15 @@ class Job:
         -------
         list[dict]
             As ClusterCoordinator.get_active_nodes. Empty in standalone
-            mode.
+            mode, and on a database error, which logs a warning.
         """
         if not self._coordination_enabled:
             return []
-        return self.cluster.get_active_nodes()
+        try:
+            return self.cluster.get_active_nodes()
+        except SQLAlchemyError as e:
+            logger.warning(f'Failed to read active nodes: {e}')
+            return []
 
     def get_dead_nodes(self) -> list[str]:
         """Names of nodes with no heartbeat within heartbeat_timeout.

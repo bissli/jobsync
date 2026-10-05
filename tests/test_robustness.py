@@ -15,16 +15,19 @@ import logging
 import threading
 import time
 import types
+from collections.abc import Iterator
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
+import sqlalchemy.exc
 from fixtures import *  # noqa: F401, F403
-from sqlalchemy import text
+from sqlalchemy import Engine, text
 
 import jobsync.client
 from jobsync import schema
-from jobsync.client import CoordinationConfig, JobState, ensure_timezone_aware
-from jobsync.client import retry_with_backoff
+from jobsync.client import CoordinationConfig, Job, JobState, Task
+from jobsync.client import ensure_timezone_aware, retry_with_backoff
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +151,58 @@ class TestThreadShutdown:
 
         assert timeout_warnings == [], \
             f'Should have no thread timeout warnings, found: {timeout_warnings}'
+
+    def test_shutdown_ends_distribution_wait(self, postgres):
+        """Verify wait_for_distribution returns False soon after shutdown.
+
+        Mutation: the poll sleeping time.sleep(check_interval) in place of
+            shutdown_event.wait, or the loop ignoring shutdown and raising
+            TimeoutError.
+        Oracle: shutdown set 0.3s into a wait with no Token rows, a 5s poll
+            interval and a 10s timeout; a 2s bound sits under both.
+        """
+        coord_config = get_coordination_config(total_tokens=10)
+        job = create_job('node1', postgres, coordination_config=coord_config)
+
+        try:
+            threading.Timer(0.3, job._shutdown_event.set).start()
+            start = time.time()
+            assigned = job.tokens.wait_for_distribution(
+                job._shutdown_event,
+                timeout_sec=10,
+                check_interval=5)
+            elapsed = time.time() - start
+
+            assert assigned is False
+            assert elapsed < 2, f'Wait took {elapsed:.1f}s after shutdown'
+        finally:
+            job.__exit__(None, None, None)
+
+    def test_shutdown_leader_lock_wait_logs_own_message(self, postgres, caplog):
+        """Verify a leader lock wait ended by shutdown is not called a timeout.
+
+        Mutation: _try_acquire_leader_lock logging 'Leader lock acquisition
+            timeout' on shutdown, or acquire_leader_lock raising 'Another
+            leader is performing'.
+        Oracle: shutdown set before the call, then a LockNotAcquired naming
+            shutdown and no timeout warning.
+        """
+        coord_config = get_coordination_config(total_tokens=10)
+        job = create_job('node1', postgres, coordination_config=coord_config)
+
+        try:
+            job._shutdown_event.set()
+            with caplog.at_level(logging.INFO), pytest.raises(
+                jobsync.client.LockNotAcquired,
+                match='Shutdown ended leader lock wait for test'):
+                with job.locks.acquire_leader_lock('test'):
+                    pass
+
+            messages = [record.getMessage() for record in caplog.records]
+            assert not any('timeout' in message for message in messages), messages
+            assert any('ended by shutdown' in message for message in messages)
+        finally:
+            job.__exit__(None, None, None)
 
     def test_shutdown_with_long_intervals(self, postgres):
         """Verify shutdown stays fast when monitor intervals are 60s.
@@ -822,6 +877,38 @@ where name = 'lonely'
         finally:
             job.__exit__(None, None, None)
 
+    def test_failed_enter_raises_original_error_when_exit_fails(
+        self,
+        postgres,
+        monkeypatch
+    ):
+        """Verify a raising __exit__ does not replace the __enter__ error.
+
+        Mutation: the failure path calling self.__exit__ unguarded, so its
+            RuntimeError replaces the TimeoutError.
+        Oracle: the minimum_nodes TimeoutError CoordinationConfig documents,
+            and a stub __exit__ that cleans up and then raises.
+        """
+        config = get_coordination_config(minimum_nodes=2)
+        job = create_job(
+            'lonely',
+            postgres,
+            coordination_config=config,
+            wait_on_enter=1)
+        real_exit = job.__exit__
+
+        def failing_exit(*args):
+            real_exit(*args)
+            raise RuntimeError('cleanup failed')
+
+        monkeypatch.setattr(job, '__exit__', failing_exit)
+
+        try:
+            with pytest.raises(TimeoutError, match=r'Minimum nodes \(2\) not reached'):
+                job.__enter__()
+        finally:
+            real_exit(None, None, None)
+
 
 class TestTimezoneAware:
     """Test timezone-aware datetime enforcement.
@@ -1172,6 +1259,174 @@ class TestStaleTaskOwnership:
                 str(task_id) for task_id in queued_task_ids), \
                 'All 3 tasks written despite no longer owning tokens'
 
+        finally:
+            job.__exit__(None, None, None)
+
+
+class TestLiveSessionDatabaseFailure:
+    """Test that a live Job logs a database failure and returns a default.
+    """
+
+    @pytest.fixture
+    def live_job(self, postgres: Engine) -> Iterator[Job]:
+        """Running follower that owns every token, with no monitors started.
+        """
+        coord_cfg = get_coordination_config(total_tokens=10)
+        job = create_job('node1', postgres, coordination_config=coord_cfg)
+        job.state_machine.state = JobState.RUNNING_FOLLOWER
+        job.tokens.my_tokens = set(range(10))
+        try:
+            yield job
+        finally:
+            job.__exit__(None, None, None)
+
+    @staticmethod
+    def break_database(monkeypatch: pytest.MonkeyPatch, job: Job) -> None:
+        """Make each new connection on job's engine raise OperationalError.
+        """
+        def refuse_connect(*args: Any, **kwargs: Any) -> None:
+            raise sqlalchemy.exc.OperationalError(
+                'select 1', {}, Exception('server closed the connection'))
+        monkeypatch.setattr(job.db.engine, 'connect', refuse_connect)
+
+    @staticmethod
+    def warnings_logged(caplog: pytest.LogCaptureFixture) -> list[str]:
+        """Messages of the WARNING records caplog holds.
+        """
+        return [
+            record.getMessage() for record in caplog.records
+            if record.levelno == logging.WARNING
+            ]
+
+    def test_add_task_skips_audit_when_claim_fails(
+        self,
+        live_job,
+        monkeypatch,
+        caplog
+    ):
+        """Verify add_task logs a failed claim and queues no audit entry.
+
+        Mutation: add_task queuing the task before set_claim, or letting the
+            claim error raise.
+        Oracle: an engine whose connect raises, then an empty audit queue
+            and a warning naming task 7.
+        """
+        with monkeypatch.context() as patch, caplog.at_level(logging.WARNING):
+            self.break_database(patch, live_job)
+            live_job.add_task(Task(7))
+
+        assert live_job.tasks._tasks == [], 'Unclaimed task must not be queued'
+        assert any('7' in message for message in self.warnings_logged(caplog))
+
+    def test_set_claim_logs_failure(self, live_job, monkeypatch, caplog):
+        """Verify set_claim logs a database error and returns.
+
+        Mutation: Job.set_claim letting the claim error raise.
+        Oracle: an engine whose connect raises, then a warning.
+        """
+        with monkeypatch.context() as patch, caplog.at_level(logging.WARNING):
+            self.break_database(patch, live_job)
+            live_job.set_claim(Task(7))
+
+        assert self.warnings_logged(caplog)
+
+    @clean_tables('Audit')
+    def test_write_audit_keeps_queue_on_failure(
+        self,
+        live_job,
+        postgres,
+        monkeypatch,
+        caplog
+    ):
+        """Verify a failed write_audit keeps its queue for the next call.
+
+        Mutation: Job.write_audit letting the error raise, or the queue
+            cleared before the insert commits.
+        Oracle: a failed write, then a write on a working engine that
+            stores task 7, queued before the failure.
+        """
+        live_job.add_task(Task(7))
+
+        with monkeypatch.context() as patch, caplog.at_level(logging.WARNING):
+            self.break_database(patch, live_job)
+            live_job.write_audit()
+
+        assert self.warnings_logged(caplog)
+        live_job.write_audit()
+        assert [row['task_id'] for row in live_job.get_audit()] == ['7']
+
+    @pytest.mark.parametrize('call_name', ['get_audit', 'get_active_nodes'])
+    def test_read_returns_empty_list_on_failure(
+        self,
+        live_job,
+        monkeypatch,
+        caplog,
+        call_name
+    ):
+        """Verify a read logs a database error and returns [].
+
+        Mutation: the read letting the error raise, or returning None.
+        Oracle: an engine whose connect raises, then [] and a warning.
+        """
+        with monkeypatch.context() as patch, caplog.at_level(logging.WARNING):
+            self.break_database(patch, live_job)
+            result = getattr(live_job, call_name)()
+
+        assert result == []
+        assert self.warnings_logged(caplog)
+
+    @clean_tables('Lock')
+    @pytest.mark.parametrize(('call_name', 'args', 'break_db'), [
+        ('register_lock', (7, 'node%'), True),
+        ('register_lock', (7, [object()]), False),
+        ('register_locks_bulk', ([(7, 'node%', 'ok'), (8, 'node%')],), False),
+        ('register_locks_bulk', ([(7, 'node%', 'ok')],), True),
+        ])
+    def test_register_lock_stores_nothing_on_failure(
+        self,
+        live_job,
+        postgres,
+        monkeypatch,
+        caplog,
+        call_name,
+        args,
+        break_db
+    ):
+        """Verify lock registration logs a failure and stores no lock.
+
+        Mutation: the registration letting a database error, a JSON
+            encoding error or a short bulk tuple raise, or storing the
+            valid entries of a bulk call that holds a bad one.
+        Oracle: an engine whose connect raises, patterns holding an
+            object(), or a bulk list whose second tuple has two items; then
+            an empty lock list and a warning.
+        """
+        with monkeypatch.context() as patch, caplog.at_level(logging.WARNING):
+            if break_db:
+                self.break_database(patch, live_job)
+            getattr(live_job, call_name)(*args)
+
+        assert live_job.list_locks() == []
+        assert self.warnings_logged(caplog)
+
+    def test_lock_provider_error_fails_startup(self, postgres):
+        """Verify a bad lock_provider entry still makes __enter__ raise.
+
+        Mutation: the register_locks_bulk wrapper logging the error during
+            startup too, so the job starts with its locks missing.
+        Oracle: a bulk tuple with two items, whose unpacking raises
+            ValueError inside lock_provider.
+        """
+        coord_cfg = get_coordination_config(total_tokens=10)
+        job = create_job(
+            'node1',
+            postgres,
+            coordination_config=coord_cfg,
+            lock_provider=lambda job: job.register_locks_bulk([(7, 'node%')]))
+
+        try:
+            with pytest.raises(ValueError):
+                job.__enter__()
         finally:
             job.__exit__(None, None, None)
 

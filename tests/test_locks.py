@@ -8,6 +8,7 @@ Scope
 - Concurrent lock acquisition
 - Leader lock coordination
 """
+import contextlib
 import datetime
 import logging
 import threading
@@ -17,6 +18,7 @@ import pytest
 from fixtures import *  # noqa: F401, F403
 from sqlalchemy import Engine, text
 
+import jobsync.client
 from jobsync import schema
 from jobsync.client import CoordinationConfig, JobState, LockNotAcquired
 
@@ -275,10 +277,94 @@ where task_id = :task_id
         assert batch_e in warnings[1]
         assert batch_d in warnings[1]
 
+    @clean_tables('Lock')
+    def test_register_lock_renews_own_lock_beside_colliding_row(
+            self, postgres, jobs_to_exit):
+        """Verify a task re-registering its unchanged patterns is stored.
+
+        Mutation: _store_locks checking a renewal against other tasks' rows,
+            so a colliding row already in the table blocks the renewal.
+        Oracle: colliding rows inserted directly for two tasks on one token;
+            renewing the first with a 1-day expiry must replace its NULL
+            expires_at.
+        """
+        config = get_coordination_config(total_tokens=4)
+        tables = schema.get_table_names(config.appname)
+        expires_sql = f'select expires_at from {tables["Lock"]} where task_id = :task_id'
+        job = create_job('node1', postgres, coordination_config=config, wait_on_enter=0)
+        jobs_to_exit.append(job)
+
+        renewed_task = 'task-0'
+        token_id = job.task_to_token(renewed_task)
+        colliding_task = next(
+            f'task-{i}' for i in range(1, 100)
+            if job.task_to_token(f'task-{i}') == token_id)
+        insert_lock(postgres, tables, renewed_task, ['special-%'])
+        insert_lock(postgres, tables, colliding_task, ['other-%'])
+
+        job.register_lock(renewed_task, ['special-%'], 'renewal', expires_in_days=1)
+
+        with postgres.connect() as conn:
+            expires_at = conn.execute(
+                text(expires_sql),
+                {'task_id': renewed_task}).scalar()
+        assert expires_at is not None, 'Renewal should replace the stored lock'
+
 
 class TestConcurrentLockRegistration:
     """Test concurrent lock registration from multiple nodes.
     """
+
+    @clean_tables('Lock')
+    def test_concurrent_colliding_locks_store_only_one(
+        self,
+        postgres,
+        jobs_to_exit,
+        monkeypatch
+    ):
+        """Verify two nodes racing colliding locks onto one token store one.
+
+        Mutation: _store_locks reading the active locks without first
+            locking the Lock table, so both nodes check an empty table and
+            both store.
+        Oracle: a barrier inside task_to_token that holds each node after
+            its read until both have read; with the table lock the second
+            node cannot read until the first commits, the barrier times out,
+            and the second node sees the first lock.
+        """
+        config = get_coordination_config(total_tokens=4)
+        tables = schema.get_table_names(config.appname)
+        node1, node2 = [
+            create_job(name, postgres, coordination_config=config, wait_on_enter=0)
+            for name in ('node1', 'node2')
+            ]
+        jobs_to_exit.extend([node1, node2])
+
+        token_id = node1.task_to_token('task-0')
+        second_task = next(
+            f'task-{i}' for i in range(1, 100)
+            if node1.task_to_token(f'task-{i}') == token_id)
+
+        barrier = threading.Barrier(2, timeout=2)
+        real_task_to_token = jobsync.client.task_to_token
+
+        def task_to_token_after_both_read(*args):
+            with contextlib.suppress(threading.BrokenBarrierError):
+                barrier.wait()
+            return real_task_to_token(*args)
+
+        monkeypatch.setattr(jobsync.client, 'task_to_token', task_to_token_after_both_read)
+
+        threads = [
+            threading.Thread(target=node1.register_lock, args=('task-0', ['east-%'])),
+            threading.Thread(target=node2.register_lock, args=(second_task, ['west-%'])),
+            ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=15)
+
+        assert count_locks(postgres, tables) == 1, 'Colliding locks both stored'
 
     @clean_tables('Lock')
     def test_same_lock_from_multiple_nodes_sequential(self, postgres, jobs_to_exit):
