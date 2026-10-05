@@ -1,8 +1,6 @@
 """PostgreSQL 17 container and engine fixtures, in the America/New_York zone.
 """
 import logging
-import os
-import pathlib
 import socket
 import time
 from collections.abc import Iterator
@@ -15,8 +13,6 @@ from sqlalchemy import Engine, create_engine, text
 from jobsync import schema
 
 logger = logging.getLogger(__name__)
-
-current_path = pathlib.Path(os.path.realpath(__file__)).parent
 
 
 def find_free_port() -> int:

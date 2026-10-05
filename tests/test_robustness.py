@@ -12,6 +12,7 @@ Scope
 import datetime
 import json
 import logging
+import threading
 import time
 import types
 from zoneinfo import ZoneInfo
@@ -540,6 +541,91 @@ class TestFollowerJoinDistribution:
                 follower.__exit__(None, None, None)
 
         finally:
+            leader.__exit__(None, None, None)
+
+    @clean_tables('Node', 'Token')
+    def test_follower_gets_tokens_after_rebalance_lock_released(
+        self, postgres, monkeypatch
+    ):
+        """Verify a join refused by a held rebalance lock gets tokens later.
+
+        Mutation: the membership_changed handler dropping a distribution
+            refused by LockNotAcquired after RebalanceMonitor has advanced
+            last_node_count, so no later distribution comes.
+        Oracle: docs/OPERATOR_GUIDE.md, tokens are redistributed
+            automatically on membership changes; the follower must own a
+            token once the outside holder releases the lock.
+        """
+        config = get_coordination_config(
+            total_tokens=100,
+            token_distribution_timeout_sec=10)
+        tables = schema.get_table_names(config.appname)
+        set_lock_sql = f"""
+update {tables["RebalanceLock"]}
+set in_progress = true, started_at = now(), started_by = 'other-node'
+where singleton = 1
+"""
+        clear_lock_sql = f"""
+update {tables["RebalanceLock"]}
+set in_progress = false, started_at = null, started_by = null
+where singleton = 1
+"""
+
+        def follower_owns_tokens():
+            return 'late-follower' in get_token_assignments(postgres, tables).values()
+
+        leader = create_job('lock-leader', postgres, coordination_config=config)
+        leader.__enter__()
+        follower = create_job('late-follower', postgres, coordination_config=config)
+        enter_errors = []
+
+        def enter_follower():
+            try:
+                follower.__enter__()
+            except Exception as e:
+                enter_errors.append(e)
+
+        follower_thread = threading.Thread(target=enter_follower, daemon=True)
+
+        refused = threading.Event()
+        real_try_acquire = leader.locks._try_acquire_rebalance_lock
+
+        def recording_try_acquire(started_by):
+            acquired = real_try_acquire(started_by)
+            if started_by == 'token_distribution' and not acquired:
+                refused.set()
+            return acquired
+
+        monkeypatch.setattr(
+            leader.locks,
+            '_try_acquire_rebalance_lock',
+            recording_try_acquire)
+
+        try:
+            assert wait_for_state(leader, JobState.RUNNING_LEADER, timeout_sec=5)
+
+            with postgres.connect() as conn:
+                conn.execute(text(set_lock_sql))
+                conn.commit()
+
+            follower_thread.start()
+
+            assert refused.wait(timeout=10), \
+                'Leader should try to distribute for the join and be refused'
+            assert not follower_owns_tokens()
+
+            with postgres.connect() as conn:
+                conn.execute(text(clear_lock_sql))
+                conn.commit()
+
+            assert wait_for(follower_owns_tokens, timeout_sec=8), \
+                'Follower should own tokens once the rebalance lock is released'
+            follower_thread.join(timeout=5)
+            assert not enter_errors, f'Follower __enter__ raised {enter_errors}'
+
+        finally:
+            follower_thread.join(timeout=25)
+            follower.__exit__(None, None, None)
             leader.__exit__(None, None, None)
 
 

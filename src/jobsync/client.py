@@ -972,8 +972,6 @@ class ClusterCoordinator:
         self.rebalance_check_interval = coord_config.rebalance_check_interval_sec
         self.created_on = created_on
         self.last_heartbeat_sent = None
-        self._heartbeat_monitor = None
-        self._health_monitor = None
 
     @property
     def active_nodes_sql(self) -> str:
@@ -1123,7 +1121,6 @@ class TokenDistributor:
         self.token_refresh_initial = coord_config.token_refresh_initial_interval_sec
         self.token_refresh_steady = coord_config.token_refresh_steady_interval_sec
         self.token_distribution_timeout = coord_config.token_distribution_timeout_sec
-        self.heartbeat_timeout = coord_config.heartbeat_timeout_sec
         self.my_tokens = set()
         self.token_version = 0
         self.on_rebalance = None
@@ -1258,7 +1255,7 @@ values (:token_id, :node, now(), :version)
         duration_ms = int((time.time() - start_time) * 1000)
         self._log_rebalance(
             trigger_reason,
-            len(active_node_names),
+            len(set(current_assignments.values())),
             len(active_node_names),
             tokens_moved,
             duration_ms)
@@ -1285,7 +1282,7 @@ values (:token_id, :node, now(), :version)
             return set(), 0
 
         tokens = {row[0] for row in records}
-        version = records[0][1] if records else 0
+        version = records[0][1]
         logger.debug(f'Node {self.node_name} owns {len(tokens)} tokens, version {version}')
         return tokens, version
 
@@ -1417,7 +1414,8 @@ where node = :node
         reason : str
             Trigger reason.
         nodes_before : int
-            Live node count before the rebalance.
+            Distinct nodes owning a token before the rebalance, a dead or
+            departed node included. 0 when the token table is empty.
         nodes_after : int
             Live node count after the rebalance.
         tokens_moved : int
@@ -1624,7 +1622,9 @@ order by created_at desc
         -------
         dict[int, list[str]]
             Ordered patterns per token id. A lock whose patterns fail to
-            parse is skipped with a warning.
+            parse is skipped with a warning. Of two locks on one token,
+            the row read last wins, with a warning when the patterns
+            differ.
         """
         with self.db.engine.connect() as conn:
             sql = f"""
@@ -1652,6 +1652,11 @@ where expires_at is not null and expires_at < now()
                         row['task_id'],
                         self.total_tokens,
                         self.hash_function)
+                    if locked_tokens.get(token_id, patterns) != patterns:
+                        logger.warning(
+                            f'Locks share token {token_id} with different patterns: '
+                            f'{locked_tokens[token_id]} replaced by {patterns} '
+                            f'from task {row["task_id"]}')
                     locked_tokens[token_id] = patterns
                 except (json.JSONDecodeError, TypeError, KeyError) as e:
                     logger.warning(f'Failed to parse lock pattern for task {row["task_id"]}: {e}')
@@ -2270,7 +2275,7 @@ order by created_on asc, name asc
                 new_tokens, new_version = set(), 0
             else:
                 new_tokens = {row['token_id'] for row in records}
-                new_version = records[0]['version'] if records else 0
+                new_version = records[0]['version']
 
             if not self.initial_callback_sent and new_tokens:
                 logger.info(f'Initial token assignment: {len(new_tokens)} tokens, v{new_version}')
@@ -2604,10 +2609,6 @@ class Job:
         machine.on_enter(JobState.RUNNING_FOLLOWER, self._on_enter_running_follower)
         machine.on_enter(JobState.SHUTTING_DOWN, self._on_enter_shutting_down)
 
-        if self._coordination_enabled:
-            coord_monitor = CoordinationMonitor(self, interval=1.0)
-            self._start_monitor('coordination', coord_monitor)
-
         if not self._coordination_enabled and on_rebalance:
             logger.warning('on_rebalance callback provided but coordination_enabled=False - callback will never fire')
 
@@ -2759,7 +2760,8 @@ class Job:
 
             if event.type == 'node_unhealthy':
                 logger.error(f'Node unhealthy: {event.data}')
-                self.state_machine.transition_to(JobState.ERROR)
+                if self.state_machine.is_initializing():
+                    self.state_machine.transition_to(JobState.ERROR)
                 self.state_machine.transition_to(JobState.SHUTTING_DOWN)
                 return
 
@@ -2787,8 +2789,9 @@ class Job:
             elif event.type == 'membership_changed':
                 if self.state_machine.is_leader():
                     data = event.data
-                    logger.info(f'Membership: {data.get("previous_count")} → {data.get("current_count")}')
-                    self._distribute_tokens_safe('membership_change')
+                    logger.info(f'Membership: {data.get("previous_count")} -> {data.get("current_count")}')
+                    if not self._distribute_tokens_safe('membership_change'):
+                        self._event_queue.publish(event.type, event.data)
 
     def _wait_for_enter_time_and_minimum_nodes(self) -> bool:
         """Wait out wait_on_enter, then count the live nodes.
@@ -2827,6 +2830,8 @@ class Job:
             return self
 
         logger.info(f'Starting {self.node_name} in coordination mode')
+
+        self._start_monitor('coordination', CoordinationMonitor(self, interval=1.0))
 
         try:
             if not self.state_machine.transition_to(JobState.CLUSTER_FORMING):
@@ -2966,7 +2971,7 @@ class Job:
             return
 
         self.tasks.add_task(task)
-        self.set_claim(task)
+        self.set_claim([task])
 
     def write_audit(self) -> None:
         """Write accumulated tasks to audit table.
@@ -3211,7 +3216,7 @@ class Job:
             JobState.RUNNING_LEADER,
             }
 
-    def _distribute_tokens_safe(self, trigger_reason: str = 'distribution') -> None:
+    def _distribute_tokens_safe(self, trigger_reason: str = 'distribution') -> bool:
         """Distribute tokens under the rebalance lock and the leader lock.
 
         Never raises. A lock held elsewhere skips the distribution with a
@@ -3222,9 +3227,14 @@ class Job:
         ----------
         trigger_reason : str, default 'distribution'
             Cause, stored in the rebalance audit row.
+
+        Returns
+        -------
+        bool
+            False when a lock held elsewhere skipped the distribution.
         """
         if self.locks is None or self.tokens is None or self.cluster is None:
-            return
+            return True
 
         try:
             # Every node takes the rebalance lock first, then the leader
@@ -3234,10 +3244,12 @@ class Job:
                     self.tokens.distribute(self.locks, self.cluster, trigger_reason)
         except LockNotAcquired as e:
             logger.debug(f'Could not acquire lock for token distribution: {e}')
+            return False
         except Exception as e:
             logger.error(f'Token distribution failed: {e}', exc_info=True)
             if self.state_machine.is_initializing():
                 self.state_machine.transition_to(JobState.ERROR)
+        return True
 
     def _cleanup(self) -> None:
         """Cleanup tables and write audit log.

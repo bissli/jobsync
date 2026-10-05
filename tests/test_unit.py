@@ -19,7 +19,7 @@ from sqlalchemy import text
 
 from jobsync import schema
 from jobsync.client import CoordinationConfig, CoordinationEvent, EventQueue
-from jobsync.client import JobState, JobStateMachine, Task
+from jobsync.client import Job, JobState, JobStateMachine, Task
 from jobsync.client import compute_minimal_move_distribution, matches_pattern
 from jobsync.client import task_to_token
 
@@ -570,6 +570,39 @@ class TestErrorStateTransitions:
         sm.transition_to(JobState.SHUTTING_DOWN)
 
         assert len(callback_invoked) == 1, 'ERROR exit callback should be invoked'
+
+    @pytest.mark.parametrize(
+        ('start_state', 'expect_error_visit'),
+        [
+            (JobState.CLUSTER_FORMING, True),
+            (JobState.ELECTING, True),
+            (JobState.DISTRIBUTING, True),
+            (JobState.RUNNING_LEADER, False),
+            (JobState.RUNNING_FOLLOWER, False),
+            ])
+    def test_node_unhealthy_shuts_down_without_invalid_transition(
+            self, caplog, start_state, expect_error_visit):
+        """Verify node_unhealthy passes through ERROR only where the graph allows.
+
+        Mutation: the handler calling transition_to(ERROR) from every state,
+            or dropping the ERROR step for the pre-running states.
+        Oracle: HealthMonitor starts in CLUSTER_FORMING and runs through
+            the running states; TestTransitionValidation's edge set has
+            X -> ERROR only for the pre-running states.
+        """
+        job = Job('node1')
+        job.state_machine.state = start_state
+        error_visits = []
+        job.state_machine.on_enter(JobState.ERROR, lambda: error_visits.append(True))
+
+        job._event_queue.publish('node_unhealthy', {'reason': 'heartbeat_timeout'})
+        with caplog.at_level(logging.ERROR, logger='jobsync.client'):
+            job._coordinate_state_transitions()
+
+        invalid_logs = [r for r in caplog.records if 'Invalid transition' in r.getMessage()]
+        assert not invalid_logs, [r.getMessage() for r in invalid_logs]
+        assert bool(error_visits) is expect_error_visit
+        assert job.state_machine.state == JobState.SHUTTING_DOWN
 
 
 class TestTransitionValidation:
@@ -1188,6 +1221,32 @@ class TestJobCoordinationStatus:
 
             assert isinstance(status['monitors'], list)
             assert 'coordination' in status['monitors']
+
+    def test_coordination_thread_starts_on_enter(self, postgres):
+        """Verify an unentered coordinated job runs no coordination thread.
+
+        Mutation: the CoordinationMonitor started in Job.__init__, so a job
+            built and never entered polls until process exit.
+        Oracle: the Job lifecycle docstring, whose INITIALIZING phase only
+            configures instance variables, checked against the thread list
+            from threading.enumerate() before and after construction.
+        """
+        before = set(threading.enumerate())
+        job = create_job(
+            'node1',
+            postgres,
+            coordination_config=get_coordination_config(),
+            wait_on_enter=0)
+        try:
+            started = {t.name for t in set(threading.enumerate()) - before}
+            assert 'coordination' not in started
+
+            with job:
+                coordination_thread = job._monitors['coordination'].thread
+                assert coordination_thread.is_alive()
+            assert not coordination_thread.is_alive()
+        finally:
+            job.__exit__(None, None, None)
 
 
 class TestTaskTokenMapping:
@@ -2572,6 +2631,28 @@ where node = :node
             items = [row[0] for row in result]
 
         assert sorted(items) == ['1', '2', '3', 'None']
+
+    @clean_tables('Claim', 'Audit')
+    def test_add_task_tuple_id_claims_one_row(self, postgres, claim_job):
+        """Verify add_task claims a tuple task id as one task, as it audits it.
+
+        Mutation: Job.add_task handing the bare tuple to set_claim, which
+            claims each element as its own task.
+        Oracle: the Task docstring allows any Hashable id, and the audit row
+            written by write_audit holds str((1, 2)).
+        """
+        tables = schema.get_table_names()
+        claim_job.add_task((1, 2))
+        claim_job.write_audit()
+
+        with postgres.connect() as conn:
+            claim_sql = f'select task_id from {tables["Claim"]} where node = :node'
+            claims = [row[0] for row in conn.execute(text(claim_sql), {'node': 'node1'})]
+            audit_sql = f'select task_id from {tables["Audit"]} where node = :node'
+            audits = [row[0] for row in conn.execute(text(audit_sql), {'node': 'node1'})]
+
+        assert audits == ['(1, 2)']
+        assert claims == ['(1, 2)']
 
 
 if __name__ == '__main__':

@@ -8,7 +8,6 @@ Scope
 - Database timezone configuration tests
 """
 import datetime
-import logging
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -17,8 +16,6 @@ from sqlalchemy import text
 
 from jobsync import schema
 from jobsync.client import CoordinationConfig, LockNotAcquired
-
-logger = logging.getLogger(__name__)
 
 
 class TestHeartbeatTimezoneHandling:

@@ -23,8 +23,6 @@ from jobsync import schema
 from jobsync.client import CoordinationConfig, Job, JobState, Task
 from jobsync.client import TokenRefreshMonitor
 
-logger = logging.getLogger(__name__)
-
 CORE_TABLE_KEYS = ['Node', 'Check', 'Audit', 'Claim']
 COORDINATION_TABLE_KEYS = ['Token', 'Lock', 'LeaderLock', 'RebalanceLock', 'Rebalance']
 
@@ -79,9 +77,8 @@ def make_unentered_job(postgres):
     ------
     callable
         make(node_name, coordination_config) -> Job, built by create_job
-        with wait_on_enter=0. Each job is exited at teardown, which stops
-        the CoordinationMonitor thread Job.__init__ starts and disposes
-        its engine.
+        with wait_on_enter=0. Each job is exited at teardown, which
+        disposes its engine.
     """
     jobs = []
 

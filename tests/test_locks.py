@@ -9,6 +9,7 @@ Scope
 - Leader lock coordination
 """
 import datetime
+import logging
 import threading
 from dataclasses import replace
 
@@ -35,7 +36,7 @@ def jobs_to_exit():
     ------
     list[Job]
         The test appends each job it never enters. Teardown calls __exit__ on
-        each, which stops the coordination thread the Job constructor starts.
+        each, which disposes its engine.
     """
     jobs = []
     yield jobs
@@ -424,6 +425,41 @@ class TestLockListing:
         assert 'pattern-1' in patterns, 'Non-expired lock should be listed'
         assert 'pattern-2' in patterns, 'Future-expiring lock should be listed'
         assert 'pattern-expired' not in patterns, 'Expired lock should not be listed'
+
+    @clean_tables('Lock')
+    @pytest.mark.parametrize(
+        ('second_patterns', 'expect_warning'),
+        [
+            (['other-%'], True),
+            (['special-%'], False),
+            ])
+    def test_get_active_locks_warns_on_conflicting_token_collision(
+            self, postgres, jobs_to_exit, caplog, second_patterns, expect_warning):
+        """Verify get_active_locks warns when two locks on one token disagree.
+
+        Mutation: get_active_locks overwriting the earlier token entry with
+            no warning, or warning even when both locks name the same
+            patterns.
+        Oracle: get_active_locks returns one pattern list per token, so of
+            two tasks hashing to one token only one lock can apply.
+        """
+        config = get_coordination_config(total_tokens=4)
+        job = create_job('node1', postgres, coordination_config=config, wait_on_enter=0)
+        jobs_to_exit.append(job)
+
+        first_task = 'task-0'
+        second_task = next(
+            f'task-{i}' for i in range(1, 100)
+            if job.task_to_token(f'task-{i}') == job.task_to_token(first_task))
+        job.register_lock(first_task, ['special-%'], 'first')
+        job.register_lock(second_task, second_patterns, 'second')
+
+        with caplog.at_level(logging.WARNING, logger='jobsync.client'):
+            locked_tokens = job.locks.get_active_locks()
+
+        assert list(locked_tokens) == [job.task_to_token(first_task)]
+        warnings = [r for r in caplog.records if 'share token' in r.getMessage()]
+        assert bool(warnings) is expect_warning
 
 
 class TestClearExistingLocks:

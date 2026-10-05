@@ -3,6 +3,7 @@
 import contextlib
 import datetime
 import functools
+import inspect
 import json
 import logging
 import threading
@@ -11,7 +12,6 @@ from collections.abc import Callable, Hashable, Iterator
 from dataclasses import replace
 from typing import Any
 
-import pytest
 from sqlalchemy import Engine, text
 
 from jobsync import schema
@@ -199,11 +199,11 @@ def simulate_node_crash(node: Job, cleanup: bool = False) -> None:
         try:
             node._cleanup()
         except Exception:
-            pass
+            logger.warning(f'{node.node_name} cleanup failed', exc_info=True)
         try:
             node.db.dispose()
         except Exception:
-            pass
+            logger.warning(f'{node.node_name} engine dispose failed', exc_info=True)
 
 
 class CallbackTracker:
@@ -236,32 +236,6 @@ class CallbackTracker:
 
 
 # --- Factories ---
-
-@pytest.fixture(scope='module')
-def shared_unit_test_job(postgres: Engine) -> Job:
-    """Unentered job shared by every test in a module.
-
-    Returns
-    -------
-    Job
-        Built with wait_on_enter=0. Only for tests that change no state,
-        since later tests in the module reuse it.
-    """
-    coord_config = get_coordination_config()
-    job = create_job(
-        'unit-test-shared',
-        postgres,
-        coordination_config=coord_config,
-        wait_on_enter=0)
-    return job
-
-
-@pytest.fixture
-def callback_tracker() -> CallbackTracker:
-    """A fresh CallbackTracker.
-    """
-    return CallbackTracker()
-
 
 def create_job(
     node_name: str,
@@ -698,11 +672,7 @@ def wait_for_cached_tokens_sync(
         check_interval=check_interval)
 
 
-def wait_for_shutdown(
-    node: Job,
-    timeout_sec: float = 5.0,
-    check_interval: float = 0.1
-) -> bool:
+def wait_for_shutdown(node: Job, timeout_sec: float = 5.0) -> bool:
     """Wait for every monitor thread of node to stop.
 
     Parameters
@@ -710,9 +680,7 @@ def wait_for_shutdown(
     node : Job
         Job whose monitor threads are checked.
     timeout_sec : float, default 5.0
-        Seconds to keep polling.
-    check_interval : float, default 0.1
-        Ignored. Polling runs every 0.1 seconds.
+        Seconds to keep polling, every 0.1 seconds.
 
     Returns
     -------
@@ -880,17 +848,12 @@ def clean_tables(*table_names: str) -> Callable:
         fixture. The wrapped test raises TypeError when it gets none.
     """
     def decorator(func: callable) -> Callable:
+        signature = inspect.signature(func)
+
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
-            postgres = kwargs.get('postgres')
-            if postgres is None:
-                if (args and hasattr(args[0], '__class__')
-                    and not isinstance(args[0], dict)):
-                    if len(args) >= 2:
-                        postgres = args[1]
-                elif args:
-                    postgres = args[0]
-
+            bound = signature.bind_partial(*args, **kwargs)
+            postgres = bound.arguments.get('postgres')
             if postgres is None:
                 raise TypeError(f"{func.__name__}() missing required 'postgres' fixture")
 

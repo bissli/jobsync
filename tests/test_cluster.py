@@ -10,6 +10,7 @@ Scope
 """
 import datetime
 import logging
+import threading
 import time
 from datetime import timedelta
 
@@ -1594,6 +1595,38 @@ class TestDeadNodeTokenRedistribution:
                 'Survivors should audit every task'
             assert {row[0] for row in audit_rows} <= {'node1', 'node3'}, \
                 'Only survivors should audit tasks'
+
+    @clean_tables('Lock', 'Rebalance', 'Token', 'Node')
+    def test_dead_node_rebalance_logs_node_counts(self, postgres):
+        """Verify the rebalance row records 3 -> 2 after one of 3 nodes dies.
+
+        Mutation: distribute passing the live node count as nodes_before.
+        Oracle: the Rebalance table's nodes_before and nodes_after columns
+            name the node counts on either side of the rebalance. Tokens
+            are seeded across node1, node2 and node3, and only node1 and
+            node2 are live.
+        """
+        tables = schema.get_table_names('sync_')
+
+        insert_active_node(postgres, tables, 'node1')
+        insert_active_node(postgres, tables, 'node2')
+        for token_id in range(30):
+            insert_token(postgres, tables, token_id, f'node{token_id % 3 + 1}')
+
+        job = create_job(
+            'node1',
+            postgres,
+            coordination_config=get_coordination_config(total_tokens=30))
+        try:
+            job.tokens.distribute(job.locks, job.cluster, 'dead_nodes')
+        finally:
+            job.__exit__(None, None, None)
+
+        with postgres.connect() as conn:
+            sql = f'select nodes_before, nodes_after from {tables["Rebalance"]}'
+            rows = [tuple(row) for row in conn.execute(text(sql))]
+
+        assert rows == [(3, 2)]
 
 
 class TestLeadershipDemotion:
