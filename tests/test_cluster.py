@@ -959,6 +959,64 @@ class TestDeadNodeLockCleanup:
             job.__exit__(None, None, None)
 
 
+class TestOrphanClaimCleanup:
+    """Test removal of claim rows whose node row is gone.
+    """
+
+    @clean_tables('Claim', 'Node')
+    def test_orphan_claims_deleted_without_dead_node(self, postgres):
+        """Verify the leader deletes a missing node's claims and keeps live ones.
+
+        Mutation: the orphan claim delete placed inside the dead_nodes
+            branch of DeadNodeMonitor.check, left out, or run without its
+            Node subquery.
+        Oracle: claim rows inserted by hand under 'gone-node', which has
+            no Node row, and under 'live-node', which has a fresh one.
+        """
+        config = get_coordination_config()
+        tables = schema.get_table_names(config.appname)
+
+        coord_config = CoordinationConfig(
+            total_tokens=50,
+            heartbeat_timeout_sec=15,
+            dead_node_check_interval_sec=0.5)
+
+        job = create_job(
+            'orphan-leader',
+            postgres,
+            wait_on_enter=0,
+            coordination_config=coord_config)
+        job.__enter__()
+
+        try:
+            assert wait_for_state(job, JobState.RUNNING_LEADER, timeout_sec=5)
+
+            insert_active_node(postgres, tables, 'live-node')
+            now = datetime.datetime.now(datetime.timezone.utc)
+            claim_sql = f"""
+insert into {tables["Claim"]} (node, task_id, created_on)
+values (:node, :task_id, :created_on)
+"""
+            with postgres.connect() as conn:
+                for node, task_id in [('gone-node', 'a'), ('gone-node', 'b'), ('live-node', 'c')]:
+                    conn.execute(
+                        text(claim_sql),
+                        {'node': node, 'task_id': task_id, 'created_on': now})
+                conn.commit()
+
+            def claim_rows():
+                with postgres.connect() as conn:
+                    rows = conn.execute(
+                        text(f'select node, task_id from {tables["Claim"]}'))
+                    return sorted((row[0], row[1]) for row in rows)
+
+            assert wait_for(lambda: claim_rows() == [('live-node', 'c')], timeout_sec=5), \
+                f'Only the live node claim should remain, left {claim_rows()}'
+
+        finally:
+            job.__exit__(None, None, None)
+
+
 class TestLeaderLockStaleRecovery:
     """Test stale leader lock detection and recovery.
     """

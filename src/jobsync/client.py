@@ -2455,11 +2455,17 @@ class DeadNodeMonitor(Monitor):
 
     def check(self) -> None:
         """Delete dead nodes, their claims and locks, then publish them.
+
+        Every check also deletes claim rows whose node has no Node row.
         """
         sql = f"""
 select name
 from {self.db.tables["Node"]}
 where last_heartbeat <= now() - interval '{self.cluster.heartbeat_timeout} seconds' or last_heartbeat is null
+"""
+        orphan_claim_sql = f"""
+delete from {self.db.tables["Claim"]}
+where node not in (select name from {self.db.tables["Node"]})
 """
 
         with self.db.engine.connect() as conn:
@@ -2488,6 +2494,14 @@ where last_heartbeat <= now() - interval '{self.cluster.heartbeat_timeout} secon
                 self.event_queue.publish('dead_nodes_detected', {'nodes': dead_nodes})
             except LockNotAcquired:
                 logger.debug('Rebalance already in progress, skipping dead node cleanup')
+
+        # A failed delete here must not block the dead-node sweep above.
+        with self.db.engine.connect() as conn:
+            orphan_claim_cnt = conn.execute(text(orphan_claim_sql)).rowcount
+            conn.commit()
+
+        if orphan_claim_cnt:
+            logger.info(f'Removed {orphan_claim_cnt} claim rows with no node row')
 
 
 class RebalanceMonitor(Monitor):
