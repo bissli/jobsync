@@ -2205,6 +2205,7 @@ class HeartbeatMonitor(Monitor):
     def __init__(
         self,
         cluster: ClusterCoordinator,
+        event_queue: EventQueue,
         shutdown_event: threading.Event
     ) -> None:
         """Heartbeat for the cluster's node, at its heartbeat interval.
@@ -2213,6 +2214,8 @@ class HeartbeatMonitor(Monitor):
         ----------
         cluster : ClusterCoordinator
             Supplies the node, database and interval.
+        event_queue : EventQueue
+            Receives 'node_unhealthy' when the node's row is gone.
         shutdown_event : threading.Event
             Ends the loop once set.
         """
@@ -2223,9 +2226,10 @@ class HeartbeatMonitor(Monitor):
         self.cluster = cluster
         self.db = cluster.db
         self.node_name = cluster.node_name
+        self.event_queue = event_queue
 
     def check(self) -> None:
-        """Send heartbeat update.
+        """Update the heartbeat, or publish node_unhealthy if the row is gone.
         """
         sql = f"""
 update {self.db.tables["Node"]}
@@ -2233,7 +2237,13 @@ set last_heartbeat = :heartbeat
 where name = :name
 """
         heartbeat_time = datetime.datetime.now(datetime.timezone.utc)
-        self.db.execute(sql, {'heartbeat': heartbeat_time, 'name': self.node_name})
+        result = self.db.execute(
+            sql,
+            {'heartbeat': heartbeat_time, 'name': self.node_name})
+        if result.rowcount == 0:
+            logger.warning(f'Node row for {self.node_name} is gone, shutting down')
+            self.event_queue.publish('node_unhealthy', {'reason': 'node_row_deleted'})
+            return
         self.cluster.last_heartbeat_sent = heartbeat_time
         logger.debug(f'Heartbeat sent by {self.node_name}')
 
@@ -2758,7 +2768,10 @@ class Job:
         self.cluster.register()
         self.tasks.cleanup()
 
-        heartbeat_monitor = HeartbeatMonitor(self.cluster, self._shutdown_event)
+        heartbeat_monitor = HeartbeatMonitor(
+            self.cluster,
+            self._event_queue,
+            self._shutdown_event)
         self._start_monitor('heartbeat', heartbeat_monitor)
 
         health_monitor = HealthMonitor(

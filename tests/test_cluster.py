@@ -1060,6 +1060,58 @@ values (:node, :task_id, :created_on)
             job.__exit__(None, None, None)
 
 
+class TestSweptLiveNode:
+    """Test a live node whose Node row another node deleted.
+    """
+
+    @clean_tables('Node')
+    def test_swept_live_node_shuts_down(self, postgres):
+        """Verify a running node whose Node row is gone shuts down.
+
+        Mutation: HeartbeatMonitor.check ignoring the update's rowcount,
+            or re-registering the node instead of shutting down.
+        Oracle: the Node row deleted by hand under a live heartbeat, with
+            a heartbeat timeout far beyond the wait so no health check
+            or dead-node sweep acts first.
+        """
+        config = get_coordination_config()
+        tables = schema.get_table_names(config.appname)
+
+        coord_config = CoordinationConfig(
+            total_tokens=50,
+            heartbeat_interval_sec=0.5,
+            heartbeat_timeout_sec=30)
+
+        job = create_job(
+            'swept-node',
+            postgres,
+            wait_on_enter=0,
+            coordination_config=coord_config)
+        job.__enter__()
+
+        try:
+            assert wait_for_state(job, JobState.RUNNING_LEADER, timeout_sec=5)
+
+            with postgres.connect() as conn:
+                conn.execute(
+                    text(f'delete from {tables["Node"]} where name = :name'),
+                    {'name': 'swept-node'})
+                conn.commit()
+
+            assert wait_for_state(job, JobState.SHUTTING_DOWN, timeout_sec=3), \
+                f'Swept node should shut down, state is {job.state_machine.state}'
+
+            with postgres.connect() as conn:
+                node_cnt = conn.execute(
+                    text(f'select count(*) from {tables["Node"]} where name = :name'),
+                    {'name': 'swept-node'}).scalar()
+
+            assert node_cnt == 0, 'A swept node should not register again'
+
+        finally:
+            job.__exit__(None, None, None)
+
+
 class TestLeaderLockStaleRecovery:
     """Test stale leader lock detection and recovery.
     """
