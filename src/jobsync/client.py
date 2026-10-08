@@ -2528,10 +2528,9 @@ class RebalanceMonitor(Monitor):
         db: DatabaseContext,
         cluster: ClusterCoordinator,
         event_queue: EventQueue,
-        shutdown_event: threading.Event,
-        initial_node_names: set[str] = None
+        shutdown_event: threading.Event
     ) -> None:
-        """Watch the live node names at the cluster's rebalance interval.
+        """Compare live nodes with token owners at the rebalance interval.
 
         Parameters
         ----------
@@ -2545,9 +2544,6 @@ class RebalanceMonitor(Monitor):
             Receives 'membership_changed'.
         shutdown_event : threading.Event
             Ends the loop once set.
-        initial_node_names : set[str], optional
-            Live node names at distribution time, the baseline for the
-            first check. None queries the current names.
         """
         super().__init__(
             f'rebalance-{node_name}',
@@ -2557,38 +2553,36 @@ class RebalanceMonitor(Monitor):
         self.db = db
         self.cluster = cluster
         self.event_queue = event_queue
-
-        if initial_node_names is not None:
-            self.last_node_names = initial_node_names
-            logger.info(f'RebalanceMonitor initialized with distribution-time node count: {len(initial_node_names)}')
-        else:
-            with self.db.engine.connect() as conn:
-                result = conn.execute(text(self.cluster.active_nodes_sql))
-                self.last_node_names = {row[0] for row in result}
-            logger.info(f'RebalanceMonitor initialized with current node count: {len(self.last_node_names)}')
+        self.last_mismatch = {'departed': [], 'tokenless': []}
 
     def check(self) -> None:
-        """Publish 'membership_changed' when the live node names change.
+        """Publish 'membership_changed' when live nodes and token owners differ.
+
+        The payload holds 'departed', token owners that are not live, and
+        'tokenless', live nodes that own no token, each a sorted list. A
+        mismatch publishes once, and again only after it changes.
         """
-        result = self.db.query(self.cluster.active_nodes_sql)
-        current_names = {row[0] for row in result}
-        previous_count = len(self.last_node_names)
-        current_count = len(current_names)
+        sql = f"""
+select
+    array(select name from ({self.cluster.active_nodes_sql}) live),
+    array(select distinct node from {self.db.tables["Token"]})
+"""
+        live_names, owner_names = self.db.query(sql)[0]
+        mismatch = {
+            'departed': sorted(set(owner_names) - set(live_names)),
+            'tokenless': sorted(set(live_names) - set(owner_names)),
+            }
 
-        logger.debug(f'Rebalance check: last={previous_count}, current={current_count}')
+        logger.debug(f'Rebalance check: {mismatch}')
 
-        if current_names != self.last_node_names:
-            logger.info(
-                f'Membership changed: {previous_count} -> {current_count} nodes, '
-                f'left {sorted(self.last_node_names - current_names)}, '
-                f'joined {sorted(current_names - self.last_node_names)}')
-            self.event_queue.publish(
-                'membership_changed',
-                {
-                    'previous_count': previous_count,
-                    'current_count': current_count,
-                    })
-            self.last_node_names = current_names
+        # A live node can rightly own no token (fewer tokens than nodes,
+        # or locks pinning every token elsewhere), so a stable mismatch
+        # must not publish on every check.
+        if ((mismatch['departed'] or mismatch['tokenless'])
+            and mismatch != self.last_mismatch):
+            logger.info(f'Membership changed: {mismatch}')
+            self.event_queue.publish('membership_changed', mismatch)
+        self.last_mismatch = mismatch
 
 
 class CoordinationMonitor(Monitor):
@@ -2729,7 +2723,6 @@ class Job:
 
         self._monitors = {}
         self._elected_leader = None
-        self._nodes_at_distribution = None
 
         machine = self.state_machine
         machine.on_enter(JobState.CLUSTER_FORMING, self._on_enter_cluster_forming)
@@ -2806,12 +2799,6 @@ class Job:
 
             if self._elected_leader == self.node_name:
                 logger.info('This node is the leader, performing token distribution')
-
-                nodes_before_distribution = self.cluster.get_active_nodes()
-                self._nodes_at_distribution = {
-                    node['name'] for node in nodes_before_distribution
-                    }
-                logger.info(f'Node count at distribution: {len(self._nodes_at_distribution)}')
                 self._distribute_tokens_safe('initial_distribution')
             else:
                 logger.info(f'Follower node detected, waiting for leader {self._elected_leader} to distribute tokens')
@@ -2848,8 +2835,7 @@ class Job:
             db=self.db,
             cluster=self.cluster,
             event_queue=self._event_queue,
-            shutdown_event=self._shutdown_event,
-            initial_node_names=self._nodes_at_distribution)
+            shutdown_event=self._shutdown_event)
         self._start_monitor('rebalance', rebalance_monitor)
 
     def _on_exit_running_leader(self) -> None:
@@ -2934,7 +2920,7 @@ class Job:
             elif event.type == 'membership_changed':
                 if self.state_machine.is_leader():
                     data = event.data
-                    logger.info(f'Membership: {data.get("previous_count")} -> {data.get("current_count")}')
+                    logger.info(f'Membership: departed {data.get("departed")}, tokenless {data.get("tokenless")}')
                     trigger_reason = 'membership_change'
 
             if trigger_reason is None:

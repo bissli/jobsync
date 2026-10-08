@@ -605,8 +605,8 @@ class TestFollowerJoinDistribution:
         """Verify a join refused by a held rebalance lock gets tokens later.
 
         Mutation: the membership_changed handler dropping a distribution
-            refused by LockNotAcquired after RebalanceMonitor has advanced
-            last_node_names, so no later distribution comes.
+            refused by LockNotAcquired after RebalanceMonitor has recorded
+            the mismatch, so no later distribution comes.
         Oracle: docs/OPERATOR_GUIDE.md, tokens are redistributed
             automatically on membership changes; the follower must own a
             token once the outside holder releases the lock.

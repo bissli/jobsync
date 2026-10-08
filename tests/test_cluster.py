@@ -2352,9 +2352,9 @@ class TestLateNodeJoining:
     def test_rebalance_monitor_detects_late_node_with_correct_baseline(self, postgres):
         """Verify a node joining before the monitor starts still rebalances.
 
-        Mutation: RebalanceMonitor started without the distribution-time
-            node count, so it baselines on the count that already includes
-            node2.
+        Mutation: RebalanceMonitor comparing live node names with its
+            previous check, so node2, live before the first check, never
+            reads as a change.
         Oracle: node2 registers in the DISTRIBUTING exit hook, after node1
             distributed to itself alone; 50 tokens over 2 nodes is 25 each.
         """
@@ -2409,23 +2409,26 @@ class TestLateNodeJoining:
         finally:
             node1.__exit__(None, None, None)
 
-    @clean_tables('Node')
+    @clean_tables('Node', 'Token')
     def test_rebalance_monitor_detects_leave_and_join_between_checks(self, postgres):
         """Verify one node leaving and another joining between checks publishes.
 
-        Mutation: RebalanceMonitor.check comparing only the live node count,
-            so {a, b, c} -> {a, b, d} reads as 3 -> 3 and publishes nothing,
-            or never moving its baseline, so the same swap publishes again.
+        Mutation: RebalanceMonitor.check comparing only node counts, so
+            {a, b, c} -> {a, b, d} reads as 3 -> 3 and publishes nothing,
+            or publishing on every mismatch, so the same swap publishes
+            again.
         Oracle: docs/OPERATOR_GUIDE.md, tokens are redistributed
-            automatically on membership changes; swapping c for d changes
-            the membership while the count stays 3.
+            automatically on membership changes; Token rows inserted by
+            hand for node-a, node-b and node-c, so the swap leaves node-c
+            owning a token and node-d owning none.
         """
         config = get_coordination_config()
         tables = schema.get_table_names(config.appname)
         watcher = create_job('watcher', postgres, coordination_config=config)
 
-        for name in ('node-a', 'node-b', 'node-c'):
+        for token_id, name in enumerate(('node-a', 'node-b', 'node-c')):
             insert_active_node(postgres, tables, name)
+            insert_token(postgres, tables, token_id, name)
 
         event_queue = EventQueue()
         monitor = RebalanceMonitor(
@@ -2446,11 +2449,51 @@ class TestLateNodeJoining:
 
             events = event_queue.consume_all()
             assert [event.type for event in events] == ['membership_changed']
-            assert events[0].data == {'previous_count': 3, 'current_count': 3}
+            assert events[0].data == {'departed': ['node-c'], 'tokenless': ['node-d']}
 
             monitor.check()
             assert event_queue.consume_all() == [], \
                 'A membership change already published should not publish again'
+        finally:
+            watcher.db.dispose()
+
+    @clean_tables('Node', 'Token')
+    def test_rebalance_monitor_publishes_tokenless_node_once(self, postgres):
+        """Verify a live node owning no token publishes one membership change.
+
+        Mutation: RebalanceMonitor.check comparing live node names with its
+            previous check, so a node live before the first check never
+            publishes, or publishing on every mismatch, so the second check
+            publishes again.
+        Oracle: Token rows inserted by hand that all name node-l and leave
+            out the live node node-f.
+        """
+        config = get_coordination_config()
+        tables = schema.get_table_names(config.appname)
+        watcher = create_job('watcher', postgres, coordination_config=config)
+
+        for name in ('node-l', 'node-f'):
+            insert_active_node(postgres, tables, name)
+        for token_id in range(4):
+            insert_token(postgres, tables, token_id, 'node-l')
+
+        event_queue = EventQueue()
+        monitor = RebalanceMonitor(
+            node_name='node-l',
+            db=watcher.db,
+            cluster=watcher.cluster,
+            event_queue=event_queue,
+            shutdown_event=threading.Event())
+
+        try:
+            monitor.check()
+            events = event_queue.consume_all()
+            assert [event.type for event in events] == ['membership_changed']
+            assert events[0].data == {'departed': [], 'tokenless': ['node-f']}
+
+            monitor.check()
+            assert event_queue.consume_all() == [], \
+                'An unchanged mismatch should not publish again'
         finally:
             watcher.db.dispose()
 
@@ -2606,7 +2649,7 @@ class TestLateNodeJoining:
             assert wait_for_state(node1, JobState.RUNNING_LEADER, timeout_sec=10)
             assert wait_for(
                 lambda: any(
-                    'Rebalance check: last=1, current=1' in record.message
+                    "Rebalance check: {'departed': [], 'tokenless': []}" in record.message
                     for record in caplog.records)), \
                 'node1 should run its first membership check before node2 registers'
 

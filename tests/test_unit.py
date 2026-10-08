@@ -624,10 +624,10 @@ class TestErrorStateTransitions:
 
         monkeypatch.setattr(job, '_distribute_tokens_safe', refusing_distribute)
 
-        for current_count in (2, 3, 4):
+        for joiner in ('node2', 'node3', 'node4'):
             job._event_queue.publish(
                 'membership_changed',
-                {'previous_count': 1, 'current_count': current_count})
+                {'departed': [], 'tokenless': [joiner]})
         job._event_queue.publish('dead_nodes_detected', {'nodes': ['ghost-1']})
         job._event_queue.publish('dead_nodes_detected', {'nodes': ['ghost-2']})
 
