@@ -2041,6 +2041,8 @@ class TaskManager:
     def set_claim(self, task: Task | Hashable) -> None:
         """Record a claim row for each task, keeping any existing claim.
 
+        Token ownership is not checked.
+
         Parameters
         ----------
         task : Task | Hashable
@@ -3109,6 +3111,9 @@ class Job:
 
     def set_claim(self, task: Task | Hashable) -> None:
         """Record a claim row for each task, keeping any existing claim.
+
+        Token ownership is not checked: a task this node does not own is
+        recorded too. add_task claims only tasks this node owns.
 
         Parameters
         ----------

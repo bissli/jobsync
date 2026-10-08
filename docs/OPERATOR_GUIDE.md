@@ -51,6 +51,10 @@ SELECT node, COUNT(*) FROM sync_token GROUP BY node;
 SELECT node, COUNT(*) FROM sync_claim GROUP BY node;
 ```
 
+A claim row records a task the node claimed during its run and survives a
+rebalance, so a task can count under several nodes. `sync_token` holds
+ownership.
+
 **For streaming workloads** (tasks arrive continuously), startup order has no effect: new tasks distribute to all nodes.
 
 ### Rolling Update

@@ -24,7 +24,9 @@
 --   sync_node           - Worker registration and heartbeat
 --   sync_checkpoint     - Job execution checkpoints
 --   sync_audit          - Completed task tracking
---   sync_claim          - Tasks claimed by workers
+--   sync_claim          - One row per task a node claimed during its run.
+--                         Rows survive a rebalance, so a task can appear
+--                         under several nodes. sync_token holds ownership.
 --   sync_token          - Token ownership assignments
 --   sync_lock           - Task pinning to specific nodes (by task_id)
 --   sync_leader_lock    - Current leader election lock
@@ -55,7 +57,9 @@ create table if not exists sync_audit (created_on timestamp with time zone not n
 
 create index if not exists idx_sync_audit_date_task_id on sync_audit(date, task_id);
 
--- Task claim tracking
+-- Task claim tracking: one row per task a node claimed during its run.
+-- Rows survive a rebalance, so a task can appear under several nodes.
+-- The sync_token table is the ownership source.
 \echo '  → sync_claim (tasks claimed by workers)'
 create table if not exists sync_claim (node varchar not null, task_id varchar not null, created_on timestamp with time zone not null, primary key (node, task_id));
 

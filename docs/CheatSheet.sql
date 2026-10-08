@@ -21,7 +21,9 @@
 --   sync_rebalance      - Token rebalancing audit log
 --   sync_rebalance_lock - Rebalancing coordination lock
 --   sync_lock           - Task pinning to specific nodes (by task_id)
---   sync_claim          - Tasks claimed by workers
+--   sync_claim          - One row per task a node claimed during its run.
+--                         Rows survive a rebalance, so a task can appear
+--                         under several nodes. sync_token holds ownership.
 --   sync_audit          - Completed task tracking
 --   sync_check          - Task processing checkpoints
 --   sync_checkpoint     - Job execution checkpoints
@@ -151,32 +153,36 @@ order by tasks_claimed desc;
 
 \echo '' \echo 'Task Completion Rate (Today):' \echo '(Claims are transient, cleaned on node exit; audit records are permanent)' with
     claimed as
-    (select count(distinct task_id) as count
-     from sync_claim
-     where created_on::date = current_date ),
-    completed as
+    (select
+         count(distinct c.task_id) as count,
+         count(distinct a.task_id) as completed_count
+     from sync_claim c
+     left join sync_audit a on c.task_id = a.task_id
+     and a.created_on::date = current_date
+     where c.created_on::date = current_date ),
+    audited as
     (select count(distinct task_id) as count
      from sync_audit
-     where date = current_date )
+     where created_on::date = current_date )
 select
     claimed.count as claimed_tasks,
-    completed.count as completed_tasks,
+    claimed.completed_count as completed_tasks,
     case
-        when claimed.count > 0 then claimed.count - completed.count
+        when claimed.count > 0 then claimed.count - claimed.completed_count
         else null
     end as incomplete_tasks,
-    round(100.0 * completed.count / nullif(claimed.count, 0), 1) as completion_percent,
+    round(100.0 * claimed.completed_count / nullif(claimed.count, 0), 1) as completion_percent,
     case
         when claimed.count = 0
-             and completed.count > 0 then '✓ NODES EXITED CLEANLY'
+             and audited.count > 0 then '✓ NODES EXITED CLEANLY'
         when claimed.count = 0 then '- NO ACTIVITY'
-        when claimed.count = completed.count then '✓ ALL COMPLETE'
-        when completed.count::float / nullif(claimed.count, 0) > 0.9 then '⚠ MOSTLY COMPLETE'
+        when claimed.count = claimed.completed_count then '✓ ALL COMPLETE'
+        when claimed.completed_count::float / nullif(claimed.count, 0) > 0.9 then '⚠ MOSTLY COMPLETE'
         else '✗ MANY INCOMPLETE'
     end as status
 from
     claimed,
-    completed;
+    audited;
 
 \echo '' \echo 'Incomplete Tasks (First 20):' \echo '(Tasks claimed but not yet completed - empty when nodes exit cleanly)'
 select
@@ -187,7 +193,7 @@ select
                    from (now() - c.created_on))/60)::NUMERIC, 1) as minutes_ago
 from sync_claim c
 left join sync_audit a on c.task_id = a.task_id
-and a.date = current_date
+and a.created_on::date = current_date
 where c.created_on::date = current_date
     and a.task_id is null
 order by c.created_on
