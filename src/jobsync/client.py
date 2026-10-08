@@ -2114,7 +2114,9 @@ values (:date, :node, :task_id, now())
         return [{'node': row[0], 'task_id': row[1]} for row in result]
 
     def cleanup(self) -> None:
-        """Cleanup Check and Claim tables.
+        """Delete this node's Check and Claim rows.
+
+        A database error logs a warning and does not raise.
         """
         try:
             with self.db.engine.connect() as conn:
@@ -2127,7 +2129,7 @@ values (:date, :node, :task_id, now())
                 conn.commit()
             logger.debug(f'Cleaned {self.node_name} from Check and Claim tables')
         except Exception as e:
-            logger.debug(f'Failed to cleanup tasks for {self.node_name}: {e}')
+            logger.warning(f'Failed to cleanup tasks for {self.node_name}: {e}')
 
 
 # --- Monitors ---
@@ -2752,6 +2754,7 @@ class Job:
         """Entry action for CLUSTER_FORMING state.
         """
         self.cluster.register()
+        self.tasks.cleanup()
 
         heartbeat_monitor = HeartbeatMonitor(self.cluster, self._shutdown_event)
         self._start_monitor('heartbeat', heartbeat_monitor)

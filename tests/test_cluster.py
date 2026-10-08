@@ -959,8 +959,8 @@ class TestDeadNodeLockCleanup:
             job.__exit__(None, None, None)
 
 
-class TestOrphanClaimCleanup:
-    """Test removal of claim rows whose node row is gone.
+class TestStaleClaimCleanup:
+    """Test removal of claim rows left by a node that is gone or restarted.
     """
 
     @clean_tables('Claim', 'Node')
@@ -1012,6 +1012,49 @@ values (:node, :task_id, :created_on)
 
             assert wait_for(lambda: claim_rows() == [('live-node', 'c')], timeout_sec=5), \
                 f'Only the live node claim should remain, left {claim_rows()}'
+
+        finally:
+            job.__exit__(None, None, None)
+
+    @clean_tables('Claim', 'Node')
+    def test_previous_run_claims_cleared_on_start(self, postgres):
+        """Verify a node restarted under its own name drops its earlier claims.
+
+        Mutation: the TaskManager.cleanup call in
+            Job._on_enter_cluster_forming left out.
+        Oracle: claim rows inserted by hand under a Node row with a fresh
+            heartbeat, which the dead and orphan sweeps both leave alone.
+        """
+        config = get_coordination_config()
+        tables = schema.get_table_names(config.appname)
+
+        insert_active_node(postgres, tables, 'restarted-node')
+        now = datetime.datetime.now(datetime.timezone.utc)
+        claim_sql = f"""
+insert into {tables["Claim"]} (node, task_id, created_on)
+values (:node, :task_id, :created_on)
+"""
+        with postgres.connect() as conn:
+            for task_id in ['a', 'b']:
+                conn.execute(
+                    text(claim_sql),
+                    {'node': 'restarted-node', 'task_id': task_id, 'created_on': now})
+            conn.commit()
+
+        job = create_job(
+            'restarted-node',
+            postgres,
+            wait_on_enter=0,
+            coordination_config=config)
+        job.__enter__()
+
+        try:
+            with postgres.connect() as conn:
+                claim_cnt = conn.execute(
+                    text(f'select count(*) from {tables["Claim"]} where node = :node'),
+                    {'node': 'restarted-node'}).scalar()
+
+            assert claim_cnt == 0, f'Earlier run claims should be gone, found {claim_cnt}'
 
         finally:
             job.__exit__(None, None, None)
